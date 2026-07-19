@@ -23,9 +23,11 @@ public final class OpenALAcousticEffects {
     private static final Map<ReverbKey, ReverbBus> REVERB_BUSES = new HashMap<>();
     private static final List<ReverbBus> REVERB_POOL = new ArrayList<>();
     private static final Map<EqualizerKey, EqualizerBus> EQUALIZER_BUSES = new HashMap<>();
-    // The late field is listener-centric. One continuously updated FDN/EAX bus keeps
-    // its tail and avoids quantized per-source room switching.
-    private static final int MAX_REVERB_BUSES = 1;
+    // Listener-space transitions use two EAX networks. New energy is routed into the
+    // freshly configured field while the previous network releases its existing tail.
+    // This is constant-cost double buffering, not per-source convolution or an
+    // unbounded room cache.
+    private static final int MAX_REVERB_BUSES = 2;
     private static final int MAX_EQUALIZER_BUSES = 12;
     private static final RoomAcoustics DSP_PREWARM_ROOM = new RoomAcoustics(
             0.75F, 0.70F, 0.32F, 0.72F, 0.95F,
@@ -454,23 +456,49 @@ public final class OpenALAcousticEffects {
             ReverbKey key,
             RoomAcoustics room
     ) {
-        ReverbBus bus = currentReverbBus();
-        if (key.equals(bus.key)) {
+        ReverbBus previous = currentReverbBus();
+        if (key.equals(previous.key)) {
             return;
         }
-        // AL_EXT_EFX copies an effect into its slot. Reassigning it while voices are
-        // feeding the slot restarts OpenAL Soft's FDN history. Preserve that history;
-        // active-field gain, damping and source coupling use non-destructive slot and
-        // filter parameters instead.
-        if (!SOURCES.isEmpty()) {
-            return;
+
+        ReverbBus next = REVERB_BUSES.get(key);
+        if (next == null) {
+            next = REVERB_POOL.stream()
+                    .filter(candidate -> candidate != previous && candidate.references == 0)
+                    .min(Comparator.comparingLong(candidate -> candidate.lastUsed))
+                    .orElse(null);
+            if (next == null && REVERB_POOL.size() < MAX_REVERB_BUSES) {
+                next = createReverbBus(null, RoomAcoustics.OUTDOORS);
+            }
+            if (next == null) {
+                // This can only occur while a just-destroyed OpenAL voice has not yet
+                // released its state. Retain the current, valid field for this callback;
+                // the continuously running next result will retry the handover.
+                return;
+            }
+            if (next.key != null) {
+                REVERB_BUSES.remove(next.key, next);
+            }
+            configureReverbBus(next, key, room);
+            REVERB_BUSES.put(key, next);
         }
-        if (bus.key != null) {
-            REVERB_BUSES.remove(bus.key, bus);
+
+        activeReverbBus = next;
+        // Move every live voice in the same sound-thread transaction. The old field is
+        // no longer fed but its slot stays audible, so its stored energy decays with the
+        // RT60 measured in the previous space instead of being cut or frozen.
+        for (Map.Entry<Integer, SourceState> entry : SOURCES.entrySet()) {
+            SourceState state = entry.getValue();
+            assignReverbBus(state);
+            AL11.alSource3i(
+                    entry.getKey(),
+                    EXTEfx.AL_AUXILIARY_SEND_FILTER,
+                    next.slot,
+                    advancedFourBand ? 1 : 0,
+                    state.reverbFilter
+            );
         }
-        configureReverbBus(bus, key, room);
-        REVERB_BUSES.put(key, bus);
-        activeReverbBus = bus;
+        previous.lastUsed = System.nanoTime();
     }
 
     private static ReverbBus createReverbBus(

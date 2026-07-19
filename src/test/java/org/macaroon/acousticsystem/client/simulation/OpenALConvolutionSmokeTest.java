@@ -20,6 +20,7 @@ import java.lang.reflect.Field;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class OpenALConvolutionSmokeTest {
@@ -220,15 +221,15 @@ class OpenALConvolutionSmokeTest {
                     0.5F, 0.0F, 0.95F
             ));
             Object migratedBus = staticField("activeReverbBus");
-            assertSame(
+            assertNotSame(
                     establishedBus,
                     migratedBus,
-                    "Listener motion must morph one persistent late field instead of restarting buses"
+                    "A new listener space must receive a fresh field while the old tail decays"
             );
-            assertSame(
+            assertNotSame(
                     establishedKey,
                     objectField(migratedBus, "key"),
-                    "An active FDN must not be reassigned and lose its accumulated tail"
+                    "The replacement field must contain the newly measured room"
             );
             assertSame(migratedBus, sourceStateObject(source, "reverbBus"));
             assertSame(
@@ -285,7 +286,7 @@ class OpenALConvolutionSmokeTest {
         Field poolField = OpenALAcousticEffects.class.getDeclaredField("REVERB_POOL");
         poolField.setAccessible(true);
         List<?> buses = (List<?>) poolField.get(null);
-        assertTrue(buses.size() == 1);
+        assertTrue(buses.size() == 2);
         Field slotField = buses.getFirst().getClass().getDeclaredField("slot");
         slotField.setAccessible(true);
         for (Object bus : buses) {

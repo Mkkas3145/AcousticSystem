@@ -341,6 +341,46 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void physicalEarlyReflectionRemainsAudibleWithoutALateReverbField() {
+        Vec3 source = new Vec3(-4.5, 2.5, 0.5);
+        Vec3 listener = new Vec3(4.5, 2.5, 0.5);
+        TestWorld world = new TestWorld(position -> {
+            boolean ceiling = position.getY() == 5
+                    && position.getX() >= -8 && position.getX() <= 8
+                    && position.getZ() >= -3 && position.getZ() <= 3;
+            boolean screen = position.getX() == 0
+                    && position.getY() >= 1 && position.getY() <= 3
+                    && position.getZ() >= -1 && position.getZ() <= 1;
+            return ceiling || screen;
+        });
+        RoomProbe ceilingProbe = new RoomProbe(
+                RoomAcoustics.OUTDOORS,
+                List.of(new RoomProbe.SurfaceSample(
+                        new Vec3(0.5, 5.0, 0.5),
+                        new Vec3(0.0, -1.0, 0.0),
+                        new AABB(0.0, 5.0, 0.0, 1.0, 6.0, 1.0),
+                        2.5,
+                        AcousticMaterialRegistry.find(Blocks.STONE.defaultBlockState())
+                )),
+                List.of()
+        );
+        AcousticResult withoutReflection = AcousticTracer.trace(
+                world, source, listener, OUTDOOR_PROBE, AcousticTracer.TraceQuality.FULL
+        );
+        AcousticResult withReflection = AcousticTracer.trace(
+                world, source, listener, ceilingProbe, AcousticTracer.TraceQuality.FULL
+        );
+
+        assertTrue(
+                withReflection.directGain() > withoutReflection.directGain() * 1.05F,
+                () -> "A validated image-source arrival must reach the audible spectrum even "
+                        + "when the late room field is outdoors: dry=" + withoutReflection
+                        + ", reflected=" + withReflection
+        );
+        assertTrue(withReflection.reverbRoom().equals(RoomAcoustics.OUTDOORS));
+    }
+
+    @Test
     void approachingAWallDoesNotDoubleTheSharedRoomEffect() {
         Vec3 source = new Vec3(0.5, 2.5, 0.5);
         Vec3 centralListener = new Vec3(2.5, 2.5, 0.5);

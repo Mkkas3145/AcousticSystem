@@ -4,6 +4,7 @@
   "version": "${version}",
   "name": "AcousticSystem",
   "description": "Continuously recalculated real-time block-aware sound propagation.",
+  "icon": "assets/acousticsystem/icon.png",
   "authors": ["macaroon"],
   "license": "All-Rights-Reserved",
   "environment": "client",

@@ -190,7 +190,23 @@ public final class AcousticTracer {
                     > weightedEnergy(diffractionPath.bands())) {
                 diffractionPath = openingBypass;
             }
-            float[] diffraction = diffractionPath.bands();
+            float[] diffraction = diffractionPath.bands().clone();
+            // The offset bundle is a finite Fresnel-zone quadrature, while the edge
+            // solution reconstructs energy missing from that same incident wavefront.
+            // Adding both at full power counts the partially open aperture twice. Give
+            // diffraction only the per-band power not already carried by the sampled
+            // direct/transmitted bundle. A path therefore grows continuously as the
+            // Fresnel zone enters shadow and never creates gain at a grazing edge.
+            for (int band = 0; band < diffraction.length; band++) {
+                float sampledPower = 0.0F;
+                for (Transmission transmission : transmissions) {
+                    float amplitude = Mth.clamp(transmission.bands()[band], 0.0F, 1.0F);
+                    sampledPower += amplitude * amplitude / transmissions.length;
+                }
+                diffraction[band] *= (float) Math.sqrt(
+                        Mth.clamp(1.0F - sampledPower, 0.0F, 1.0F)
+                );
+            }
             geometricPaths.add(PathKind.DIFFRACTED, diffraction, 1.0F);
         }
         float[] geometricSpectrum = geometricPaths.amplitudes();
@@ -201,13 +217,7 @@ public final class AcousticTracer {
         applyMediumResponse(diffractionSpectrum, listenerMedium);
         diffractionContribution = weightedEnergy(diffractionSpectrum);
 
-        float lowEnergy = geometricSpectrum[0] * 0.24F + geometricSpectrum[1] * 0.26F
-                + geometricSpectrum[2] * 0.27F + geometricSpectrum[3] * 0.23F;
-        float highEnergy = geometricSpectrum[4] * 0.28F + geometricSpectrum[5] * 0.27F
-                + geometricSpectrum[6] * 0.25F + geometricSpectrum[7] * 0.20F;
-        float arrivalEnergy = Mth.clamp(weightedEnergy(geometricSpectrum), 0.0F, 1.0F);
-        float directGain = Mth.clamp(arrivalEnergy, 0.0F, 1.0F);
-        float highFrequencyGain = Mth.clamp(highEnergy / Math.max(lowEnergy, 0.01F), 0.02F, 1.0F);
+        float geometricEnergy = Mth.clamp(weightedEnergy(geometricSpectrum), 0.0F, 1.0F);
         ReflectionResult reflections = estimateEarlyReflections(
                 level,
                 source,
@@ -222,12 +232,24 @@ public final class AcousticTracer {
         allArrivals.add(PathKind.DIRECT_OR_TRANSMITTED, geometricSpectrum, 1.0F);
         allArrivals.add(PathKind.SPECULAR_REFLECTION, reflectedSpectrum, 1.0F);
         float[] fieldSpectrum = allArrivals.amplitudes();
+        // First-order image paths are real arrivals, not merely a hint for the late
+        // reverb unit. Keeping them out of the audible spectrum made an outdoor wall
+        // reflection vanish and made mild occlusion sound sealed. Their already
+        // distance-, material- and visibility-weighted power now fills the shadow while
+        // the unit clamp prevents a clear direct path from being amplified.
+        float arrivalEnergy = Mth.clamp(weightedEnergy(fieldSpectrum), 0.0F, 1.0F);
+        float directGain = arrivalEnergy;
+        float lowEnergy = fieldSpectrum[0] * 0.24F + fieldSpectrum[1] * 0.26F
+                + fieldSpectrum[2] * 0.27F + fieldSpectrum[3] * 0.23F;
+        float highEnergy = fieldSpectrum[4] * 0.28F + fieldSpectrum[5] * 0.27F
+                + fieldSpectrum[6] * 0.25F + fieldSpectrum[7] * 0.20F;
+        float highFrequencyGain = Mth.clamp(highEnergy / Math.max(lowEnergy, 0.01F), 0.02F, 1.0F);
         Vec3 apparentPosition = source;
         if (diffractionPath != null) {
             Vec3 directDirection = source.subtract(listener);
             Vec3 diffractedDirection = diffractionPath.point().subtract(listener);
             float directionMix = Mth.clamp(
-                    diffractionContribution / Math.max(arrivalEnergy, 0.01F),
+                    diffractionContribution / Math.max(geometricEnergy, 0.01F),
                     0.0F,
                     1.0F
             );
@@ -237,6 +259,29 @@ public final class AcousticTracer {
                 if (arrivalDirection.lengthSqr() > 1.0E-6) {
                     apparentPosition = listener.add(
                             arrivalDirection.normalize().scale(Math.max(1.0, source.distanceTo(listener)))
+                    );
+                }
+            }
+        }
+        float reflectionContribution = weightedEnergy(reflectedSpectrum);
+        if (reflectionContribution > 1.0E-5F
+                && reflections.arrivalPoint() != null
+                && reflections.arrivalPoint().subtract(listener).lengthSqr() > 1.0E-6) {
+            Vec3 currentDirection = apparentPosition.subtract(listener);
+            Vec3 reflectedDirection = reflections.arrivalPoint().subtract(listener);
+            float reflectionMix = Mth.clamp(
+                    reflectionContribution / Math.max(arrivalEnergy, 0.01F),
+                    0.0F,
+                    1.0F
+            );
+            if (currentDirection.lengthSqr() > 1.0E-6) {
+                Vec3 arrivalDirection = currentDirection.normalize().scale(1.0F - reflectionMix)
+                        .add(reflectedDirection.normalize().scale(reflectionMix));
+                if (arrivalDirection.lengthSqr() > 1.0E-6) {
+                    // Preserve Minecraft/OpenAL's original distance attenuation. Extra
+                    // reflected path length has already been applied to path energy.
+                    apparentPosition = listener.add(
+                            arrivalDirection.normalize().scale(Math.max(1.0, directDistance))
                     );
                 }
             }
@@ -276,10 +321,10 @@ public final class AcousticTracer {
         return new AcousticResult(
                 directGain,
                 highFrequencyGain,
-                pairEnergy(geometricSpectrum, 0),
-                pairEnergy(geometricSpectrum, 2),
-                pairEnergy(geometricSpectrum, 4),
-                pairEnergy(geometricSpectrum, 6),
+                pairEnergy(fieldSpectrum, 0),
+                pairEnergy(fieldSpectrum, 2),
+                pairEnergy(fieldSpectrum, 4),
+                pairEnergy(fieldSpectrum, 6),
                 Mth.clamp(
                         reflectedSend * tuning.reverbSendScale(),
                         0.0F,
@@ -1228,6 +1273,8 @@ public final class AcousticTracer {
 
         double directDistance = Math.max(source.distanceTo(listener), 0.5);
         float[] accumulated = new float[AcousticBands.COUNT];
+        Vec3 dominantArrivalPoint = null;
+        float dominantArrivalEnergy = 0.0F;
         int remainingDiffractedLegs = Math.min(2, pathBudget);
         int acceptedPaths = 0;
         List<Vec3> acceptedReflectionPoints = new ArrayList<>(pathBudget);
@@ -1334,6 +1381,7 @@ public final class AcousticTracer {
             float incidence = (float) Math.abs(
                     source.subtract(reflectionPoint).normalize().dot(facingNormal)
             );
+            float[] pathAmplitude = new float[AcousticBands.COUNT];
             for (int band = 0; band < accumulated.length; band++) {
                 float transmission = reflectionMaterial.surfaceTransmission(
                         band,
@@ -1351,7 +1399,13 @@ public final class AcousticTracer {
                         * reflection
                         * distanceGain
                         * airAbsorption(band, AcousticMaterialRegistry.tuning().meters(pathDistance));
+                pathAmplitude[band] = contribution;
                 accumulated[band] += contribution * contribution;
+            }
+            float pathEnergy = weightedEnergy(pathAmplitude);
+            if (pathEnergy > dominantArrivalEnergy) {
+                dominantArrivalEnergy = pathEnergy;
+                dominantArrivalPoint = reflectionPoint;
             }
             if (acceptedPaths >= pathBudget) {
                 break;
@@ -1375,7 +1429,8 @@ public final class AcousticTracer {
                         0.0F,
                         0.90F
                 ),
-                Mth.clamp(high / Math.max(low, 0.01F), 0.05F, 1.0F)
+                Mth.clamp(high / Math.max(low, 0.01F), 0.05F, 1.0F),
+                dominantArrivalPoint
         );
     }
 
@@ -2115,9 +2170,16 @@ public final class AcousticTracer {
         }
     }
 
-    record ReflectionResult(float[] bands, float gain, float highFrequencyGain) {
+    record ReflectionResult(
+            float[] bands,
+            float gain,
+            float highFrequencyGain,
+            Vec3 arrivalPoint
+    ) {
         private static ReflectionResult silent() {
-            return new ReflectionResult(new float[AcousticBands.COUNT], 0.0F, 1.0F);
+            return new ReflectionResult(
+                    new float[AcousticBands.COUNT], 0.0F, 1.0F, null
+            );
         }
     }
 

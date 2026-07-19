@@ -73,7 +73,7 @@ public final class AcousticRuntime {
     // occurrence. Keeping only the newest cell entry caused rapid repeated sounds to
     // invalidate every earlier completion before it reached its own channel.
     private static final Map<SoundInstance, PreparedResult> PREPARED_SOUNDS = new ConcurrentHashMap<>();
-    private static long generation;
+    private static volatile long generation;
     private static long lastDebugLogNanoseconds;
 
     private AcousticRuntime() {
@@ -93,17 +93,19 @@ public final class AcousticRuntime {
         }
 
         List<SoundRequest> positionalSounds = new ArrayList<>();
-        for (SoundInstance sound : activeSounds.keySet()) {
+        for (Map.Entry<SoundInstance, ChannelAccess.ChannelHandle> entry : activeSounds.entrySet()) {
+            SoundInstance sound = entry.getKey();
             if (!sound.isRelative()) {
                 positionalSounds.add(new SoundRequest(
                         sound,
+                        entry.getValue(),
                         new Vec3(sound.getX(), sound.getY(), sound.getZ()),
                         AcousticTracer.TraceQuality.FULL
                 ));
             }
         }
 
-        publishCompletedBatch(level, listener, activeSounds);
+        publishCompletedBatch(level, listener);
         long now = System.nanoTime();
         // There is no fixed update clock. A completed snapshot is consumed immediately
         // and the next immutable-world calculation is launched on the next available
@@ -354,19 +356,15 @@ public final class AcousticRuntime {
                         scene.revision(),
                         listener,
                         roomProbe,
-                        submittedNanoseconds,
-                        List.of()
+                        submittedNanoseconds
                 ));
             }
             Map<TraceKey, AcousticResult> traceCache = new ConcurrentHashMap<>();
             int partitionCount = Math.min(WORKER_COUNT, sounds.size());
-            List<CompletableFuture<List<ComputedSound>>> partitions = new ArrayList<>(partitionCount);
+            List<CompletableFuture<Void>> partitions = new ArrayList<>(partitionCount);
             for (int partition = 0; partition < partitionCount; partition++) {
                 int firstIndex = partition;
                 partitions.add(CompletableFuture.supplyAsync(() -> {
-                    List<ComputedSound> computed = new ArrayList<>(
-                            (sounds.size() + partitionCount - 1) / partitionCount
-                    );
                     for (int index = firstIndex; index < sounds.size(); index += partitionCount) {
                         SoundRequest request = sounds.get(index);
                         TraceKey key = TraceKey.from(request);
@@ -384,38 +382,34 @@ public final class AcousticRuntime {
                                     request.quality()
                             );
                         });
-                        computed.add(new ComputedSound(
-                                request.sound(),
-                                request.source(),
-                                result
-                        ));
+                        deliverCompletedSound(
+                                request,
+                                result,
+                                batchGeneration,
+                                listener,
+                                submittedNanoseconds
+                        );
                     }
-                    return computed;
+                    return null;
                 }, WORKERS));
             }
             CompletableFuture<?>[] all = partitions.toArray(CompletableFuture[]::new);
-            return CompletableFuture.allOf(all).thenApply(ignored -> {
-                List<ComputedSound> computed = new ArrayList<>(sounds.size());
-                for (CompletableFuture<List<ComputedSound>> partition : partitions) {
-                    computed.addAll(partition.join());
-                }
-                return new BatchResult(
+            return CompletableFuture.allOf(all).thenApply(ignored ->
+                    new BatchResult(
                         level,
                         batchGeneration,
                         scene.revision(),
                         listener,
                         roomProbe,
-                        submittedNanoseconds,
-                        List.copyOf(computed)
-                );
-            });
+                        submittedNanoseconds
+                    )
+            );
         });
     }
 
     private static void publishCompletedBatch(
             ClientLevel level,
-            Vec3 currentListener,
-            Map<SoundInstance, ChannelAccess.ChannelHandle> activeSounds
+            Vec3 currentListener
     ) {
         if (pendingBatch == null || !pendingBatch.isDone()) {
             return;
@@ -451,29 +445,48 @@ public final class AcousticRuntime {
                 return;
             }
 
-            double maximumMovementSquared = tuning.maxSourceMovement() * tuning.maxSourceMovement();
-            for (ComputedSound computed : batch.sounds()) {
-                ChannelAccess.ChannelHandle handle = activeSounds.get(computed.sound());
-                if (handle == null || handle.isStopped()) {
-                    continue;
-                }
-                Vec3 currentPosition = new Vec3(
-                        computed.sound().getX(),
-                        computed.sound().getY(),
-                        computed.sound().getZ()
-                );
-                if (currentPosition.distanceToSqr(computed.source()) > maximumMovementSquared) {
-                    continue;
-                }
-                handle.execute(channel -> apply(
-                        channel,
-                        computed.result(),
-                        batch.submittedNanoseconds()
-                ));
-            }
+            // Source results are delivered individually by their worker partition as
+            // soon as they finish. The completed batch only commits the listener probe
+            // and opens the next continuously sampled generation; it must not apply the
+            // same coefficients a second time.
         } catch (CompletionException exception) {
             AcousticSystem.LOGGER.warn("Asynchronous acoustic batch failed; retrying on the next client tick", exception.getCause());
         }
+    }
+
+    private static void deliverCompletedSound(
+            SoundRequest request,
+            AcousticResult result,
+            long batchGeneration,
+            Vec3 computedListener,
+            long submittedNanoseconds
+    ) {
+        ChannelAccess.ChannelHandle handle = request.handle();
+        if (handle == null || handle.isStopped() || batchGeneration != generation) {
+            return;
+        }
+        PrePlayContext context = prePlayContext;
+        if (context == null
+                || context.generation() != batchGeneration
+                || !isListenerResultCurrent(computedListener, context.listener())) {
+            return;
+        }
+        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
+        long ageMilliseconds = (System.nanoTime() - submittedNanoseconds) / 1_000_000L;
+        if (ageMilliseconds > tuning.maxResultAgeMilliseconds()) {
+            return;
+        }
+        Vec3 currentPosition = new Vec3(
+                request.sound().getX(),
+                request.sound().getY(),
+                request.sound().getZ()
+        );
+        double maximumMovement = tuning.maxSourceMovement();
+        if (currentPosition.distanceToSqr(request.source())
+                > maximumMovement * maximumMovement) {
+            return;
+        }
+        handle.execute(channel -> apply(channel, result, submittedNanoseconds));
     }
 
     private static void apply(Channel channel, AcousticResult result, long sequence) {
@@ -589,6 +602,7 @@ public final class AcousticRuntime {
 
     private record SoundRequest(
             SoundInstance sound,
+            ChannelAccess.ChannelHandle handle,
             Vec3 source,
             AcousticTracer.TraceQuality quality
     ) {
@@ -605,17 +619,13 @@ public final class AcousticRuntime {
         }
     }
 
-    private record ComputedSound(SoundInstance sound, Vec3 source, AcousticResult result) {
-    }
-
     private record BatchResult(
             ClientLevel level,
             long generation,
             long sceneRevision,
             Vec3 listener,
             RoomProbe roomProbe,
-            long submittedNanoseconds,
-            List<ComputedSound> sounds
+            long submittedNanoseconds
     ) {
     }
 
