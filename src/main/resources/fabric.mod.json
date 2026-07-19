@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "acousticsystem",
+  "version": "${version}",
+  "name": "AcousticSystem",
+  "description": "Continuously recalculated real-time block-aware sound propagation.",
+  "authors": ["macaroon"],
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "main": ["org.macaroon.acousticsystem.AcousticSystem"],
+    "client": ["org.macaroon.acousticsystem.client.AcousticSystemClient"]
+  },
+  "mixins": [
+    {
+      "config": "acousticsystem.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": ">=0.155.2"
+  }
+}

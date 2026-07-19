@@ -1,0 +1,160 @@
+package org.macaroon.acousticsystem.client.material;
+
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.material.FluidState;
+
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+public final class AcousticMaterialRegistry {
+    private static volatile Snapshot snapshot = new Snapshot(
+            AcousticMaterial.DEFAULT,
+            AcousticMaterial.DEFAULT_FLUID,
+            AcousticTuning.DEFAULT,
+            List.of(),
+            List.of(),
+            new ConcurrentHashMap<>(),
+            new ConcurrentHashMap<>()
+    );
+
+    private AcousticMaterialRegistry() {
+    }
+
+    public static AcousticMaterial find(BlockState state) {
+        Snapshot current = snapshot;
+        return current.blockMaterialCache().computeIfAbsent(
+                state,
+                ignored -> resolveBlockMaterial(current, state)
+        );
+    }
+
+    private static AcousticMaterial resolveBlockMaterial(Snapshot current, BlockState state) {
+        List<Rule> rules = current.blockRules();
+        for (int i = rules.size() - 1; i >= 0; i--) {
+            Rule rule = rules.get(i);
+            if (rule.matches(state)) {
+                return rule.material();
+            }
+        }
+        return current.defaultMaterial();
+    }
+
+    public static AcousticMaterial findFluid(FluidState state) {
+        Snapshot current = snapshot;
+        return current.fluidMaterialCache().computeIfAbsent(
+                state,
+                ignored -> resolveFluidMaterial(current, state)
+        );
+    }
+
+    private static AcousticMaterial resolveFluidMaterial(Snapshot current, FluidState state) {
+        List<FluidRule> rules = current.fluidRules();
+        for (int i = rules.size() - 1; i >= 0; i--) {
+            FluidRule rule = rules.get(i);
+            if (rule.matches(state)) {
+                return rule.material();
+            }
+        }
+        return current.defaultFluidMaterial();
+    }
+
+    public static AcousticTuning tuning() {
+        return snapshot.tuning();
+    }
+
+    static void replace(
+            AcousticMaterial defaultMaterial,
+            AcousticMaterial defaultFluidMaterial,
+            AcousticTuning tuning,
+            List<Rule> blockRules,
+            List<FluidRule> fluidRules
+    ) {
+        snapshot = new Snapshot(
+                defaultMaterial,
+                defaultFluidMaterial,
+                tuning,
+                List.copyOf(blockRules),
+                List.copyOf(fluidRules),
+                new ConcurrentHashMap<>(),
+                new ConcurrentHashMap<>()
+        );
+    }
+
+    record Snapshot(
+            AcousticMaterial defaultMaterial,
+            AcousticMaterial defaultFluidMaterial,
+            AcousticTuning tuning,
+            List<Rule> blockRules,
+            List<FluidRule> fluidRules,
+            ConcurrentMap<BlockState, AcousticMaterial> blockMaterialCache,
+            ConcurrentMap<FluidState, AcousticMaterial> fluidMaterialCache
+    ) {
+    }
+
+    public static final class Rule {
+        private final String selector;
+        private final Identifier id;
+        private final TagKey<Block> tag;
+        private final AcousticMaterial material;
+
+        public Rule(String selector, AcousticMaterial material) {
+            this.selector = selector;
+            this.id = Identifier.parse(selector.startsWith("#") ? selector.substring(1) : selector);
+            this.tag = selector.startsWith("#") ? TagKey.create(Registries.BLOCK, id) : null;
+            this.material = material;
+        }
+
+        boolean matches(BlockState state) {
+            if (tag != null) {
+                return state.is(tag);
+            }
+            return BuiltInRegistries.BLOCK.getKey(state.getBlock()).equals(id);
+        }
+
+        AcousticMaterial material() {
+            return material;
+        }
+
+        @Override
+        public String toString() {
+            return selector;
+        }
+    }
+
+    public static final class FluidRule {
+        private final String selector;
+        private final Identifier id;
+        private final TagKey<Fluid> tag;
+        private final AcousticMaterial material;
+
+        public FluidRule(String selector, AcousticMaterial material) {
+            this.selector = selector;
+            this.id = Identifier.parse(selector.startsWith("#") ? selector.substring(1) : selector);
+            this.tag = selector.startsWith("#") ? TagKey.create(Registries.FLUID, id) : null;
+            this.material = material;
+        }
+
+        boolean matches(FluidState state) {
+            if (tag != null) {
+                return state.is(tag);
+            }
+            return BuiltInRegistries.FLUID.getKey(state.getType()).equals(id);
+        }
+
+        AcousticMaterial material() {
+            return material;
+        }
+
+        @Override
+        public String toString() {
+            return selector;
+        }
+    }
+}

@@ -1,0 +1,18 @@
+{
+  "required": true,
+  "package": "org.macaroon.acousticsystem.mixin.client",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ChannelAccessor",
+    "ChannelMixin",
+    "ClientLevelMixin",
+    "LibraryMixin",
+    "SoundEngineMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "overwrites": {
+    "requireAnnotations": true
+  }
+}

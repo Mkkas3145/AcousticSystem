@@ -1,0 +1,139 @@
+package org.macaroon.acousticsystem.client.material;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import net.fabricmc.fabric.api.resource.v1.reloader.SimpleReloadListener;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.resources.PreparableReloadListener;
+import net.minecraft.server.packs.resources.Resource;
+import org.macaroon.acousticsystem.AcousticSystem;
+
+import java.io.Reader;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+
+public final class AcousticMaterialReloadListener extends SimpleReloadListener<AcousticMaterialReloadListener.Prepared> {
+    private static final Gson GSON = new Gson();
+
+    @Override
+    protected Prepared prepare(PreparableReloadListener.SharedState state) {
+        Map<Identifier, Resource> resources = state.resourceManager().listResources(
+                "acoustic_materials",
+                id -> id.getPath().endsWith(".json")
+        );
+        List<Map.Entry<Identifier, Resource>> ordered = new ArrayList<>(resources.entrySet());
+        ordered.sort(Map.Entry.comparingByKey(Comparator.comparing(Identifier::toString)));
+
+        AcousticMaterial defaultMaterial = AcousticMaterial.DEFAULT;
+        AcousticMaterial defaultFluidMaterial = AcousticMaterial.DEFAULT_FLUID;
+        AcousticTuning tuning = AcousticTuning.DEFAULT;
+        List<AcousticMaterialRegistry.Rule> rules = new ArrayList<>();
+        List<AcousticMaterialRegistry.FluidRule> fluidRules = new ArrayList<>();
+        for (Map.Entry<Identifier, Resource> entry : ordered) {
+            try (Reader reader = entry.getValue().openAsReader()) {
+                JsonObject root = GSON.fromJson(reader, JsonObject.class);
+                AcousticMaterial fileDefault = defaultMaterial;
+                AcousticMaterial fileFluidDefault = defaultFluidMaterial;
+                AcousticTuning fileTuning = tuning;
+                List<AcousticMaterialRegistry.Rule> fileRules = new ArrayList<>();
+                List<AcousticMaterialRegistry.FluidRule> fileFluidRules = new ArrayList<>();
+                if (root.has("tuning")) {
+                    fileTuning = AcousticTuning.fromJson(root.getAsJsonObject("tuning"), fileTuning);
+                }
+                if (root.has("default")) {
+                    fileDefault = AcousticMaterial.fromJson(
+                            root.getAsJsonObject("default"), fileDefault, fileTuning.metersPerBlock()
+                    );
+                }
+                if (root.has("default_fluid")) {
+                    fileFluidDefault = AcousticMaterial.fromJson(
+                            root.getAsJsonObject("default_fluid"), fileFluidDefault,
+                            fileTuning.metersPerBlock()
+                    );
+                }
+
+                JsonArray materials = root.getAsJsonArray("materials");
+                if (materials != null) {
+                    for (JsonElement element : materials) {
+                        JsonObject materialObject = element.getAsJsonObject();
+                        JsonArray blocks = materialObject.getAsJsonArray("blocks");
+                        JsonArray fluids = materialObject.getAsJsonArray("fluids");
+                        if ((blocks == null || blocks.isEmpty()) && (fluids == null || fluids.isEmpty())) {
+                            throw new IllegalArgumentException("A material entry requires a non-empty 'blocks' or 'fluids' array");
+                        }
+                        if (blocks != null) {
+                            AcousticMaterial material = AcousticMaterial.fromJson(
+                                    materialObject, fileDefault, fileTuning.metersPerBlock()
+                            );
+                            for (JsonElement block : blocks) {
+                                String selector = block.getAsString();
+                                validateSelector(selector);
+                                fileRules.add(new AcousticMaterialRegistry.Rule(selector, material));
+                            }
+                        }
+                        if (fluids != null) {
+                            AcousticMaterial material = AcousticMaterial.fromJson(
+                                    materialObject, fileFluidDefault, fileTuning.metersPerBlock()
+                            );
+                            for (JsonElement fluid : fluids) {
+                                String selector = fluid.getAsString();
+                                validateSelector(selector);
+                                fileFluidRules.add(new AcousticMaterialRegistry.FluidRule(selector, material));
+                            }
+                        }
+                    }
+                }
+
+                if (root.has("replace") && root.get("replace").getAsBoolean()) {
+                    rules.clear();
+                    fluidRules.clear();
+                }
+                defaultMaterial = fileDefault;
+                defaultFluidMaterial = fileFluidDefault;
+                tuning = fileTuning;
+                rules.addAll(fileRules);
+                fluidRules.addAll(fileFluidRules);
+            } catch (Exception exception) {
+                AcousticSystem.LOGGER.error("Failed to load acoustic material file {} from pack {}",
+                        entry.getKey(), entry.getValue().sourcePackId(), exception);
+            }
+        }
+        return new Prepared(defaultMaterial, defaultFluidMaterial, tuning, rules, fluidRules);
+    }
+
+    @Override
+    protected void apply(Prepared prepared, PreparableReloadListener.SharedState state) {
+        AcousticMaterialRegistry.replace(
+                prepared.defaultMaterial(),
+                prepared.defaultFluidMaterial(),
+                prepared.tuning(),
+                prepared.rules(),
+                prepared.fluidRules()
+        );
+        AcousticSystem.LOGGER.info(
+                "Loaded {} acoustic block selectors and {} fluid selectors",
+                prepared.rules().size(),
+                prepared.fluidRules().size()
+        );
+    }
+
+    private static void validateSelector(String selector) {
+        String id = selector.startsWith("#") ? selector.substring(1) : selector;
+        if (Identifier.tryParse(id) == null) {
+            throw new IllegalArgumentException("Invalid block or tag identifier: " + selector);
+        }
+    }
+
+    record Prepared(
+            AcousticMaterial defaultMaterial,
+            AcousticMaterial defaultFluidMaterial,
+            AcousticTuning tuning,
+            List<AcousticMaterialRegistry.Rule> rules,
+            List<AcousticMaterialRegistry.FluidRule> fluidRules
+    ) {
+    }
+}

@@ -1,0 +1,348 @@
+package org.macaroon.acousticsystem.client.simulation;
+
+import net.minecraft.world.phys.Vec3;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.lwjgl.openal.AL;
+import org.lwjgl.openal.AL10;
+import org.lwjgl.openal.ALC;
+import org.lwjgl.openal.ALC10;
+import org.lwjgl.openal.ALCCapabilities;
+import org.lwjgl.openal.EXTEfx;
+import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
+
+import java.nio.ByteBuffer;
+import java.nio.IntBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.lang.reflect.Field;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class OpenALConvolutionSmokeTest {
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_OPENAL_SMOKE", matches = "true")
+    void prewarmsRealTimeEaxWithoutBlockingTheFirstSound() throws ReflectiveOperationException {
+        long device = ALC10.alcOpenDevice((ByteBuffer) null);
+        assertTrue(device != 0L);
+        ALCCapabilities deviceCapabilities = ALC.createCapabilities(device);
+        long context = ALC10.alcCreateContext(device, (IntBuffer) null);
+        assertTrue(context != 0L);
+        assertTrue(ALC10.alcMakeContextCurrent(context));
+        AL.createCapabilities(deviceCapabilities);
+
+        int source = AL10.alGenSources();
+        try {
+            AcousticResult result = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.25F, 1.0F, 0.0F,
+                    4.0,
+                    new Vec3(4.0, 0.0, 0.0),
+                    RoomAcoustics.OUTDOORS,
+                    RoomImpulseResponse.SILENT
+            );
+
+            long warmupStarted = System.nanoTime();
+            OpenALAcousticEffects.initialize();
+            double warmupMilliseconds = (System.nanoTime() - warmupStarted) / 1_000_000.0;
+            long started = System.nanoTime();
+            OpenALAcousticEffects.applyBeforePlay(source, result);
+            double elapsedMilliseconds = (System.nanoTime() - started) / 1_000_000.0;
+            RoomAcoustics indoor = new RoomAcoustics(
+                    0.75F, 0.68F, 0.32F, 0.72F, 0.95F,
+                    1.8F, 0.65F, 1.15F,
+                    0.28F, 0.018F, Vec3.ZERO,
+                    1.2F, 0.032F, Vec3.ZERO,
+                    0.6F, 0.08F, 0.94F
+            );
+            AcousticResult indoorResult = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.25F, 0.8F, 0.0F,
+                    4.0,
+                    new Vec3(4.0, 0.0, 0.0),
+                    indoor,
+                    RoomImpulseResponse.SILENT
+            );
+            long indoorStarted = System.nanoTime();
+            OpenALAcousticEffects.updateListenerRoom(indoor);
+            OpenALAcousticEffects.apply(source, indoorResult);
+            double indoorMilliseconds = (System.nanoTime() - indoorStarted) / 1_000_000.0;
+            double[] updateMilliseconds = new double[6];
+            for (int index = 0; index < updateMilliseconds.length; index++) {
+                float gain = 0.33F + index * 0.03F;
+                RoomAcoustics changed = new RoomAcoustics(
+                        0.75F, 0.68F, gain, 0.72F, 0.95F,
+                        1.8F, 0.65F, 1.15F,
+                        0.28F, 0.018F, Vec3.ZERO,
+                        1.2F, 0.032F, Vec3.ZERO,
+                        0.6F, 0.08F, 0.94F
+                );
+                AcousticResult changedResult = new AcousticResult(
+                        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F,
+                        0.25F, 0.8F, 0.0F, 4.0,
+                        new Vec3(4.0, 0.0, 0.0), changed, RoomImpulseResponse.SILENT
+                );
+                long updateStarted = System.nanoTime();
+                OpenALAcousticEffects.updateListenerRoom(changed);
+                OpenALAcousticEffects.apply(source, changedResult);
+                updateMilliseconds[index] = (System.nanoTime() - updateStarted) / 1_000_000.0;
+            }
+            System.out.println("warmupMilliseconds=" + warmupMilliseconds
+                    + ", firstSoundApplyMilliseconds=" + elapsedMilliseconds
+                    + ", firstIndoorBusMilliseconds=" + indoorMilliseconds
+                    + ", roomUpdateMilliseconds=" + java.util.Arrays.toString(updateMilliseconds));
+            assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
+            assertTrue(elapsedMilliseconds < warmupMilliseconds);
+            assertTrue(indoorMilliseconds < 10.0, () -> "first listener-room commit exceeded 10 ms: " + indoorMilliseconds);
+            for (double update : updateMilliseconds) {
+                assertTrue(update < 10.0, () -> "listener-room update exceeded 10 ms: " + update);
+            }
+
+            RoomAcoustics newestRoom = new RoomAcoustics(
+                    0.78F, 0.73F, 0.51F, 0.76F, 0.96F,
+                    2.0F, 0.69F, 1.18F,
+                    0.31F, 0.019F, Vec3.ZERO,
+                    1.3F, 0.034F, Vec3.ZERO,
+                    0.6F, 0.05F, 0.94F
+            );
+            AcousticResult newestResult = new AcousticResult(
+                    0.73F, 0.81F,
+                    0.73F, 0.70F, 0.66F, 0.59F,
+                    0.84F, 0.78F, 0.0F,
+                    1.4, new Vec3(1.4, 0.0, 0.0),
+                    newestRoom, RoomImpulseResponse.SILENT
+            );
+            RoomAcoustics staleRoom = new RoomAcoustics(
+                    0.20F, 0.18F, 0.07F, 0.45F, 0.82F,
+                    0.35F, 0.45F, 0.75F,
+                    0.04F, 0.008F, Vec3.ZERO,
+                    0.12F, 0.012F, Vec3.ZERO,
+                    0.2F, 0.0F, 0.98F
+            );
+            AcousticResult staleResult = new AcousticResult(
+                    0.11F, 0.35F,
+                    0.11F, 0.08F, 0.05F, 0.03F,
+                    0.09F, 0.42F, 0.0F,
+                    2.8, new Vec3(2.8, 0.0, 0.0),
+                    staleRoom, RoomImpulseResponse.SILENT
+            );
+            setStaticLong("lastListenerRoomUpdateNanoseconds", 0L);
+            setSourceStateLong(source, "lastUpdateNanoseconds", 0L);
+            OpenALAcousticEffects.applySequenced(source, newestResult, 200L);
+            float acceptedRoomGain = ((RoomAcoustics) staticField("smoothedListenerRoom")).gain();
+            float acceptedDirectGain = sourceStateFloat(source, "directGain");
+            OpenALAcousticEffects.applySequenced(source, staleResult, 100L);
+            assertEquals(
+                    acceptedRoomGain,
+                    ((RoomAcoustics) staticField("smoothedListenerRoom")).gain(),
+                    "An older channel callback must not roll the shared room field backward"
+            );
+            assertEquals(
+                    acceptedDirectGain,
+                    sourceStateFloat(source, "directGain"),
+                    "An older channel callback must not roll a voice response backward"
+            );
+
+            int laggingSource = AL10.alGenSources();
+            try {
+                OpenALAcousticEffects.applyBeforePlay(laggingSource, result);
+                setStaticLong("lastListenerRoomUpdateNanoseconds", 0L);
+                setSourceStateLong(source, "lastUpdateNanoseconds", 0L);
+                OpenALAcousticEffects.applySequenced(source, newestResult, 300L);
+                float globallyNewestRoomGain =
+                        ((RoomAcoustics) staticField("smoothedListenerRoom")).gain();
+
+                setSourceStateLong(laggingSource, "lastUpdateNanoseconds", 0L);
+                OpenALAcousticEffects.applySequenced(laggingSource, staleResult, 250L);
+                assertEquals(
+                        staleResult.directGain(),
+                        sourceStateFloat(laggingSource, "directGain"),
+                        1.0E-6F,
+                        "A source must accept its own newest result even when another channel advanced the room"
+                );
+                assertEquals(
+                        globallyNewestRoomGain,
+                        ((RoomAcoustics) staticField("smoothedListenerRoom")).gain(),
+                        "A lagging source must not roll the shared listener field backward"
+                );
+
+                OpenALAcousticEffects.applySequenced(laggingSource, newestResult, 240L);
+                assertEquals(
+                        staleResult.directGain(),
+                        sourceStateFloat(laggingSource, "directGain"),
+                        1.0E-6F,
+                        "The same source must still reject its own out-of-order result"
+                );
+            } finally {
+                OpenALAcousticEffects.releaseSource(laggingSource);
+                AL10.alDeleteSources(laggingSource);
+            }
+
+            Object establishedBus = staticField("activeReverbBus");
+            Object establishedKey = objectField(establishedBus, "key");
+            Object establishedRoom = staticField("smoothedListenerRoom");
+            OpenALAcousticEffects.prepareListenerRoomForOnset(RoomAcoustics.OUTDOORS);
+            assertSame(
+                    establishedBus,
+                    staticField("activeReverbBus"),
+                    "Starting another sound must not replace the listener field of existing voices"
+            );
+            assertSame(establishedRoom, staticField("smoothedListenerRoom"));
+
+            int oneShot = AL10.alGenSources();
+            OpenALAcousticEffects.applyBeforePlay(oneShot, result);
+            AcousticResult occludedOnset = new AcousticResult(
+                    0.2F, 0.35F,
+                    0.35F, 0.28F, 0.18F, 0.10F,
+                    0.12F, 0.45F, 0.08F,
+                    4.5, new Vec3(3.5, 0.0, 0.5),
+                    indoor, RoomImpulseResponse.SILENT
+            );
+            setSourceStateLong(oneShot, "lastUpdateNanoseconds", System.nanoTime());
+            OpenALAcousticEffects.applyOnsetCorrection(oneShot, occludedOnset);
+            float correctedOnsetGain = sourceStateFloat(oneShot, "directGain");
+            assertTrue(
+                    correctedOnsetGain > occludedOnset.directGain()
+                            && correctedOnsetGain < result.directGain(),
+                    "The first physical correction must follow the real-dt response instead of snapping"
+            );
+            setStaticLong("lastListenerRoomUpdateNanoseconds", 0L);
+            OpenALAcousticEffects.updateListenerRoom(new RoomAcoustics(
+                    0.70F, 0.72F, 0.29F, 0.69F, 0.94F,
+                    1.6F, 0.62F, 1.12F,
+                    0.24F, 0.016F, Vec3.ZERO,
+                    1.1F, 0.029F, Vec3.ZERO,
+                    0.5F, 0.0F, 0.95F
+            ));
+            Object migratedBus = staticField("activeReverbBus");
+            assertSame(
+                    establishedBus,
+                    migratedBus,
+                    "Listener motion must morph one persistent late field instead of restarting buses"
+            );
+            assertSame(
+                    establishedKey,
+                    objectField(migratedBus, "key"),
+                    "An active FDN must not be reassigned and lose its accumulated tail"
+            );
+            assertSame(migratedBus, sourceStateObject(source, "reverbBus"));
+            assertSame(
+                    migratedBus,
+                    sourceStateObject(oneShot, "reverbBus"),
+                    "A listener-room transition must migrate every active wet send together"
+            );
+            OpenALAcousticEffects.apply(oneShot, indoorResult);
+            OpenALAcousticEffects.releaseSource(oneShot);
+            AL10.alDeleteSources(oneShot);
+            assertAllReverbSlotsKeepTheirTailGain();
+
+            List<Integer> burstSources = new ArrayList<>();
+            for (int index = 0; index < 32; index++) {
+                int burstSource = AL10.alGenSources();
+                assertTrue(burstSource != 0, "OpenAL source pool exhausted during repeated-sound test");
+                burstSources.add(burstSource);
+                float low = 0.18F + (index % 7) * 0.11F;
+                float midLow = 0.22F + (index % 5) * 0.13F;
+                float midHigh = 0.16F + (index % 6) * 0.12F;
+                float high = 0.12F + (index % 4) * 0.17F;
+                AcousticResult burstResult = new AcousticResult(
+                        Math.max(Math.max(low, midLow), Math.max(midHigh, high)),
+                        high / Math.max(low, 0.01F),
+                        Math.min(low, 1.0F), Math.min(midLow, 1.0F),
+                        Math.min(midHigh, 1.0F), Math.min(high, 1.0F),
+                        0.35F, 0.7F, 0.0F,
+                        5.0, new Vec3(index % 8, 0.0, index / 8.0),
+                        indoor, RoomImpulseResponse.SILENT
+                );
+                OpenALAcousticEffects.applyBeforePlay(burstSource, burstResult);
+                assertEquals(
+                        AL10.AL_NO_ERROR,
+                        AL10.alGetError(),
+                        "EFX failed on simultaneous repeated sound " + index
+                );
+            }
+            for (int burstSource : burstSources) {
+                OpenALAcousticEffects.releaseSource(burstSource);
+                AL10.alDeleteSources(burstSource);
+            }
+            assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
+        } finally {
+            OpenALAcousticEffects.releaseSource(source);
+            OpenALAcousticEffects.shutdown();
+            AL10.alDeleteSources(source);
+            ALC10.alcMakeContextCurrent(0L);
+            ALC10.alcDestroyContext(context);
+            ALC10.alcCloseDevice(device);
+        }
+    }
+
+    private static void assertAllReverbSlotsKeepTheirTailGain() throws ReflectiveOperationException {
+        Field poolField = OpenALAcousticEffects.class.getDeclaredField("REVERB_POOL");
+        poolField.setAccessible(true);
+        List<?> buses = (List<?>) poolField.get(null);
+        assertTrue(buses.size() == 1);
+        Field slotField = buses.getFirst().getClass().getDeclaredField("slot");
+        slotField.setAccessible(true);
+        for (Object bus : buses) {
+            int slot = slotField.getInt(bus);
+            float gain = EXTEfx.alGetAuxiliaryEffectSlotf(slot, EXTEfx.AL_EFFECTSLOT_GAIN);
+            assertTrue(gain >= 0.0F && gain <= 1.0F);
+        }
+    }
+
+    private static float sourceStateFloat(int source, String fieldName)
+            throws ReflectiveOperationException {
+        Object state = sourceState(source);
+        Field valueField = state.getClass().getDeclaredField(fieldName);
+        valueField.setAccessible(true);
+        return valueField.getFloat(state);
+    }
+
+    private static void setSourceStateLong(int source, String fieldName, long value)
+            throws ReflectiveOperationException {
+        Object state = sourceState(source);
+        Field valueField = state.getClass().getDeclaredField(fieldName);
+        valueField.setAccessible(true);
+        valueField.setLong(state, value);
+    }
+
+    private static Object sourceStateObject(int source, String fieldName)
+            throws ReflectiveOperationException {
+        Object state = sourceState(source);
+        Field valueField = state.getClass().getDeclaredField(fieldName);
+        valueField.setAccessible(true);
+        return valueField.get(state);
+    }
+
+    private static Object sourceState(int source) throws ReflectiveOperationException {
+        Field sourcesField = OpenALAcousticEffects.class.getDeclaredField("SOURCES");
+        sourcesField.setAccessible(true);
+        Map<?, ?> sources = (Map<?, ?>) sourcesField.get(null);
+        return sources.get(source);
+    }
+
+    private static Object staticField(String fieldName) throws ReflectiveOperationException {
+        Field field = OpenALAcousticEffects.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(null);
+    }
+
+    private static Object objectField(Object object, String fieldName)
+            throws ReflectiveOperationException {
+        Field field = object.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(object);
+    }
+
+    private static void setStaticLong(String fieldName, long value)
+            throws ReflectiveOperationException {
+        Field field = OpenALAcousticEffects.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.setLong(null, value);
+    }
+}
