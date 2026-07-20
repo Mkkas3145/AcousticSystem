@@ -1,10 +1,14 @@
 package org.macaroon.acousticsystem.client.audio;
 
+import net.minecraft.world.phys.Vec3;
 import org.lwjgl.openal.AL;
 import org.lwjgl.openal.AL10;
+import org.lwjgl.openal.AL11;
+import org.lwjgl.openal.EXTBFormat;
 import org.lwjgl.openal.EXTFloat32;
 import org.lwjgl.openal.SOFTCallbackBuffer;
 import org.lwjgl.openal.SOFTCallbackBufferType;
+import org.lwjgl.openal.SOFTBformatEx;
 import org.lwjgl.system.MemoryUtil;
 import org.macaroon.acousticsystem.AcousticSystem;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
@@ -27,7 +31,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  */
 public final class SoftwareAcousticMixer {
     static final int OUTPUT_RATE = 48_000;
-    private static final int BYTES_PER_FRAME = Float.BYTES * 2;
+    private static final int STEREO_CHANNELS = 2;
+    private static final int AMBISONIC_CHANNELS = 4;
+    private static final float INVERSE_SQRT_TWO = 0.70710677F;
     private static final Object LOCK = new Object();
     private static final Map<Integer, Voice> CURRENT_VOICES = new HashMap<>();
     private static final List<Voice> DETACHED_TAILS = new ArrayList<>();
@@ -36,6 +42,9 @@ public final class SoftwareAcousticMixer {
     private static boolean initialized;
     private static int outputBuffer;
     private static int outputSource;
+    private static boolean ambisonicOutput;
+    private static int outputChannels = STEREO_CHANNELS;
+    private static int bytesPerFrame = Float.BYTES * STEREO_CHANNELS;
     private static SOFTCallbackBufferType callback;
     private static volatile Throwable callbackFailure;
     private static volatile boolean callbackFailureReported;
@@ -44,6 +53,8 @@ public final class SoftwareAcousticMixer {
     private static volatile long lastHealthReportNanoseconds;
     private static float[] leftScratch = new float[8_192];
     private static float[] rightScratch = new float[8_192];
+    private static float[] thirdScratch = new float[8_192];
+    private static float[] fourthScratch = new float[8_192];
 
     private SoftwareAcousticMixer() {
     }
@@ -86,9 +97,26 @@ public final class SoftwareAcousticMixer {
                 cleanupOutputObjects();
                 return;
             }
+            ambisonicOutput = AL.getCapabilities().AL_EXT_BFORMAT;
+            outputChannels = ambisonicOutput ? AMBISONIC_CHANNELS : STEREO_CHANNELS;
+            bytesPerFrame = Float.BYTES * outputChannels;
+            if (ambisonicOutput && AL.getCapabilities().AL_SOFT_bformat_ex) {
+                AL11.alBufferi(
+                        outputBuffer,
+                        SOFTBformatEx.AL_AMBISONIC_LAYOUT_SOFT,
+                        SOFTBformatEx.AL_FUMA_SOFT
+                );
+                AL11.alBufferi(
+                        outputBuffer,
+                        SOFTBformatEx.AL_AMBISONIC_SCALING_SOFT,
+                        SOFTBformatEx.AL_FUMA_SOFT
+                );
+            }
             SOFTCallbackBuffer.alBufferCallbackSOFT(
                     outputBuffer,
-                    EXTFloat32.AL_FORMAT_STEREO_FLOAT32,
+                    ambisonicOutput
+                            ? EXTBFormat.AL_FORMAT_BFORMAT3D_FLOAT32
+                            : EXTFloat32.AL_FORMAT_STEREO_FLOAT32,
                     OUTPUT_RATE,
                     callback,
                     1L
@@ -114,7 +142,8 @@ public final class SoftwareAcousticMixer {
             worstCallbackNanoseconds = 0L;
             lastHealthReportNanoseconds = System.nanoTime();
             AcousticSystem.LOGGER.info(
-                    "Software acoustic field mixer enabled without per-sound EFX slots"
+                    "Software acoustic field mixer enabled without per-sound EFX slots ({})",
+                    ambisonicOutput ? "first-order ambisonic" : "stereo fallback"
             );
         }
     }
@@ -237,7 +266,8 @@ public final class SoftwareAcousticMixer {
             int source,
             EarlyReflection earlyReflection,
             float earlySend,
-            float earlyPan,
+            Vec3 earlyDirection,
+            Vec3 propagationDirection,
             RoomAcoustics listenerRoom,
             float listenerSend,
             float listenerHighFrequency,
@@ -252,7 +282,8 @@ public final class SoftwareAcousticMixer {
         voice.updateAcoustics(new VoiceAcoustics(
                 earlyReflection,
                 clamp(earlySend, 0.0F, 1.0F),
-                clamp(earlyPan, -1.0F, 1.0F),
+                normalizedOrZero(earlyDirection),
+                AmbisonicDirection.from(propagationDirection),
                 listenerRoom == null ? RoomAcoustics.OUTDOORS : listenerRoom,
                 clamp(listenerSend, 0.0F, 1.0F),
                 clamp(listenerHighFrequency, 0.0F, 1.0F),
@@ -303,7 +334,7 @@ public final class SoftwareAcousticMixer {
 
     private static void recordCallbackDuration(long started, int numbytes) {
         long elapsed = System.nanoTime() - started;
-        int frames = Math.max(1, numbytes / BYTES_PER_FRAME);
+        int frames = Math.max(1, numbytes / bytesPerFrame);
         long deadline = Math.max(
                 1L,
                 Math.round(frames * 1_000_000_000.0 / OUTPUT_RATE)
@@ -342,25 +373,42 @@ public final class SoftwareAcousticMixer {
     }
 
     private static int render(long address, int numbytes) {
-        int frames = Math.max(0, numbytes / BYTES_PER_FRAME);
+        int frames = Math.max(0, numbytes / bytesPerFrame);
         if (leftScratch.length < frames) {
             int capacity = Math.max(256, Integer.highestOneBit(frames - 1) << 1);
             leftScratch = new float[capacity];
             rightScratch = new float[leftScratch.length];
+            thirdScratch = new float[leftScratch.length];
+            fourthScratch = new float[leftScratch.length];
         }
         Arrays.fill(leftScratch, 0, frames, 0.0F);
         Arrays.fill(rightScratch, 0, frames, 0.0F);
+        if (ambisonicOutput) {
+            Arrays.fill(thirdScratch, 0, frames, 0.0F);
+            Arrays.fill(fourthScratch, 0, frames, 0.0F);
+        }
         Voice[] voices = renderVoices;
         for (Voice voice : voices) {
-            voice.render(leftScratch, rightScratch, frames);
+            voice.render(
+                    leftScratch,
+                    rightScratch,
+                    thirdScratch,
+                    fourthScratch,
+                    frames,
+                    ambisonicOutput
+            );
         }
         long cursor = address;
         for (int frame = 0; frame < frames; frame++) {
             MemoryUtil.memPutFloat(cursor, leftScratch[frame]);
             MemoryUtil.memPutFloat(cursor + Float.BYTES, rightScratch[frame]);
-            cursor += BYTES_PER_FRAME;
+            if (ambisonicOutput) {
+                MemoryUtil.memPutFloat(cursor + Float.BYTES * 2L, thirdScratch[frame]);
+                MemoryUtil.memPutFloat(cursor + Float.BYTES * 3L, fourthScratch[frame]);
+            }
+            cursor += bytesPerFrame;
         }
-        return frames * BYTES_PER_FRAME;
+        return frames * bytesPerFrame;
     }
 
     private static void cleanupOutputObjects() {
@@ -378,11 +426,20 @@ public final class SoftwareAcousticMixer {
             callback.free();
             callback = null;
         }
+        ambisonicOutput = false;
+        outputChannels = STEREO_CHANNELS;
+        bytesPerFrame = Float.BYTES * STEREO_CHANNELS;
         AL10.alGetError();
     }
 
     private static float clamp(float value, float minimum, float maximum) {
         return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private static Vec3 normalizedOrZero(Vec3 direction) {
+        return direction == null || direction.lengthSqr() <= 1.0E-12
+                ? Vec3.ZERO
+                : direction.normalize();
     }
 
     static float wrapRingPosition(float position, int capacity) {
@@ -404,10 +461,106 @@ public final class SoftwareAcousticMixer {
         return 1.0F - (float) Math.exp(-1.0F / (OUTPUT_RATE * seconds));
     }
 
+    static void addAmbisonicPoint(
+            float sample,
+            float localRight,
+            float localUp,
+            float localBack,
+            float[] w,
+            float[] front,
+            float[] left,
+            float[] up,
+            int frame
+    ) {
+        w[frame] += sample * INVERSE_SQRT_TWO;
+        front[frame] -= sample * localBack;
+        left[frame] -= sample * localRight;
+        up[frame] += sample * localUp;
+    }
+
+    private static void addAmbisonicDiffuse(
+            float stereoLeft,
+            float stereoRight,
+            float[] w,
+            float[] left,
+            int frame
+    ) {
+        // Preserve the old stereo field as two opposed lateral plane waves. Their
+        // common component is omnidirectional while their difference remains diffuse.
+        w[frame] += (stereoLeft + stereoRight) * INVERSE_SQRT_TWO;
+        left[frame] += stereoLeft - stereoRight;
+    }
+
+    private static void addAmbisonicDirectionalField(
+            float stereoLeft,
+            float stereoRight,
+            AmbisonicDirection direction,
+            float[] w,
+            float[] front,
+            float[] left,
+            float[] up,
+            int frame
+    ) {
+        if (!direction.valid()) {
+            addAmbisonicDiffuse(stereoLeft, stereoRight, w, left, frame);
+            return;
+        }
+        float mid = (stereoLeft + stereoRight) * INVERSE_SQRT_TWO;
+        float side = (stereoLeft - stereoRight) * INVERSE_SQRT_TWO;
+        addAmbisonicPoint(
+                mid,
+                direction.right(),
+                direction.up(),
+                direction.back(),
+                w, front, left, up, frame
+        );
+
+        // The orthogonal mid/side transform preserves the field's decorrelated width.
+        // Its side channel is a tangent dipole, not a second arbitrary apparent source.
+        front[frame] += side * direction.tangentFront();
+        left[frame] += side * direction.tangentLeft();
+    }
+
+    private record AmbisonicDirection(
+            float right,
+            float up,
+            float back,
+            float tangentFront,
+            float tangentLeft,
+            boolean valid
+    ) {
+        private static final AmbisonicDirection ZERO = new AmbisonicDirection(
+                0.0F, 0.0F, 0.0F, 0.0F, 0.0F, false
+        );
+
+        private static AmbisonicDirection from(Vec3 rawDirection) {
+            Vec3 direction = normalizedOrZero(rawDirection);
+            if (direction.lengthSqr() <= 1.0E-12) {
+                return ZERO;
+            }
+            float right = (float) direction.x;
+            float up = (float) direction.y;
+            float back = (float) direction.z;
+            float horizontalLength = (float) Math.sqrt(right * right + back * back);
+            return horizontalLength > 1.0E-6F
+                    ? new AmbisonicDirection(
+                            right, up, back,
+                            right / horizontalLength,
+                            -back / horizontalLength,
+                            true
+                    )
+                    : new AmbisonicDirection(
+                            right, up, back,
+                            0.0F, -1.0F, true
+                    );
+        }
+    }
+
     private record VoiceAcoustics(
             EarlyReflection early,
             float earlySend,
-            float earlyPan,
+            Vec3 earlyDirection,
+            AmbisonicDirection propagationDirection,
             RoomAcoustics listenerRoom,
             float listenerSend,
             float listenerHighFrequency,
@@ -419,7 +572,8 @@ public final class SoftwareAcousticMixer {
         private static final VoiceAcoustics SILENT = new VoiceAcoustics(
                 EarlyReflection.SILENT,
                 0.0F,
-                0.0F,
+                Vec3.ZERO,
+                AmbisonicDirection.ZERO,
                 RoomAcoustics.OUTDOORS,
                 0.0F,
                 1.0F,
@@ -499,7 +653,14 @@ public final class SoftwareAcousticMixer {
                     || sourceField.hasPendingEnergy();
         }
 
-        private void render(float[] left, float[] right, int frames) {
+        private void render(
+                float[] first,
+                float[] second,
+                float[] third,
+                float[] fourth,
+                int frames,
+                boolean ambisonic
+        ) {
             if (finished || paused) {
                 return;
             }
@@ -508,7 +669,7 @@ public final class SoftwareAcousticMixer {
                 if (current != renderedAcoustics) {
                     early.configure(
                             current.early(), current.earlySend(),
-                            current.earlyPan(), current.controlCoefficient()
+                            current.earlyDirection(), current.controlCoefficient()
                     );
                     if (renderedAcoustics == null) {
                         renderedListenerSend = current.listenerSend();
@@ -536,7 +697,7 @@ public final class SoftwareAcousticMixer {
                                 - renderedSourceHighFrequency
                 ) * response;
                 float input = playing && !inputEnded ? nextSample() * volume : 0.0F;
-                long earlyOutput = early.process(input);
+                float earlyOutput = early.process(input);
                 long listenerOutput = listenerField.process(
                         input * renderedListenerSend,
                         renderedListenerHighFrequency
@@ -545,10 +706,33 @@ public final class SoftwareAcousticMixer {
                         input * renderedSourceSend,
                         renderedSourceHighFrequency
                 );
-                left[frame] += unpackLeft(earlyOutput)
-                        + unpackLeft(listenerOutput) + unpackLeft(sourceOutput);
-                right[frame] += unpackRight(earlyOutput)
-                        + unpackRight(listenerOutput) + unpackRight(sourceOutput);
+                float listenerLeft = unpackLeft(listenerOutput);
+                float listenerRight = unpackRight(listenerOutput);
+                float sourceLeft = unpackLeft(sourceOutput);
+                float sourceRight = unpackRight(sourceOutput);
+                if (ambisonic) {
+                    addAmbisonicPoint(
+                            earlyOutput,
+                            early.currentDirectionX(),
+                            early.currentDirectionY(),
+                            early.currentDirectionZ(),
+                            first, second, third, fourth, frame
+                    );
+                    addAmbisonicDiffuse(
+                            listenerLeft, listenerRight,
+                            first, third, frame
+                    );
+                    addAmbisonicDirectionalField(
+                            sourceLeft, sourceRight,
+                            current.propagationDirection(),
+                            first, second, third, fourth, frame
+                    );
+                } else {
+                    first[frame] += earlyOutput * early.currentLeftPan()
+                            + listenerLeft + sourceLeft;
+                    second[frame] += earlyOutput * early.currentRightPan()
+                            + listenerRight + sourceRight;
+                }
             }
             if (inputEnded && !hasPendingEnergy()) {
                 finished = true;
@@ -604,6 +788,12 @@ public final class SoftwareAcousticMixer {
         private float targetLeftPan = 0.70710677F;
         private float currentRightPan = 0.70710677F;
         private float targetRightPan = 0.70710677F;
+        private float currentDirectionX;
+        private float currentDirectionY;
+        private float currentDirectionZ;
+        private float targetDirectionX;
+        private float targetDirectionY;
+        private float targetDirectionZ;
         private float response = 0.001F;
         private float lowPassState;
         private int remainingFrames;
@@ -611,7 +801,7 @@ public final class SoftwareAcousticMixer {
         private void configure(
                 EarlyReflection reflection,
                 float transportGain,
-                float listenerPan,
+                Vec3 listenerDirection,
                 float controlCoefficient
         ) {
             targetDelayFrames = clamp(
@@ -625,7 +815,10 @@ public final class SoftwareAcousticMixer {
             targetHighFrequency = clamp(
                     reflection.highFrequencyGain(), 0.0F, 1.0F
             );
-            float pan = clamp(listenerPan, -1.0F, 1.0F);
+            targetDirectionX = (float) listenerDirection.x;
+            targetDirectionY = (float) listenerDirection.y;
+            targetDirectionZ = (float) listenerDirection.z;
+            float pan = clamp(targetDirectionX, -1.0F, 1.0F);
             targetLeftPan = (float) Math.sqrt(0.5F * (1.0F - pan));
             targetRightPan = (float) Math.sqrt(0.5F * (1.0F + pan));
             response = clamp(controlCoefficient, 1.0E-5F, 1.0F);
@@ -636,12 +829,15 @@ public final class SoftwareAcousticMixer {
                 currentHighFrequency = targetHighFrequency;
                 currentLeftPan = targetLeftPan;
                 currentRightPan = targetRightPan;
+                currentDirectionX = targetDirectionX;
+                currentDirectionY = targetDirectionY;
+                currentDirectionZ = targetDirectionZ;
             }
         }
 
-        private long process(float input) {
+        private float process(float input) {
             if (delay == null) {
-                return 0L;
+                return 0.0F;
             }
             currentDelayFrames += (targetDelayFrames - currentDelayFrames) * response;
             currentGain += (targetGain - currentGain) * response;
@@ -650,6 +846,9 @@ public final class SoftwareAcousticMixer {
             ) * response;
             currentLeftPan += (targetLeftPan - currentLeftPan) * response;
             currentRightPan += (targetRightPan - currentRightPan) * response;
+            currentDirectionX += (targetDirectionX - currentDirectionX) * response;
+            currentDirectionY += (targetDirectionY - currentDirectionY) * response;
+            currentDirectionZ += (targetDirectionZ - currentDirectionZ) * response;
             delay[write] = input;
             // Adding a tiny negative float to a large ring length may round to the
             // length itself (for example -0.0001 + 16384 -> 16384). Normalize after
@@ -670,10 +869,27 @@ public final class SoftwareAcousticMixer {
             } else if (remainingFrames > 0) {
                 remainingFrames--;
             }
-            return pack(
-                    sample * currentLeftPan,
-                    sample * currentRightPan
-            );
+            return sample;
+        }
+
+        private float currentLeftPan() {
+            return currentLeftPan;
+        }
+
+        private float currentRightPan() {
+            return currentRightPan;
+        }
+
+        private float currentDirectionX() {
+            return currentDirectionX;
+        }
+
+        private float currentDirectionY() {
+            return currentDirectionY;
+        }
+
+        private float currentDirectionZ() {
+            return currentDirectionZ;
         }
 
         private void endInput() {

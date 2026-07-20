@@ -887,6 +887,45 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void horizontalTunnelTurningIntoAVerticalShaftKeepsTheFinalArrivalDirection() {
+        SolidGeometry bentShaft = position -> {
+            double x = position.getX() + 0.5;
+            double y = position.getY() + 0.5;
+            double z = position.getZ() + 0.5;
+            boolean horizontalTunnel = x >= 0.0 && x <= 12.0
+                    && y >= 1.0 && y <= 4.0
+                    && z >= 1.0 && z <= 4.0;
+            boolean verticalShaft = x >= 9.0 && x <= 12.0
+                    && y >= 1.0 && y <= 14.0
+                    && z >= 1.0 && z <= 4.0;
+            return !(horizontalTunnel || verticalShaft);
+        };
+        TestWorld world = new TestWorld(bentShaft);
+        Vec3 source = new Vec3(1.5, 2.5, 2.5);
+        Vec3 listener = new Vec3(10.5, 12.5, 2.5);
+        AcousticResult result = AcousticTracer.trace(
+                world,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(world, source),
+                AcousticTracer.probeRoom(world, listener),
+                AcousticTracer.TraceQuality.FULL
+        );
+        Vec3 arrival = result.apparentPosition().subtract(listener).normalize();
+
+        assertTrue(
+                result.diffractionContribution() > 1.0E-5F,
+                () -> "The connected horizontal-to-vertical tunnel was treated as sealed: "
+                        + result
+        );
+        assertTrue(
+                arrival.y < -0.65,
+                () -> "The final shaft segment must arrive from below: arrival="
+                        + arrival + ", result=" + result
+        );
+    }
+
+    @Test
     @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
     void seededNoiseCaveTraceRemainsBelowTenMilliseconds() {
         NoiseCave cave = new NoiseCave(0x5EEDC0DEL, 64);

@@ -313,6 +313,8 @@ public final class OpenALAcousticEffects {
         if (!ensureSupport()) {
             return;
         }
+        Vec3 previousListenerPosition = lastDynamicListenerPosition;
+        lastDynamicListenerPosition = listener;
         if (SoftwareAcousticMixer.available()) {
             return;
         }
@@ -327,11 +329,10 @@ public final class OpenALAcousticEffects {
             // is important immediately after a block edit: the room must settle according
             // to elapsed physical time, not wait for another movement event.
             advanceListenerField(now);
-            if (lastDynamicListenerPosition != null
-                    && listener.distanceToSqr(lastDynamicListenerPosition) <= 1.0E-10) {
+            if (previousListenerPosition != null
+                    && listener.distanceToSqr(previousListenerPosition) <= 1.0E-10) {
                 return;
             }
-            lastDynamicListenerPosition = listener;
             PortalRadiation activeRadiation = activeReverbBus.field == null
                     ? PortalRadiation.INSIDE
                     : activeReverbBus.field.apertureRadiation(listener, true);
@@ -529,13 +530,19 @@ public final class OpenALAcousticEffects {
                 Vec3 earlyDirection = listenerRelativeDirection(
                         state.earlyReflection.arrivalDirection()
                 );
+                Vec3 propagationDirection = lastDynamicListenerPosition == null
+                        ? Vec3.ZERO
+                        : listenerRelativeDirection(
+                                state.apparentPosition.subtract(lastDynamicListenerPosition)
+                        );
                 float transportedGain = state.propagationGain
                         * state.audibilityGain;
                 SoftwareAcousticMixer.apply(
                         source,
                         state.earlyReflection,
                         transportedGain,
-                        (float) earlyDirection.x,
+                        earlyDirection,
+                        propagationDirection,
                         target.reverbRoom(),
                         state.reverbSend * transportedGain,
                         state.reverbHighFrequency,
