@@ -75,6 +75,21 @@ final class DiffuseFieldOverlapTest {
     }
 
     @Test
+    void listenerFieldChangesOnlyAfterCrossingTheFiniteOpening() {
+        Vec3 inside = Vec3.ZERO;
+        Vec3 opening = new Vec3(2.0, 0.0, 0.0);
+        Vec3 outward = new Vec3(1.0, 0.0, 0.0);
+        double area = 4.0;
+
+        assertTrue(OpenALAcousticEffects.segmentCrossesAperture(
+                inside, new Vec3(3.0, 0.0, 0.0), opening, outward, area
+        ));
+        assertEquals(false, OpenALAcousticEffects.segmentCrossesAperture(
+                inside, new Vec3(3.0, 4.0, 0.0), opening, outward, area
+        ));
+    }
+
+    @Test
     void apertureTransportOverridesStaleSameRoomOverlapAfterCrossingTheExit() {
         float nearExit = OpenALAcousticEffects.transportedDiffuseFieldGain(
                 ROOM, ROOM, 0.80F, true

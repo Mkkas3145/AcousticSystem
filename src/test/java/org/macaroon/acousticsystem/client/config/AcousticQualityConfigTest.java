@@ -15,8 +15,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AcousticQualityConfigTest {
     @AfterEach
     void restoreDefault() {
+        AcousticQualityConfig.setEnabled(true);
         AcousticQualityConfig.resetPhysics();
         AcousticQualityConfig.applyPreset(QualityPreset.HIGH);
+    }
+
+    @Test
+    void masterSwitchPreservesPresetAndSurvivesPersistence() {
+        AcousticQualityConfig.applyPreset(QualityPreset.ULTRA);
+        AcousticQualityConfig.setEnabled(false);
+        AcousticQualityConfig.applyPreset(QualityPreset.LOW);
+
+        Settings current = AcousticQualityConfig.settings();
+        assertFalse(current.enabled());
+        assertEquals(QualityPreset.LOW, current.preset());
+        assertFalse(AcousticQualityConfig.deserialize(
+                AcousticQualityConfig.serialize(current)
+        ).enabled());
+        assertTrue(AcousticQualityConfig.deserialize("{\"preset\":\"high\"}").enabled());
     }
 
     @Test

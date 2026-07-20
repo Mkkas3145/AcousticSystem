@@ -1,5 +1,7 @@
 {
   "acousticsystem.options.title": "사운드 물리학",
+  "acousticsystem.options.enabled": "전체 효과",
+  "acousticsystem.options.enabled.tooltip": "끄면 설정값은 유지한 채 바닐라 사운드 처리로 전환합니다.",
   "acousticsystem.options.open.tooltip": "블록과 공간에 따른 소리 계산 품질을 설정합니다.",
   "acousticsystem.options.quality": "품질 프리셋",
   "acousticsystem.options.preset": "품질",

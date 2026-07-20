@@ -26,8 +26,22 @@ public final class SoundPhysicsScreen extends OptionsSubScreen {
 
     @Override
     protected void addOptions() {
-        list.addHeader(Component.translatable("acousticsystem.options.quality"));
         Settings current = AcousticQualityConfig.settings();
+        CycleButton<Boolean> enabled = CycleButton.booleanBuilder(
+                        Component.translatable("options.on"),
+                        Component.translatable("options.off"),
+                        current.enabled()
+                )
+                .withTooltip(value -> Tooltip.create(Component.translatable(
+                        "acousticsystem.options.enabled.tooltip"
+                )))
+                .create(
+                        Component.translatable("acousticsystem.options.enabled"),
+                        (button, value) -> AcousticQualityConfig.setEnabled(value)
+                );
+        list.addBig(enabled);
+
+        list.addHeader(Component.translatable("acousticsystem.options.quality"));
         CycleButton<QualityPreset> preset = CycleButton.builder(
                         SoundPhysicsScreen::presetName,
                         current.preset()

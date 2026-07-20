@@ -1,5 +1,7 @@
 {
   "acousticsystem.options.title": "Sound Physics",
+  "acousticsystem.options.enabled": "All Effects",
+  "acousticsystem.options.enabled.tooltip": "Switches to vanilla sound processing while preserving these settings.",
   "acousticsystem.options.open.tooltip": "Configure the quality of block- and room-aware sound processing.",
   "acousticsystem.options.quality": "Quality Preset",
   "acousticsystem.options.preset": "Quality",

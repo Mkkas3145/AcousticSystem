@@ -69,7 +69,13 @@ public final class AcousticQualityConfig {
     }
 
     public static void applyPreset(QualityPreset preset) {
-        update(Settings.fromPreset(preset).withPhysics(settings.physics()));
+        update(Settings.fromPreset(preset)
+                .withEnabled(settings.enabled())
+                .withPhysics(settings.physics()));
+    }
+
+    public static void setEnabled(boolean enabled) {
+        update(settings.withEnabled(enabled));
     }
 
     public static void updatePhysics(UnaryOperator<PhysicsSettings> change) {
@@ -390,6 +396,7 @@ public final class AcousticQualityConfig {
     public record Settings(
             QualityPreset preset,
             boolean customized,
+            boolean enabled,
             boolean reflectionsEnabled,
             boolean diffractionEnabled,
             boolean reverbEnabled,
@@ -402,13 +409,13 @@ public final class AcousticQualityConfig {
     ) {
         public static Settings fromPreset(QualityPreset preset) {
             return switch (preset) {
-                case LOW -> new Settings(preset, false, true, true, true,
+                case LOW -> new Settings(preset, false, true, true, true, true,
                         64, 32, 24, 5, 2, PhysicsSettings.DEFAULT);
-                case MEDIUM -> new Settings(preset, false, true, true, true,
+                case MEDIUM -> new Settings(preset, false, true, true, true, true,
                         128, 64, 48, 8, 3, PhysicsSettings.DEFAULT);
-                case HIGH -> new Settings(preset, false, true, true, true,
+                case HIGH -> new Settings(preset, false, true, true, true, true,
                         256, 128, 96, 12, 4, PhysicsSettings.DEFAULT);
-                case ULTRA -> new Settings(preset, false, true, true, true,
+                case ULTRA -> new Settings(preset, false, true, true, true, true,
                         320, 160, 128, 14, 6, PhysicsSettings.DEFAULT);
             };
         }
@@ -418,7 +425,8 @@ public final class AcousticQualityConfig {
             int safeRoomRays = clampStep(roomRayCount, 32, 1024, 32);
             int safeSourceRays = Math.min(clampStep(sourceRoomRayCount, 16, 1024, 16), safeRoomRays);
             return new Settings(
-                    safePreset, customized, reflectionsEnabled, diffractionEnabled, reverbEnabled,
+                    safePreset, customized, enabled,
+                    reflectionsEnabled, diffractionEnabled, reverbEnabled,
                     safeRoomRays, safeSourceRays, clampStep(lateReverbRayCount, 24, 512, 8),
                     Math.clamp(lateReverbMaxBounces, 2, 16),
                     Math.clamp(diffractionMaxPaths, 1, 8),
@@ -427,9 +435,17 @@ public final class AcousticQualityConfig {
         }
 
         public Settings withPhysics(PhysicsSettings value) {
-            return new Settings(preset, customized, reflectionsEnabled, diffractionEnabled,
+            return new Settings(preset, customized, enabled,
+                    reflectionsEnabled, diffractionEnabled,
                     reverbEnabled, roomRayCount, sourceRoomRayCount, lateReverbRayCount,
                     lateReverbMaxBounces, diffractionMaxPaths, value);
+        }
+
+        public Settings withEnabled(boolean value) {
+            return new Settings(preset, customized, value,
+                    reflectionsEnabled, diffractionEnabled, reverbEnabled,
+                    roomRayCount, sourceRoomRayCount, lateReverbRayCount,
+                    lateReverbMaxBounces, diffractionMaxPaths, physics);
         }
 
         public Settings withReflections(boolean value) {
@@ -484,7 +500,7 @@ public final class AcousticQualityConfig {
                 boolean custom, boolean reflections, boolean diffraction, boolean reverb,
                 int roomRays, int sourceRays, int lateRays, int bounces, int paths
         ) {
-            return new Settings(preset, custom, reflections, diffraction, reverb,
+            return new Settings(preset, custom, enabled, reflections, diffraction, reverb,
                     roomRays, sourceRays, lateRays, bounces, paths, physics);
         }
 
@@ -497,6 +513,7 @@ public final class AcousticQualityConfig {
     private static final class StoredSettings {
         private String preset;
         private boolean customized;
+        private Boolean enabled;
         private boolean reflectionsEnabled;
         private boolean diffractionEnabled;
         private boolean reverbEnabled;
@@ -511,7 +528,7 @@ public final class AcousticQualityConfig {
             QualityPreset quality = QualityPreset.parse(preset);
             Settings defaults = Settings.fromPreset(quality);
             return new Settings(
-                    quality, customized,
+                    quality, customized, enabled == null || enabled,
                     roomRayCount == 0 ? defaults.reflectionsEnabled() : reflectionsEnabled,
                     roomRayCount == 0 ? defaults.diffractionEnabled() : diffractionEnabled,
                     roomRayCount == 0 ? defaults.reverbEnabled() : reverbEnabled,
@@ -528,6 +545,7 @@ public final class AcousticQualityConfig {
             StoredSettings stored = new StoredSettings();
             stored.preset = settings.preset().serializedName();
             stored.customized = settings.customized();
+            stored.enabled = settings.enabled();
             stored.reflectionsEnabled = settings.reflectionsEnabled();
             stored.diffractionEnabled = settings.diffractionEnabled();
             stored.reverbEnabled = settings.reverbEnabled();

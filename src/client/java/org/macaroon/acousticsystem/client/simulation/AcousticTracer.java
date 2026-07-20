@@ -40,9 +40,10 @@ public final class AcousticTracer {
     private static final Vec3 POSITIVE_Y_NORMAL = new Vec3(0.0, 1.0, 0.0);
     private static final Vec3 NEGATIVE_Z_NORMAL = new Vec3(0.0, 0.0, -1.0);
     private static final Vec3 POSITIVE_Z_NORMAL = new Vec3(0.0, 0.0, 1.0);
-    // EAX exposes one aggregate early-reflection cluster, so four diverse physical
-    // image paths retain the useful directional/energy estimate without tracing extra
-    // paths that the output stage cannot represent separately.
+    // EAX exposes one aggregate early-reflection cluster. The tracer still examines all
+    // sampled image paths and retains the strongest independent contributions; stopping
+    // at the first four valid planes made an echo appear or disappear when candidate
+    // ordering changed during small movements.
     private static final int MAX_EARLY_REFLECTION_PATHS_PER_SOUND = 4;
     private static final int DIFFRACTION_CANDIDATE_BUDGET = 20;
     private static final int MAX_ROOM_REFLECTION_SURFACES = 32;
@@ -267,6 +268,7 @@ public final class AcousticTracer {
             );
         }
         float[] geometricSpectrum = resolvedField.amplitudes();
+        double propagationDistance = resolvedField.propagationDistance(directDistance);
 
         ReflectionResult reflections = tuning.reflectionGainScale() <= 1.0E-6F
                 ? ReflectionResult.silent()
@@ -276,7 +278,8 @@ public final class AcousticTracer {
                         listener,
                         sourceRoomProbe,
                         MAX_EARLY_REFLECTION_PATHS_PER_SOUND,
-                        diffractionPath == null || !diffractionPath.multipleBends()
+                        diffractionPath == null || !diffractionPath.multipleBends(),
+                        propagationDistance
                 );
         // A resolved image reflection is already rendered by the source-specific early
         // reflection channel. Feeding the same path into the shared late-field send
@@ -328,10 +331,9 @@ public final class AcousticTracer {
                 0.0F,
                 1.0F
         );
-        // The EAX network is a listener-owned late field shared by every live source.
-        // Source-specific image paths contribute to this voice's send above, but must
-        // never overwrite the shared room parameters or pan all other sources toward
-        // whichever reflection happened to finish last.
+        // The listener probe supplies this voice's receiving-field boundary. DSP state
+        // is still private to the playback occurrence; only the immutable geometric
+        // measurement is reused, so another source cannot reset or redirect this tail.
         RoomAcoustics reverbRoom = listenerRoom;
         RoomImpulseResponse reverbImpulse = listenerRoomProbe.impulseResponse();
         float fieldLow = meanBands(fieldSpectrum, 0, 4);
@@ -341,7 +343,6 @@ public final class AcousticTracer {
                 0.05F,
                 1.0F
         );
-        double propagationDistance = resolvedField.propagationDistance(directDistance);
         boolean sameEnclosedDiffuseField = sourceRoomProbe.openings().isEmpty()
                 && listenerRoomProbe.openings().isEmpty()
                 && (center.firstBounds() == null
@@ -2646,7 +2647,13 @@ public final class AcousticTracer {
             int pathBudget
     ) {
         return estimateEarlyReflections(
-                level, source, listener, roomProbe, pathBudget, true
+                level,
+                source,
+                listener,
+                roomProbe,
+                pathBudget,
+                true,
+                source.distanceTo(listener)
         );
     }
 
@@ -2656,7 +2663,8 @@ public final class AcousticTracer {
             Vec3 listener,
             RoomProbe sourceRoomProbe,
             int pathBudget,
-            boolean allowDiffractedLegs
+            boolean allowDiffractedLegs,
+            double firstArrivalDistance
     ) {
         List<RoomProbe.SurfaceSample> candidates = reflectionCandidates(
                 source, listener, sourceRoomProbe
@@ -2666,16 +2674,14 @@ public final class AcousticTracer {
         }
 
         double directDistance = Math.max(source.distanceTo(listener), 0.5);
-        float[] accumulated = new float[AcousticBands.COUNT];
         int remainingDiffractedLegs = allowDiffractedLegs
                 ? Math.min(2, pathBudget)
                 : 0;
-        int acceptedPaths = 0;
         List<Vec3> acceptedReflectionPoints = new ArrayList<>(pathBudget);
+        PriorityQueue<ReflectionPathSample> strongestPaths = new PriorityQueue<>(
+                Comparator.comparingDouble(ReflectionPathSample::power)
+        );
         SurfaceHit[] validationHit = new SurfaceHit[1];
-        double delayPowerSum = 0.0;
-        double directionPower = 0.0;
-        Vec3 arrivalDirectionSum = Vec3.ZERO;
         // pathBudget limits accepted, audible paths. It must not limit how many cheap
         // image-plane candidates are inspected: the nearest few probe rays can be
         // geometrically invalid even though a wall or ceiling immediately after them
@@ -2733,18 +2739,14 @@ public final class AcousticTracer {
             if (duplicate) {
                 continue;
             }
-            acceptedReflectionPoints.add(reflectionPoint);
-
             Vec3 pathPoint = reflectionPoint.add(facingNormal.scale(0.035));
             // The offset point must actually lie in air. At the intersection of two
             // closed walls an image path can otherwise touch the mathematical edge, with
             // each leg starting in the adjoining solid block and the voxel walker
             // (correctly) ignoring its endpoint block. That is not an open acoustic path.
             if (pointInsideCollision(level, pathPoint)) {
-                acceptedReflectionPoints.remove(acceptedReflectionPoints.size() - 1);
                 continue;
             }
-            acceptedPaths++;
             Transmission sourceLeg = traceTransmission(level, source, pathPoint);
             Transmission listenerLeg = traceTransmission(level, pathPoint, listener);
             float[] sourceBands = sourceLeg.bands();
@@ -2776,7 +2778,7 @@ public final class AcousticTracer {
             double pathDistance = source.distanceTo(reflectionPoint) + reflectionPoint.distanceTo(listener);
             float distanceGain = (float) (directDistance / Math.max(pathDistance, directDistance));
             float[] pathBands = new float[AcousticBands.COUNT];
-            for (int band = 0; band < accumulated.length; band++) {
+            for (int band = 0; band < AcousticBands.COUNT; band++) {
                 float transmission = reflectionMaterial.surfaceTransmission(
                         band,
                         AcousticMaterialRegistry.tuning().metersPerBlock()
@@ -2794,29 +2796,52 @@ public final class AcousticTracer {
                         * distanceGain
                         * airAbsorption(band, AcousticMaterialRegistry.tuning().meters(pathDistance));
                 pathBands[band] = contribution;
-                accumulated[band] += contribution * contribution;
             }
             double pathPower = weightedEnergy(pathBands);
             pathPower *= pathPower;
             if (pathPower > 1.0E-12) {
+                // The budget is for physically contributing arrivals. Counting a
+                // geometrically valid but fully blocked/absorbed candidate let several
+                // silent planes consume the whole budget, making the echo disappear
+                // when the listener moved by a fraction of a block.
+                acceptedReflectionPoints.add(reflectionPoint);
                 double excessMeters = AcousticMaterialRegistry.tuning().meters(
-                        Math.max(0.0, pathDistance - directDistance)
+                        Math.max(0.0, pathDistance - firstArrivalDistance)
                 );
-                delayPowerSum += pathPower
-                        * excessMeters / DiffractionPhysics.SPEED_OF_SOUND_METERS_PER_SECOND;
                 Vec3 arrivalDirection = reflectionPoint.subtract(listener);
-                if (arrivalDirection.lengthSqr() > 1.0E-10) {
-                    arrivalDirectionSum = arrivalDirectionSum.add(
-                            arrivalDirection.normalize().scale(pathPower)
-                    );
-                    directionPower += pathPower;
+                ReflectionPathSample sample = new ReflectionPathSample(
+                        pathBands,
+                        pathPower,
+                        excessMeters / DiffractionPhysics.SPEED_OF_SOUND_METERS_PER_SECOND,
+                        arrivalDirection.lengthSqr() > 1.0E-10
+                                ? arrivalDirection.normalize()
+                                : Vec3.ZERO
+                );
+                if (strongestPaths.size() < pathBudget) {
+                    strongestPaths.add(sample);
+                } else if (sample.power() > strongestPaths.peek().power()) {
+                    strongestPaths.poll();
+                    strongestPaths.add(sample);
                 }
-            }
-            if (acceptedPaths >= pathBudget) {
-                break;
             }
         }
 
+        float[] accumulated = new float[AcousticBands.COUNT];
+        double delayPowerSum = 0.0;
+        double directionPower = 0.0;
+        Vec3 arrivalDirectionSum = Vec3.ZERO;
+        for (ReflectionPathSample path : strongestPaths) {
+            for (int band = 0; band < accumulated.length; band++) {
+                accumulated[band] += path.bands()[band] * path.bands()[band];
+            }
+            delayPowerSum += path.power() * path.delaySeconds();
+            if (path.arrivalDirection().lengthSqr() > 1.0E-10) {
+                arrivalDirectionSum = arrivalDirectionSum.add(
+                        path.arrivalDirection().scale(path.power())
+                );
+                directionPower += path.power();
+            }
+        }
         for (int band = 0; band < accumulated.length; band++) {
             accumulated[band] = Mth.clamp(
                     (float) Math.sqrt(accumulated[band])
@@ -2867,6 +2892,14 @@ public final class AcousticTracer {
                 source.distanceTo(surface.location()) + listener.distanceTo(surface.location())
         ));
         return candidates;
+    }
+
+    private record ReflectionPathSample(
+            float[] bands,
+            double power,
+            double delaySeconds,
+            Vec3 arrivalDirection
+    ) {
     }
 
     private static float[] combineIndependentPaths(float[] first, float[] second) {

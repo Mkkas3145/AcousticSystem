@@ -10,8 +10,14 @@ import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.ALCCapabilities;
 import org.lwjgl.openal.EXTEfx;
 import org.lwjgl.openal.EXTSourceDistanceModel;
+import org.lwjgl.openal.EXTLinearDistance;
+import org.lwjgl.openal.EXTFloat32;
+import org.lwjgl.openal.SOFTCallbackBuffer;
+import org.lwjgl.openal.SOFTCallbackBufferType;
 import org.lwjgl.BufferUtils;
+import org.lwjgl.system.MemoryUtil;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
+import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
@@ -30,19 +36,53 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class OpenALConvolutionSmokeTest {
     @Test
     @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_OPENAL_SMOKE", matches = "true")
-    void prewarmsRealTimeEaxWithoutBlockingTheFirstSound() throws ReflectiveOperationException {
+    void prewarmsRealTimeEaxWithoutBlockingTheFirstSound() throws Exception {
         long device = ALC10.alcOpenDevice((ByteBuffer) null);
         assertTrue(device != 0L);
         ALCCapabilities deviceCapabilities = ALC.createCapabilities(device);
         IntBuffer attributes = BufferUtils.createIntBuffer(3);
-        // The user's actual OpenAL device exposes two sends. Exercise the
-        // multiplexed remote-room path rather than only the ideal three-send case.
-        attributes.put(EXTEfx.ALC_MAX_AUXILIARY_SENDS).put(2).put(0).flip();
+        // The production context now explicitly requests the three independent paths.
+        attributes.put(EXTEfx.ALC_MAX_AUXILIARY_SENDS).put(3).put(0).flip();
         long context = ALC10.alcCreateContext(device, attributes);
         assertTrue(context != 0L);
         assertTrue(ALC10.alcMakeContextCurrent(context));
-        AL.createCapabilities(deviceCapabilities);
+        assertTrue(
+                ALC10.alcGetInteger(device, EXTEfx.ALC_MAX_AUXILIARY_SENDS) >= 3,
+                "The bundled OpenAL Soft context must honor the three-send request"
+        );
+        var alCapabilities = AL.createCapabilities(deviceCapabilities);
+        assertTrue(
+                alCapabilities.AL_SOFT_callback_buffer,
+                "The software field mixer requires AL_SOFT_callback_buffer"
+        );
         AL10.alEnable(EXTSourceDistanceModel.AL_SOURCE_DISTANCE_MODEL);
+
+        int callbackBuffer = AL10.alGenBuffers();
+        int callbackSource = AL10.alGenSources();
+        SOFTCallbackBufferType silenceCallback = new SOFTCallbackBufferType() {
+            @Override
+            public int invoke(long userptr, long sampledata, int numbytes) {
+                MemoryUtil.memSet(sampledata, 0, numbytes);
+                return numbytes;
+            }
+        };
+        SOFTCallbackBuffer.alBufferCallbackSOFT(
+                callbackBuffer,
+                EXTFloat32.AL_FORMAT_STEREO_FLOAT32,
+                48_000,
+                silenceCallback,
+                1L
+        );
+        AL10.alSourcei(callbackSource, AL10.AL_BUFFER, callbackBuffer);
+        AL10.alSourcePlay(callbackSource);
+        Thread.sleep(20L);
+        assertEquals(AL10.AL_PLAYING, AL10.alGetSourcei(callbackSource, AL10.AL_SOURCE_STATE));
+        AL10.alSourceStop(callbackSource);
+        AL10.alSourcei(callbackSource, AL10.AL_BUFFER, 0);
+        AL10.alDeleteSources(callbackSource);
+        AL10.alDeleteBuffers(callbackBuffer);
+        silenceCallback.free();
+        assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
 
         int source = AL10.alGenSources();
         try {
@@ -152,16 +192,193 @@ class OpenALConvolutionSmokeTest {
             AcousticResult remoteRoomResult = new AcousticResult(
                     0.7F, 0.8F,
                     0.7F, 0.65F, 0.55F, 0.45F,
-                    0.2F, 0.75F, EarlyReflection.SILENT, 0.0F,
+                    0.2F, 0.75F,
+                    new EarlyReflection(
+                            0.2F, 0.68F, 0.027F,
+                            new Vec3(-1.0, 0.0, 0.0)
+                    ),
+                    0.0F,
                     4.0, new Vec3(4.0, 0.0, 0.0),
                     RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
                     sourceField, Vec3.ZERO
             );
+            setStaticObject("lastDynamicListenerPosition", new Vec3(4.0, 0.0, 0.0));
             OpenALAcousticEffects.apply(source, remoteRoomResult);
+            Object remoteEarlyBus = sourceStateObject(source, "earlyReflectionBus");
             Object remoteSourceBus = sourceStateObject(source, "sourceRoomBus");
             assertNotNull(
+                    remoteEarlyBus,
+                    "A calculated source reflection must own its independent send"
+            );
+            assertNotNull(
                     remoteSourceBus,
-                    "A remote emitter must keep feeding its own shared room field"
+                    "A remote diffuse field must own the third send"
+            );
+            assertThrows(
+                    NoSuchFieldException.class,
+                    () -> remoteEarlyBus.getClass().getDeclaredField("sourceRoom"),
+                    "An early-delay network must never retain a diffuse room tail"
+            );
+            int earlyEffect = (int) objectField(remoteEarlyBus, "effect");
+            assertTrue(EXTEfx.alGetEffectf(
+                    earlyEffect, EXTEfx.AL_EAXREVERB_REFLECTIONS_GAIN
+            ) > 0.0F, "The calculated echo must remain present in a remote field");
+            int sourceRoomEffect = (int) objectField(remoteSourceBus, "effect");
+            assertTrue(EXTEfx.alGetEffectf(
+                    sourceRoomEffect, EXTEfx.AL_EAXREVERB_LATE_REVERB_GAIN
+            ) > 0.0F, "The source-side diffuse field must remain independent");
+
+            List<Integer> distinctFieldSources = new ArrayList<>();
+            for (int fieldIndex = 0; fieldIndex < 8; fieldIndex++) {
+                int fieldSource = AL10.alGenSources();
+                assertTrue(fieldSource != 0);
+                distinctFieldSources.add(fieldSource);
+                RoomAcoustics distinctRoom = new RoomAcoustics(
+                        0.12F + fieldIndex * 0.1F, 0.66F, 0.25F, 0.7F, 0.94F,
+                        0.1F, 0.58F, 1.16F,
+                        0.24F, 0.01F, Vec3.ZERO,
+                        1.0F, 0.01F, Vec3.ZERO,
+                        0.55F, 0.06F, 0.94F
+                );
+                AcousticResult distinctFieldResult = new AcousticResult(
+                        0.65F, 0.72F,
+                        0.65F, 0.6F, 0.5F, 0.4F,
+                        0.18F, 0.7F, EarlyReflection.SILENT, 0.0F,
+                        5.0, new Vec3(fieldIndex + 2.0, 0.0, 1.0),
+                        RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
+                        new RoomProbe(
+                                distinctRoom, List.of(), sourceField.openings()
+                        ),
+                        new Vec3(fieldIndex, 0.0, 0.0)
+                );
+                OpenALAcousticEffects.applyBeforePlay(
+                        fieldSource, distinctFieldResult
+                );
+                assertNotNull(
+                        sourceStateObject(fieldSource, "sourceRoomBus"),
+                        "A fifth-or-later simultaneous room must not lose its field"
+                );
+            }
+            assertTrue(
+                    ((List<?>) staticField("REVERB_POOL")).size() > 4,
+                    "Four prewarmed networks must not become a runtime field limit"
+            );
+            for (int fieldSource : distinctFieldSources) {
+                OpenALAcousticEffects.releaseSource(fieldSource);
+                AL10.alDeleteSources(fieldSource);
+            }
+            Thread.sleep(350L);
+            OpenALAcousticEffects.updateListenerPosition(
+                    new Vec3(4.001, 0.0, 0.0)
+            );
+            assertTrue(
+                    ((List<?>) staticField("REVERB_POOL")).size() <= 4,
+                    "Finished room responses must return to the warm reserve; size="
+                            + ((List<?>) staticField("REVERB_POOL")).size()
+            );
+            RoomAcoustics editedRemoteFieldRoom = new RoomAcoustics(
+                    0.45F, 0.62F, 0.24F, 0.51F, 0.86F,
+                    1.1F, 0.48F, 1.08F,
+                    0.18F, 0.013F, Vec3.ZERO,
+                    0.7F, 0.025F, Vec3.ZERO,
+                    0.35F, 0.03F, 0.96F
+            );
+            AcousticResult editedRemoteRoomResult = new AcousticResult(
+                    0.7F, 0.8F,
+                    0.7F, 0.65F, 0.55F, 0.45F,
+                    0.2F, 0.62F,
+                    new EarlyReflection(
+                            0.18F, 0.61F, 0.031F,
+                            new Vec3(-0.8, 0.0, -0.2)
+                    ),
+                    0.0F,
+                    4.0, new Vec3(4.0, 0.0, 0.0),
+                    RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
+                    new RoomProbe(
+                            editedRemoteFieldRoom, List.of(), sourceField.openings()
+                    ),
+                    new Vec3(0.2, 0.0, 0.0)
+            );
+            setObjectLong(
+                    remoteSourceBus,
+                    "lastBoundaryUpdateNanoseconds",
+                    System.nanoTime() - 1_000_000_000L
+            );
+            OpenALAcousticEffects.apply(source, editedRemoteRoomResult);
+            assertSame(
+                    remoteSourceBus,
+                    sourceStateObject(source, "sourceRoomBus"),
+                    "Moving inside a remote field must preserve its diffuse response"
+            );
+            RoomAcoustics evolvedRemoteRoom = (RoomAcoustics) objectField(
+                    remoteSourceBus, "room"
+            );
+            assertTrue(
+                    evolvedRemoteRoom.decayTime() < remoteFieldRoom.decayTime()
+                            && evolvedRemoteRoom.decayTime() >= editedRemoteFieldRoom.decayTime(),
+                    "A moving remote field must evolve toward its current measured boundary"
+            );
+            AcousticResult sealedRemoteRoomResult = new AcousticResult(
+                    0.7F, 0.8F,
+                    0.7F, 0.65F, 0.55F, 0.45F,
+                    0.2F, 0.62F,
+                    new EarlyReflection(
+                            0.18F, 0.61F, 0.031F,
+                            new Vec3(-0.8, 0.0, -0.2)
+                    ),
+                    0.0F,
+                    4.0, new Vec3(4.0, 0.0, 0.0),
+                    RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
+                    new RoomProbe(editedRemoteFieldRoom, List.of(), List.of()),
+                    new Vec3(0.2, 0.0, 0.0)
+            );
+            OpenALAcousticEffects.apply(source, sealedRemoteRoomResult);
+            Object sealedRemoteBus = sourceStateObject(source, "sourceRoomBus");
+            assertSame(
+                    remoteSourceBus,
+                    sealedRemoteBus,
+                    "An aperture edit must evolve the existing diffuse response"
+            );
+            assertTrue(
+                    EXTEfx.alGetEffectf(
+                            (int) objectField(
+                                    sourceStateObject(source, "earlyReflectionBus"),
+                                    "effect"
+                            ),
+                            EXTEfx.AL_EAXREVERB_REFLECTIONS_GAIN
+                    ) > 0.0F,
+                    "A sealed remote field must not suppress its independently calculated echo"
+            );
+            int continuousEarlyPoolSize = ((List<?>) staticField(
+                    "EARLY_REFLECTION_POOL"
+            )).size();
+            for (int edit = 0; edit < 256; edit++) {
+                OpenALAcousticEffects.apply(
+                        source,
+                        (edit & 1) == 0
+                                ? editedRemoteRoomResult
+                                : sealedRemoteRoomResult
+                );
+                Object continuousBus = sourceStateObject(
+                        source, "earlyReflectionBus"
+                );
+                assertSame(
+                        remoteEarlyBus,
+                        continuousBus,
+                        "Frequent topology edits must retain one continuous response state"
+                );
+                assertTrue(
+                        EXTEfx.alGetEffectf(
+                                (int) objectField(continuousBus, "effect"),
+                                EXTEfx.AL_EAXREVERB_REFLECTIONS_GAIN
+                        ) > 0.0F,
+                        "A topology update suppressed a still-valid calculated echo"
+                );
+            }
+            assertEquals(
+                    continuousEarlyPoolSize,
+                    ((List<?>) staticField("EARLY_REFLECTION_POOL")).size(),
+                    "Frequent space edits must not accumulate retired echo networks"
             );
             AcousticResult indoorResult = new AcousticResult(
                     1.0F, 1.0F,
@@ -176,28 +393,32 @@ class OpenALConvolutionSmokeTest {
             );
             long indoorStarted = System.nanoTime();
             OpenALAcousticEffects.updateListenerRoom(indoor);
+            double indoorMilliseconds = (System.nanoTime() - indoorStarted) / 1_000_000.0;
             assertSame(
                     sourceStateObject(source, "reverbBus"),
                     sourceStateObject(source, "primaryLateBus"),
-                    "The primary late send must remain listener-owned on a two-send device"
+                    "The primary late send must remain listener-owned"
             );
             assertNotSame(
                     remoteSourceBus,
                     sourceStateObject(source, "primaryLateBus"),
-                    "A remote field must use the first send instead of replacing listener late reverb"
+                    "The source diffuse field must not replace listener late reverb"
             );
             OpenALAcousticEffects.apply(source, indoorResult);
             RoomProbe sealedListenerRoom = new RoomProbe(
                     indoor, List.of(), List.of()
             );
             OpenALAcousticEffects.updateListenerRoom(
-                    sealedListenerRoom, Vec3.ZERO, 1L
+                    sealedListenerRoom, Vec3.ZERO, 1L, 70L
             );
             OpenALAcousticEffects.updateListenerPosition(
                     new Vec3(0.05, 0.0, 0.0)
             );
+            float sealedOutputGain = (float) objectField(
+                    staticField("activeReverbBus"), "outputGain"
+            );
             assertTrue(
-                    (float) objectField(staticField("activeReverbBus"), "outputGain") > 0.05F,
+                    sealedOutputGain > 0.05F,
                     "A sealed listener-owned room must not be muted merely because it has no openings"
             );
             Object stablePhysicalRoomBus = staticField("activeReverbBus");
@@ -208,57 +429,172 @@ class OpenALConvolutionSmokeTest {
                     indoor.lateReverbGain(), indoor.lateReverbDelay(), Vec3.ZERO,
                     0.4F, 0.02F, 0.95F
             );
+            float outputBeforeSameFieldUpdate = (float) objectField(
+                    stablePhysicalRoomBus, "outputGain"
+            );
             OpenALAcousticEffects.updateListenerRoom(
                     new RoomProbe(
                             shiftedEstimateInSameRoom, List.of(), List.of()
                     ),
                     new Vec3(0.25, 0.0, 0.0),
-                    2L
+                    2L,
+                    70L
             );
             assertSame(
                     stablePhysicalRoomBus,
                     staticField("activeReverbBus"),
                     "Numeric probe variation inside one physical field must not replace its global reverb bus"
             );
-            assertEquals(0, (int) objectField(remoteSourceBus, "sourceReferences"));
             assertTrue(
-                    (boolean) objectField(remoteSourceBus, "sourceField"),
-                    "A stopped source-room tail must retain its portal transport identity"
+                    Math.abs((float) objectField(stablePhysicalRoomBus, "outputGain")
+                            - outputBeforeSameFieldUpdate) < 0.05F,
+                    "Moving inside one diffuse field must not pump its global output gain"
             );
-            long remoteFieldToken = (long) objectField(
-                    remoteSourceBus, "fieldToken"
+            setStaticLong(
+                    "lastListenerRoomUpdateNanoseconds",
+                    System.nanoTime() - 1_000_000_000L
             );
-            OpenALAcousticEffects.TailFieldRequest remoteTail =
-                    OpenALAcousticEffects.tailFieldRequests().stream()
-                            .filter(request -> request.fieldToken() == remoteFieldToken)
-                            .findFirst()
-                            .orElseThrow(() -> new AssertionError(
-                                    "A stopped remote field must remain geometrically sampled until its RT60 ends"
-                            ));
             OpenALAcousticEffects.updateListenerPosition(
-                    new Vec3(4.0, 0.0, 0.0)
+                    new Vec3(0.251, 0.0, 0.0)
             );
-            setObjectLong(
-                    remoteSourceBus,
-                    "lastOutputGainUpdateNanoseconds",
-                    0L
+            RoomAcoustics evolvedField = (RoomAcoustics) objectField(
+                    stablePhysicalRoomBus, "room"
             );
-            OpenALAcousticEffects.updateTailField(
-                    remoteTail.fieldToken(),
-                    new RoomProbe(remoteFieldRoom, List.of(), List.of()),
-                    remoteTail.position()
+            assertTrue(
+                    evolvedField.decayTime() > indoor.decayTime()
+                            && evolvedField.decayTime() < shiftedEstimateInSameRoom.decayTime(),
+                    "A live feedback field must continuously adopt the measured space instead of changing gain only"
             );
-            assertEquals(
-                    0.0F,
-                    (float) objectField(remoteSourceBus, "outputGain"),
-                    1.0E-6F,
-                    "Sealing the last opening must stop a stored remote tail from leaking through stale geometry"
+            OpenALAcousticEffects.updateListenerRoom(
+                    sealedListenerRoom,
+                    new Vec3(0.3, 0.0, 0.0),
+                    3L,
+                    71L
             );
+            assertSame(
+                    stablePhysicalRoomBus,
+                    staticField("activeReverbBus"),
+                    "A scene revision must update boundary conditions without resetting stored feedback"
+            );
+            RoomProbe cavePortalProbe = new RoomProbe(
+                    indoor,
+                    List.of(),
+                    List.of(new RoomProbe.OpeningSample(
+                            new Vec3(0.5, 0.0, 0.0),
+                            new Vec3(1.0, 0.0, 0.0),
+                            1.0F
+                    ))
+            );
+            OpenALAcousticEffects.updateListenerRoom(
+                    cavePortalProbe, Vec3.ZERO, 4L, 71L
+            );
+            RoomAcoustics adjacentCaveChamber = new RoomAcoustics(
+                    0.35F, 0.82F, 0.47F, 0.58F, 0.91F,
+                    3.4F, 0.52F, 1.42F,
+                    0.42F, 0.024F, Vec3.ZERO,
+                    1.4F, 0.041F, Vec3.ZERO,
+                    0.7F, 0.03F, 0.93F
+            );
+            OpenALAcousticEffects.updateListenerRoom(
+                    new RoomProbe(adjacentCaveChamber, List.of(), List.of()),
+                    new Vec3(1.0, 0.0, 0.0),
+                    5L,
+                    72L
+            );
+            Object adjacentFieldBus = staticField("activeReverbBus");
+            assertSame(
+                    stablePhysicalRoomBus,
+                    adjacentFieldBus,
+                    "Crossing a finite opening must evolve one persistent listener field"
+            );
+            float previousFieldGain = (float) objectField(
+                    adjacentFieldBus, "outputGain"
+            );
+            for (int edit = 0; edit < 128; edit++) {
+                RoomAcoustics changedBoundary = (edit & 1) == 0
+                        ? shiftedEstimateInSameRoom
+                        : adjacentCaveChamber;
+                OpenALAcousticEffects.updateListenerRoom(
+                        new RoomProbe(changedBoundary, List.of(), List.of()),
+                        new Vec3(1.0 + edit * 0.01, 0.0, 0.0),
+                        6L + edit,
+                        73L + edit
+                );
+                assertSame(
+                        adjacentFieldBus,
+                        staticField("activeReverbBus"),
+                        "Rapid block edits must not allocate or reset another feedback network"
+                );
+                float fieldGain = (float) objectField(
+                        adjacentFieldBus, "outputGain"
+                );
+                assertTrue(Float.isFinite(fieldGain));
+                assertTrue(
+                        Math.abs(fieldGain - previousFieldGain) < 0.05F,
+                        "A block revision introduced a discontinuous late-field level"
+                );
+                previousFieldGain = fieldGain;
+            }
             Object leftEarlyBus = sourceStateObject(source, "earlyReflectionBus");
             assertNotNull(
                     leftEarlyBus,
                     "A calculated first-order reflection must use its source-owned send"
             );
+            AcousticResult movedReflectionResult = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.25F, 0.8F,
+                    new EarlyReflection(
+                            0.18F, 0.62F, 0.043F,
+                            new Vec3(0.3, 0.0, -0.95)
+                    ),
+                    0.0F, 4.0,
+                    new Vec3(4.0, 0.0, 0.0),
+                    indoor,
+                    RoomImpulseResponse.SILENT
+            );
+            OpenALAcousticEffects.applyBeforePlay(source, movedReflectionResult);
+            assertSame(
+                    leftEarlyBus,
+                    sourceStateObject(source, "earlyReflectionBus"),
+                    "A moving reflection must morph its existing delay line instead of switching it off"
+            );
+            assertEquals(
+                    0.043F,
+                    EXTEfx.alGetEffectf(
+                            (int) objectField(leftEarlyBus, "effect"),
+                            EXTEfx.AL_EAXREVERB_REFLECTIONS_DELAY
+                    ),
+                    1.0E-6F,
+                    "The early path delay must reach EFX continuously without a quantized time step"
+            );
+            AcousticResult temporarilySilentReflection = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.25F, 0.8F,
+                    EarlyReflection.SILENT,
+                    0.0F, 4.0,
+                    new Vec3(4.0, 0.0, 0.0),
+                    indoor,
+                    RoomImpulseResponse.SILENT
+            );
+            OpenALAcousticEffects.applyBeforePlay(
+                    source, temporarilySilentReflection
+            );
+            assertSame(
+                    leftEarlyBus,
+                    sourceStateObject(source, "earlyReflectionBus"),
+                    "A zero-energy snapshot must stop input without deleting a pending echo"
+            );
+            assertEquals(
+                    0.0F,
+                    EXTEfx.alGetFilterf(
+                            sourceStateInt(source, "earlyReflectionFilter"),
+                            EXTEfx.AL_LOWPASS_GAIN
+                    ),
+                    1.0E-6F
+            );
+            OpenALAcousticEffects.applyBeforePlay(source, indoorResult);
             int opposingSource = AL10.alGenSources();
             try {
                 AcousticResult opposingResult = new AcousticResult(
@@ -289,7 +625,13 @@ class OpenALConvolutionSmokeTest {
                 OpenALAcousticEffects.releaseSource(opposingSource);
                 AL10.alDeleteSources(opposingSource);
             }
-            double indoorMilliseconds = (System.nanoTime() - indoorStarted) / 1_000_000.0;
+            OpenALAcousticEffects.updateListenerRoom(new RoomAcoustics(
+                    0.75F, 0.68F, 0.33F, 0.72F, 0.95F,
+                    1.8F, 0.65F, 1.15F,
+                    0.28F, 0.018F, Vec3.ZERO,
+                    1.2F, 0.032F, Vec3.ZERO,
+                    0.6F, 0.08F, 0.94F
+            ));
             Object gainOnlyBus = staticField("activeReverbBus");
             double[] updateMilliseconds = new double[6];
             for (int index = 0; index < updateMilliseconds.length; index++) {
@@ -323,11 +665,25 @@ class OpenALConvolutionSmokeTest {
                     0.55F, 0.061F, Vec3.ZERO,
                     0.6F, 0.08F, 0.94F
             );
+            Object establishedFeedbackRoom = objectField(gainOnlyBus, "room");
             OpenALAcousticEffects.updateListenerRoom(fastChangedRoom);
             assertSame(
                     gainOnlyBus,
                     staticField("activeReverbBus"),
                     "Fast gain, spectrum and delay changes must not restart the decay network"
+            );
+            RoomAcoustics continuouslyMorphedRoom = (RoomAcoustics) objectField(
+                    gainOnlyBus, "room"
+            );
+            assertNotSame(
+                    establishedFeedbackRoom,
+                    continuouslyMorphedRoom,
+                    "The retained feedback network must continuously receive its evolved boundary coefficients"
+            );
+            assertTrue(
+                    Math.abs(continuouslyMorphedRoom.decayTime()
+                            - ((RoomAcoustics) establishedFeedbackRoom).decayTime()) < 0.05F,
+                    "A fast boundary update must evolve instead of stepping to an unrelated decay"
             );
             System.out.println("warmupMilliseconds=" + warmupMilliseconds
                     + ", firstSoundApplyMilliseconds=" + elapsedMilliseconds
@@ -463,46 +819,35 @@ class OpenALConvolutionSmokeTest {
                     0.5F, 0.0F, 0.95F
             ));
             Object migratedBus = staticField("activeReverbBus");
-            assertNotSame(
+            assertSame(
                     establishedBus,
                     migratedBus,
-                    "A new listener space must receive a fresh field while the old tail decays"
+                    "A new listener space must evolve the persistent acoustic energy state"
             );
             assertNotSame(
                     establishedKey,
                     objectField(migratedBus, "key"),
-                    "The replacement field must contain the newly measured room"
+                    "The persistent field must index the newly measured boundary"
             );
             assertSame(migratedBus, sourceStateObject(source, "reverbBus"));
             assertSame(
                     migratedBus,
                     sourceStateObject(oneShot, "reverbBus"),
-                    "A listener-room transition must migrate every active wet send together"
-            );
-            assertTrue(
-                    (long) objectField(establishedBus, "tailExpiresAtNanoseconds")
-                            > System.nanoTime(),
-                    "The previous room bus must remain protected until its measured RT60 ends"
-            );
-            assertTrue(
-                    (long) objectField(establishedBus, "tailExpiresAtNanoseconds")
-                            - System.nanoTime()
-                            > (long) (indoor.decayTime() * 1.8 * 1_000_000_000L),
-                    "A stopped EAX field must survive beyond one RT60 so it cannot be hard-muted while still audible"
-            );
-            setObjectLong(
-                    establishedBus,
-                    "lastOutputGainUpdateNanoseconds",
-                    System.nanoTime() - 1_000_000_000L
+                    "A listener-room transition must keep every active wet send on the same state"
             );
             setStaticLong("lastListenerRoomUpdateNanoseconds", 0L);
             OpenALAcousticEffects.updateListenerRoom(RoomAcoustics.OUTDOORS);
-            int retiredSlot = (int) objectField(establishedBus, "slot");
+            setStaticLong(
+                    "lastListenerRoomUpdateNanoseconds",
+                    System.nanoTime() - 1_000_000_000L
+            );
+            OpenALAcousticEffects.updateListenerPosition(new Vec3(12.0, 0.0, 0.0));
+            int persistentSlot = (int) objectField(establishedBus, "slot");
             assertTrue(
                     EXTEfx.alGetAuxiliaryEffectSlotf(
-                            retiredSlot, EXTEfx.AL_EFFECTSLOT_GAIN
-                    ) < indoor.gain() * 0.05F,
-                    "A retired indoor field must not follow the listener outdoors at full level"
+                            persistentSlot, EXTEfx.AL_EFFECTSLOT_GAIN
+                    ) < indoor.gain(),
+                    "The persistent field must evolve toward the outdoor boundary"
             );
             OpenALAcousticEffects.apply(oneShot, indoorResult);
             OpenALAcousticEffects.releaseSource(oneShot);
@@ -539,7 +884,77 @@ class OpenALConvolutionSmokeTest {
                 AL10.alDeleteSources(burstSource);
             }
             assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
+
+            // Repeated batches model a long play session, not merely one concurrent
+            // peak. Every early network is allowed to finish its real delay before it
+            // is reclaimed; no live voice or calculated effect is dropped to make room.
+            for (int cycle = 0; cycle < 24; cycle++) {
+                List<Integer> transientSources = new ArrayList<>();
+                for (int voice = 0; voice < 12; voice++) {
+                    int transientSource = AL10.alGenSources();
+                    assertTrue(
+                            transientSource != 0,
+                            "OpenAL source allocation degraded in cycle " + cycle
+                    );
+                    transientSources.add(transientSource);
+                    double angle = (cycle * 12 + voice) * 0.371;
+                    AcousticResult transientResult = new AcousticResult(
+                            0.8F, 0.75F,
+                            0.8F, 0.72F, 0.61F, 0.5F,
+                            0.22F, 0.7F,
+                            new EarlyReflection(
+                                    0.18F + voice * 0.01F,
+                                    0.62F,
+                                    0.001F,
+                                    new Vec3(Math.cos(angle), 0.0, Math.sin(angle))
+                            ),
+                            0.0F,
+                            6.0,
+                            new Vec3(Math.cos(angle) * 6.0, 0.0, Math.sin(angle) * 6.0),
+                            indoor,
+                            RoomImpulseResponse.SILENT
+                    );
+                    OpenALAcousticEffects.applyBeforePlay(
+                            transientSource, transientResult
+                    );
+                }
+                for (int transientSource : transientSources) {
+                    OpenALAcousticEffects.releaseSource(transientSource);
+                    AL10.alDeleteSources(transientSource);
+                }
+                Thread.sleep(2L);
+                OpenALAcousticEffects.updateListenerPosition(
+                        new Vec3(12.0 + cycle * 0.001, 0.0, 0.0)
+                );
+                assertTrue(
+                        ((List<?>) staticField("EARLY_REFLECTION_POOL")).size() <= 6,
+                        "Expired physical delay lines accumulated in cycle " + cycle
+                );
+                int probeSource = AL10.alGenSources();
+                assertTrue(
+                        probeSource != 0,
+                        "A long session exhausted OpenAL sources after cycle " + cycle
+                );
+                AL10.alDeleteSources(probeSource);
+                assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
+            }
+
+            AcousticQualityConfig.setEnabled(false);
+            OpenALAcousticEffects.useVanillaProcessing();
+            assertEquals(
+                    EXTLinearDistance.AL_LINEAR_DISTANCE_CLAMPED,
+                    AL10.alGetSourcei(source, AL10.AL_DISTANCE_MODEL),
+                    "The master switch must restore Minecraft's vanilla distance model"
+            );
+            assertTrue(
+                    ((Map<?, ?>) staticField("SOURCES")).isEmpty(),
+                    "The master switch must detach every mod-owned live source state"
+            );
+            AcousticQualityConfig.setEnabled(true);
+            OpenALAcousticEffects.applyBeforePlay(source, indoorResult);
+            assertEquals(AL10.AL_NONE, AL10.alGetSourcei(source, AL10.AL_DISTANCE_MODEL));
         } finally {
+            AcousticQualityConfig.setEnabled(true);
             OpenALAcousticEffects.releaseSource(source);
             OpenALAcousticEffects.shutdown();
             AL10.alDeleteSources(source);
@@ -553,7 +968,7 @@ class OpenALConvolutionSmokeTest {
         Field poolField = OpenALAcousticEffects.class.getDeclaredField("REVERB_POOL");
         poolField.setAccessible(true);
         List<?> buses = (List<?>) poolField.get(null);
-        assertTrue(buses.size() == 4);
+        assertTrue(buses.size() >= 4);
         Field slotField = buses.getFirst().getClass().getDeclaredField("slot");
         slotField.setAccessible(true);
         for (Object bus : buses) {
@@ -627,5 +1042,12 @@ class OpenALConvolutionSmokeTest {
         Field field = OpenALAcousticEffects.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         field.setLong(null, value);
+    }
+
+    private static void setStaticObject(String fieldName, Object value)
+            throws ReflectiveOperationException {
+        Field field = OpenALAcousticEffects.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(null, value);
     }
 }

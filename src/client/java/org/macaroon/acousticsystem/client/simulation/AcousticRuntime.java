@@ -9,6 +9,7 @@ import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.AcousticSystem;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects.TailFieldRequest;
+import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
@@ -68,6 +69,7 @@ public final class AcousticRuntime {
     private static volatile PrePlayContext prePlayContext;
     private static volatile ProbeSnapshot latestProbe;
     private static volatile Vec3 latestObservedListener;
+    private static boolean processingEnabled = true;
     private static final Map<ProbeCell, CachedRoomProbe> ROOM_PROBE_CACHE = new ConcurrentHashMap<>();
     private static final Map<SourceCell, CachedRoomProbe> SOURCE_ROOM_PROBE_CACHE = new ConcurrentHashMap<>();
     private static final Map<SourceCell, PreparedResult> PREPARED_RESULTS = new ConcurrentHashMap<>();
@@ -95,10 +97,21 @@ public final class AcousticRuntime {
             Map<SoundInstance, ChannelAccess.ChannelHandle> activeSounds,
             ChannelAccess channelAccess
     ) {
+        boolean enabled = AcousticQualityConfig.settings().enabled();
+        if (enabled != processingEnabled) {
+            configurationChanged();
+            processingEnabled = enabled;
+        }
         if (currentLevel != level) {
             switchLevel(level);
         }
         latestObservedListener = listener;
+        if (!enabled) {
+            channelAccess.executeOnChannels(ignored ->
+                    OpenALAcousticEffects.useVanillaProcessing()
+            );
+            return;
+        }
         // Listener motion is already known here; portal transport does not need to wait
         // for the background geometry batch. Read the latest position again on the
         // sound thread so queued callbacks naturally coalesce to the newest frame.
@@ -162,6 +175,9 @@ public final class AcousticRuntime {
 
     /** Called on the client thread before Minecraft allocates the OpenAL channel. */
     public static void prepareSound(SoundInstance sound) {
+        if (!AcousticQualityConfig.settings().enabled()) {
+            return;
+        }
         PrePlayContext context = prePlayContext;
         if (sound.isRelative()) {
             return;
@@ -245,6 +261,9 @@ public final class AcousticRuntime {
     }
 
     public static void applyBeforePlay(int source, Vec3 sourcePosition, boolean relative) {
+        if (!AcousticQualityConfig.settings().enabled()) {
+            return;
+        }
         PrePlayContext context = prePlayContext;
         if (relative || context == null) {
             return;
@@ -283,7 +302,8 @@ public final class AcousticRuntime {
             SoundInstance sound,
             ChannelAccess.ChannelHandle handle
     ) {
-        if (sound.isRelative() || handle == null || handle.isStopped()) {
+        if (!AcousticQualityConfig.settings().enabled()
+                || sound.isRelative() || handle == null || handle.isStopped()) {
             PREPARED_SOUNDS.remove(sound);
             return;
         }
@@ -333,6 +353,7 @@ public final class AcousticRuntime {
 
     /** Drops results measured with a previous GUI quality configuration. */
     public static void configurationChanged() {
+        processingEnabled = AcousticQualityConfig.settings().enabled();
         generation++;
         if (pendingBatch != null) {
             pendingBatch.cancel(false);
@@ -389,6 +410,7 @@ public final class AcousticRuntime {
                     channelAccess,
                     roomProbe,
                     batchGeneration,
+                    scene.revision(),
                     listener,
                     submittedNanoseconds
             );
@@ -559,6 +581,7 @@ public final class AcousticRuntime {
             ChannelAccess channelAccess,
             RoomProbe roomProbe,
             long batchGeneration,
+            long sceneRevision,
             Vec3 computedListener,
             long sequence
     ) {
@@ -585,7 +608,7 @@ public final class AcousticRuntime {
         // background result completes.
         channelAccess.executeOnChannels(ignored ->
                 OpenALAcousticEffects.updateListenerRoom(
-                        roomProbe, computedListener, sequence
+                        roomProbe, computedListener, sequence, sceneRevision
                 )
         );
     }

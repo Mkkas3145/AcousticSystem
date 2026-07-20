@@ -1,5 +1,7 @@
 {
   "acousticsystem.options.title": "サウンド物理",
+  "acousticsystem.options.enabled": "すべての効果",
+  "acousticsystem.options.enabled.tooltip": "設定値を保持したまま、バニラのサウンド処理に切り替えます。",
   "acousticsystem.options.open.tooltip": "ブロックと空間に応じたサウンド処理の品質を設定します。",
   "acousticsystem.options.quality": "品質プリセット",
   "acousticsystem.options.preset": "品質",

@@ -8,10 +8,12 @@ import org.lwjgl.openal.EXTEfx;
 import org.lwjgl.openal.EXTLinearDistance;
 import org.lwjgl.BufferUtils;
 import org.macaroon.acousticsystem.AcousticSystem;
+import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.simulation.AcousticResult;
+import org.macaroon.acousticsystem.client.simulation.DiffuseFieldDynamics;
 import org.macaroon.acousticsystem.client.simulation.EarlyReflection;
 import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 import org.macaroon.acousticsystem.client.simulation.RoomImpulseResponse;
@@ -35,11 +37,11 @@ public final class OpenALAcousticEffects {
     private static final ThreadLocal<FloatBuffer> LISTENER_ORIENTATION = ThreadLocal.withInitial(
             () -> BufferUtils.createFloatBuffer(6)
     );
-    // One network receives the current listener field while recently retired networks
-    // finish their own RT60. Four bounded slots cover rapid adjacent-space crossings
-    // without running a convolution per source or retaining an unbounded room cache.
-    private static final int MAX_REVERB_BUSES = 4;
-    private static final int MAX_EARLY_REFLECTION_BUSES = 6;
+    // These are warm-start reserves, not runtime limits. Additional physically distinct
+    // fields are created as needed and reclaimed only after their calculated energy has
+    // decayed; no active response is displaced to satisfy an arbitrary pool size.
+    private static final int PREWARMED_REVERB_BUSES = 4;
+    private static final int PREWARMED_EARLY_REFLECTION_BUSES = 6;
     private static final RoomAcoustics DSP_PREWARM_ROOM = new RoomAcoustics(
             0.75F, 0.70F, 0.32F, 0.72F, 0.95F,
             1.8F, 0.65F, 1.15F,
@@ -53,6 +55,7 @@ public final class OpenALAcousticEffects {
     private static boolean dedicatedSourceRoomSendSupported;
     private static ReverbBus activeReverbBus;
     private static RoomAcoustics smoothedListenerRoom;
+    private static RoomAcoustics targetListenerRoom;
     private static long lastListenerRoomUpdateNanoseconds;
     private static long lastListenerRoomSequence = Long.MIN_VALUE;
     private static Vec3 lastDynamicListenerPosition;
@@ -60,6 +63,7 @@ public final class OpenALAcousticEffects {
     private static volatile List<TailFieldRequest> tailFieldRequests = List.of();
     private static DistanceAttenuationSettings appliedDistanceAttenuationSettings;
     private static AtmosphereHighFrequencyCache atmosphereHighFrequencyCache;
+    private static boolean vanillaProcessing;
 
     private OpenALAcousticEffects() {
     }
@@ -71,12 +75,47 @@ public final class OpenALAcousticEffects {
      */
     public static void configureDistanceAttenuation(int source, float maximumDistance) {
         SOURCE_MAX_DISTANCES.put(source, Math.max(0.1F, maximumDistance));
+        if (!AcousticQualityConfig.settings().enabled()) {
+            return;
+        }
+        vanillaProcessing = false;
         applyDistanceAttenuation(source, distanceAttenuationSettings());
+    }
+
+    /** Removes every mod-owned OpenAL object and restores live voices to vanilla. */
+    public static void useVanillaProcessing() {
+        if (vanillaProcessing) {
+            return;
+        }
+        Map<Integer, Float> authoredRanges = new HashMap<>(SOURCE_MAX_DISTANCES);
+        if (supported) {
+            DistanceAttenuationSettings vanilla = new DistanceAttenuationSettings(
+                    false, 0.0F, 1.0F
+            );
+            for (int source : authoredRanges.keySet()) {
+                applyDistanceAttenuation(source, vanilla);
+            }
+            for (int source : SOURCES.keySet()) {
+                if (!authoredRanges.containsKey(source)) {
+                    applyDistanceAttenuation(source, vanilla);
+                }
+            }
+        }
+        shutdown();
+        SoftwareAcousticMixer.clearVoices();
+        SOURCE_MAX_DISTANCES.putAll(authoredRanges);
+        vanillaProcessing = true;
     }
 
     /** Builds the reusable EFX buses while Minecraft is initializing its audio library. */
     public static void initialize() {
         if (!ensureSupport()) {
+            return;
+        }
+        if (SoftwareAcousticMixer.available()) {
+            AcousticSystem.LOGGER.info(
+                    "OpenAL is retaining only positional direct filtering; reflected fields use the software mixer"
+            );
             return;
         }
         int source = AL10.alGenSources();
@@ -104,12 +143,18 @@ public final class OpenALAcousticEffects {
                     RoomImpulseResponse.SILENT
             ));
             AL10.alSourcePlay(source);
-            while (REVERB_POOL.size() < MAX_REVERB_BUSES) {
+            while (REVERB_POOL.size() < PREWARMED_REVERB_BUSES) {
                 createReverbBus(null, RoomAcoustics.OUTDOORS);
             }
             if (advancedEaxReverb) {
-                while (EARLY_REFLECTION_POOL.size() < MAX_EARLY_REFLECTION_BUSES) {
-                    createEarlyReflectionBus(null, EarlyReflection.SILENT, Vec3.ZERO);
+                while (EARLY_REFLECTION_POOL.size() < PREWARMED_EARLY_REFLECTION_BUSES) {
+                    EarlyReflectionBus prewarmed = createEarlyReflectionBus(
+                            null, EarlyReflection.SILENT, Vec3.ZERO,
+                            EarlyFieldMix.SILENT
+                    );
+                    if (prewarmed == null) {
+                        break;
+                    }
                 }
             }
             // OpenAL Soft may lazily instantiate the actual reverb network the first
@@ -133,6 +178,7 @@ public final class OpenALAcousticEffects {
                     0.0, Vec3.ZERO, DSP_PREWARM_ROOM, RoomImpulseResponse.SILENT
             ));
             smoothedListenerRoom = null;
+            targetListenerRoom = null;
             lastListenerRoomUpdateNanoseconds = 0L;
             lastListenerRoomSequence = Long.MIN_VALUE;
         } finally {
@@ -199,12 +245,22 @@ public final class OpenALAcousticEffects {
             Vec3 listener,
             long sequence
     ) {
+        updateListenerRoom(probe, listener, sequence, Long.MIN_VALUE);
+    }
+
+    public static void updateListenerRoom(
+            RoomProbe probe,
+            Vec3 listener,
+            long sequence,
+            long sceneRevision
+    ) {
         updateListenerRoomInternal(
                 probe.acoustics(),
                 true,
                 sequence,
                 true,
-                ListenerFieldSnapshot.from(probe, listener)
+                ListenerFieldSnapshot.from(probe, listener),
+                sceneRevision
         );
     }
 
@@ -250,45 +306,51 @@ public final class OpenALAcousticEffects {
 
     /**
      * Applies listener motion to already measured room fields without waiting for the
-     * next geometric probe. This only evaluates finite apertures and updates EFX gains
-     * and pan, so it is safe to run for every observed listener position.
+     * next geometric probe. This only evaluates finite apertures and updates EFX slot
+     * gains and send filters, so it is safe to run for every observed listener position.
      */
     public static void updateListenerPosition(Vec3 listener) {
-        if (!ensureSupport() || activeReverbBus == null || smoothedListenerRoom == null) {
+        if (!ensureSupport()) {
             return;
         }
-        if (lastDynamicListenerPosition != null
-                && listener.distanceToSqr(lastDynamicListenerPosition) <= 1.0E-10) {
+        if (SoftwareAcousticMixer.available()) {
             return;
         }
-        lastDynamicListenerPosition = listener;
         try {
             long now = System.nanoTime();
+            reapExpiredEarlyReflectionBuses(now);
+            reapExpiredReverbBuses(now);
+            if (activeReverbBus == null || smoothedListenerRoom == null) {
+                return;
+            }
+            // Boundary energy keeps evolving even while the player is stationary. This
+            // is important immediately after a block edit: the room must settle according
+            // to elapsed physical time, not wait for another movement event.
+            advanceListenerField(now);
+            if (lastDynamicListenerPosition != null
+                    && listener.distanceToSqr(lastDynamicListenerPosition) <= 1.0E-10) {
+                return;
+            }
+            lastDynamicListenerPosition = listener;
             PortalRadiation activeRadiation = activeReverbBus.field == null
                     ? PortalRadiation.INSIDE
                     : activeReverbBus.field.apertureRadiation(listener, true);
             float targetGain = clamp(smoothedListenerRoom.gain(), 0.0F, 1.0F);
-            Vec3 pan = Vec3.ZERO;
             if (activeRadiation.outside()) {
                 targetGain *= activeRadiation.transmission();
-                pan = listenerRelativeVector(activeRadiation.arrivalDirection());
             }
-            float amount = elapsedResponseAmount(
-                    activeReverbBus.lastOutputGainUpdateNanoseconds, now
-            );
-            activeReverbBus.outputGain = lerp(
-                    activeReverbBus.outputGain, targetGain, amount
-            );
+            // smoothedListenerRoom already is the exact elapsed-time evolution of the
+            // diffuse energy. Filtering its slot gain a second time adds an unrelated
+            // lag and makes the audible field trail the player's actual space.
+            activeReverbBus.outputGain = targetGain;
             EXTEfx.alAuxiliaryEffectSlotf(
                     activeReverbBus.slot,
                     EXTEfx.AL_EFFECTSLOT_GAIN,
                     clamp(activeReverbBus.outputGain, 0.0F, 1.0F)
             );
             activeReverbBus.lastOutputGainUpdateNanoseconds = now;
-            updateFastReverbProperties(
-                    activeReverbBus, activeReverbBus.room, pan,
-                    activeRadiation.highFrequencyGain()
-            );
+            activeReverbBus.transportHighFrequencyGain =
+                    activeRadiation.highFrequencyGain();
             updateRetiredReverbOutputs(now, smoothedListenerRoom, listener);
         } catch (RuntimeException exception) {
             AcousticSystem.LOGGER.warn(
@@ -304,14 +366,16 @@ public final class OpenALAcousticEffects {
      * only the continuously sampled listener probe owns subsequent room changes.
      */
     public static void prepareListenerRoomForOnset(RoomAcoustics room) {
-        if (!SOURCES.isEmpty()) {
+        if (!SOURCES.isEmpty() || smoothedListenerRoom != null) {
             return;
         }
         updateListenerRoomInternal(room, false);
     }
 
     private static void updateListenerRoomInternal(RoomAcoustics room, boolean interpolate) {
-        updateListenerRoomInternal(room, interpolate, Long.MIN_VALUE, false, null);
+        updateListenerRoomInternal(
+                room, interpolate, Long.MIN_VALUE, false, null, Long.MIN_VALUE
+        );
     }
 
     private static boolean updateListenerRoomInternal(
@@ -320,7 +384,9 @@ public final class OpenALAcousticEffects {
             long sequence,
             boolean ordered
     ) {
-        return updateListenerRoomInternal(room, interpolate, sequence, ordered, null);
+        return updateListenerRoomInternal(
+                room, interpolate, sequence, ordered, null, Long.MIN_VALUE
+        );
     }
 
     private static boolean updateListenerRoomInternal(
@@ -328,12 +394,26 @@ public final class OpenALAcousticEffects {
             boolean interpolate,
             long sequence,
             boolean ordered,
-            ListenerFieldSnapshot measuredField
+            ListenerFieldSnapshot measuredField,
+            long sceneRevision
     ) {
         if (!ensureSupport()) {
             return false;
         }
         syncDistanceAttenuationSettings();
+        if (SoftwareAcousticMixer.available()) {
+            if (ordered && sequence < lastListenerRoomSequence) {
+                return false;
+            }
+            if (ordered) {
+                lastListenerRoomSequence = sequence;
+            }
+            smoothedListenerRoom = room;
+            targetListenerRoom = room;
+            lastListenerRoomUpdateNanoseconds = System.nanoTime();
+            tailFieldRequests = List.of();
+            return true;
+        }
         if (ordered) {
             if (sequence < lastListenerRoomSequence) {
                 return false;
@@ -345,65 +425,59 @@ public final class OpenALAcousticEffects {
         }
         try {
             long now = System.nanoTime();
-            if (!interpolate || smoothedListenerRoom == null) {
+            boolean initializesField = !interpolate || smoothedListenerRoom == null;
+            if (initializesField) {
                 smoothedListenerRoom = room;
+                targetListenerRoom = room;
             } else {
-                float amount = elapsedResponseAmount(
-                        lastListenerRoomUpdateNanoseconds,
-                        now
-                );
-                smoothedListenerRoom = interpolateRoom(smoothedListenerRoom, room, amount);
+                // First advance the existing energy to the exact event time, then
+                // replace only its boundary conditions. This keeps all accumulated
+                // energy continuous across motion and arbitrarily frequent block edits.
+                advanceListenerField(now);
+                targetListenerRoom = room;
             }
             lastListenerRoomUpdateNanoseconds = now;
-            boolean crossedMeasuredAperture = measuredField == null
-                    || activeReverbBus == null
-                    || activeReverbBus.field == null
-                    || activeReverbBus.field.apertureRadiation(
-                            measuredField.listener(), true
-                    ).outside();
-            if (crossedMeasuredAperture) {
-                updatePersistentReverbBus(
-                        ReverbKey.from(room),
-                        room
-                );
+            ReverbBus listenerBus = currentReverbBus();
+            reindexListenerReverbBus(listenerBus, ReverbKey.from(room));
+            if (initializesField) {
+                // Startup has no stored acoustic energy to evolve. Publish the measured
+                // boundary to the already prewarmed network without allocating another
+                // field or waiting for a later movement callback.
+                morphReverbBus(listenerBus, room);
             }
+            // Space identity is not a DSP lifetime boundary. Crossing an aperture and
+            // editing blocks only replace the measured boundary of the same energy
+            // state, which DiffuseFieldDynamics advances using real elapsed time.
             if (measuredField != null) {
-                activeReverbBus.field = measuredField;
-                activeReverbBus.fieldToken = ++nextFieldToken;
+                listenerBus.field = measuredField;
+                listenerBus.fieldToken = ++nextFieldToken;
+                if (sceneRevision != Long.MIN_VALUE) {
+                    listenerBus.sceneRevision = sceneRevision;
+                }
             }
-            activeReverbBus.room = room;
             Vec3 observation = lastDynamicListenerPosition != null
                     ? lastDynamicListenerPosition
                     : measuredField == null ? null : measuredField.listener();
             PortalRadiation activeRadiation = observation == null
-                    || activeReverbBus.field == null
+                    || listenerBus.field == null
                     ? PortalRadiation.INSIDE
-                    : activeReverbBus.field.apertureRadiation(observation, true);
-            Vec3 activePan = activeRadiation.outside()
-                    ? listenerRelativeVector(activeRadiation.arrivalDirection())
-                    : Vec3.ZERO;
-            updateFastReverbProperties(
-                    activeReverbBus, room, activePan,
-                    activeRadiation.highFrequencyGain()
-            );
+                    : listenerBus.field.apertureRadiation(observation, true);
+            listenerBus.transportHighFrequencyGain =
+                    activeRadiation.highFrequencyGain();
+            refreshBusSendFilters(listenerBus);
             float activeTargetGain = clamp(
                     smoothedListenerRoom.gain()
                             * (activeRadiation.outside()
                             ? activeRadiation.transmission() : 1.0F),
                     0.0F, 1.0F
             );
-            float activeAmount = elapsedResponseAmount(
-                    activeReverbBus.lastOutputGainUpdateNanoseconds, now
-            );
-            activeReverbBus.outputGain = lerp(
-                    activeReverbBus.outputGain, activeTargetGain, activeAmount
-            );
+            listenerBus.outputGain = activeTargetGain;
             EXTEfx.alAuxiliaryEffectSlotf(
-                    activeReverbBus.slot,
+                    listenerBus.slot,
                     EXTEfx.AL_EFFECTSLOT_GAIN,
-                    clamp(activeReverbBus.outputGain, 0.0F, 1.0F)
+                    clamp(listenerBus.outputGain, 0.0F, 1.0F)
             );
-            activeReverbBus.lastOutputGainUpdateNanoseconds = now;
+            listenerBus.lastOutputGainUpdateNanoseconds = now;
             updateRetiredReverbOutputs(
                     now,
                     smoothedListenerRoom,
@@ -440,8 +514,41 @@ public final class OpenALAcousticEffects {
         syncDistanceAttenuationSettings();
 
         try {
+            // OpenAL keeps one error flag per context. Consume any stale flag before
+            // this transaction and always consume ours below, so one failed voice can
+            // never poison every later vanilla source allocation.
+            AL10.alGetError();
             SourceState state = SOURCES.computeIfAbsent(source, OpenALAcousticEffects::createSourceState);
             if (!state.update(target, snapToTarget, sequence, ordered)) {
+                return;
+            }
+            if (SoftwareAcousticMixer.available()) {
+                RoomAcoustics sourceRoom = state.sourceRoomProbe == null
+                        ? RoomAcoustics.OUTDOORS
+                        : state.sourceRoomProbe.acoustics();
+                Vec3 earlyDirection = listenerRelativeDirection(
+                        state.earlyReflection.arrivalDirection()
+                );
+                float transportedGain = state.propagationGain
+                        * state.audibilityGain;
+                SoftwareAcousticMixer.apply(
+                        source,
+                        state.earlyReflection,
+                        transportedGain,
+                        (float) earlyDirection.x,
+                        target.reverbRoom(),
+                        state.reverbSend * transportedGain,
+                        state.reverbHighFrequency,
+                        sourceRoom,
+                        state.sourceRoomSend * transportedGain,
+                        state.sourceRoomHighFrequency
+                );
+                applyPositionalDirectPath(source, state);
+                AL10.alSource3f(source, AL10.AL_POSITION,
+                        (float) state.apparentPosition.x,
+                        (float) state.apparentPosition.y,
+                        (float) state.apparentPosition.z);
+                throwOnOpenAlError(source, "software acoustic update");
                 return;
             }
             assignReverbBus(state);
@@ -452,6 +559,7 @@ public final class OpenALAcousticEffects {
                     (float) state.apparentPosition.x,
                     (float) state.apparentPosition.y,
                     (float) state.apparentPosition.z);
+            throwOnOpenAlError(source, "EFX acoustic update");
         } catch (RuntimeException exception) {
             recoverSourceAfterFailure(source, exception);
         }
@@ -463,8 +571,14 @@ public final class OpenALAcousticEffects {
         if (state == null || !supported) {
             return;
         }
-        detachSource(source);
-        deleteSourceState(state);
+        try {
+            detachSource(source);
+            deleteSourceState(state);
+        } finally {
+            // Channel.destroy continues with vanilla OpenAL cleanup immediately after
+            // this injection. Never hand it an error produced by our detached source.
+            AL10.alGetError();
+        }
     }
 
     public static void shutdown() {
@@ -495,16 +609,13 @@ public final class OpenALAcousticEffects {
                 )
         );
         EXTEfx.alFilterf(state.directFilter, EXTEfx.AL_LOWPASS_GAINHF, clamp(state.highFrequencyGain, 0.0F, 1.0F));
-        updateReverbFilter(state);
         AL10.alSourcei(source, EXTEfx.AL_DIRECT_FILTER, state.directFilter);
+        if (SoftwareAcousticMixer.available()) {
+            return;
+        }
+        updateReverbFilter(state);
         if (advancedEaxReverb) {
-            boolean remoteFieldUsesFirstSend = state.sourceRoomBus != null
-                    && !dedicatedSourceRoomSendSupported;
-            if (remoteFieldUsesFirstSend) {
-                attachSourceRoomSend(source, state, 0);
-            } else {
-                updateEarlyReflectionSend(source, state);
-            }
+            updateEarlyReflectionSend(source, state);
             attachLateReverbSends(source, state);
         } else {
             attachLateReverbSends(source, state);
@@ -581,7 +692,12 @@ public final class OpenALAcousticEffects {
         EXTEfx.alFilterf(
                 state.sourceRoomFilter,
                 EXTEfx.AL_LOWPASS_GAINHF,
-                clamp(state.sourceRoomHighFrequency, 0.0F, 1.0F)
+                clamp(
+                        state.sourceRoomHighFrequency
+                                * state.sourceRoomBus.transportHighFrequencyGain,
+                        0.0F,
+                        1.0F
+                )
         );
     }
 
@@ -596,20 +712,65 @@ public final class OpenALAcousticEffects {
                         1.0F
                 )
         );
-        float roomHighFrequency = smoothedListenerRoom == null
-                ? 1.0F
-                : smoothedListenerRoom.gainHighFrequency();
         EXTEfx.alFilterf(
                 state.reverbFilter,
                 EXTEfx.AL_LOWPASS_GAINHF,
-                clamp(state.reverbHighFrequency * roomHighFrequency, 0.0F, 1.0F)
+                clamp(
+                        state.reverbHighFrequency
+                                * state.reverbBus.transportHighFrequencyGain,
+                        0.0F,
+                        1.0F
+                )
         );
+    }
+
+    /** Updates transport filters without replacing an EFX feedback network mid-tail. */
+    private static void refreshBusSendFilters(ReverbBus bus) {
+        for (SourceState state : SOURCES.values()) {
+            if (state.reverbBus == bus) {
+                updateReverbFilter(state);
+            }
+            if (state.sourceRoomBus == bus) {
+                updateSourceRoomFilter(state);
+            }
+        }
     }
 
     private static void updateEarlyReflectionSend(int source, SourceState state) {
         EarlyReflection reflection = state.earlyReflection;
-        if (reflection.gain() <= 1.0E-5F) {
-            releaseEarlyReflectionBus(state);
+        EarlyFieldMix mix = EarlyFieldMix.from(state);
+        if (mix.inputGain() <= 0.0F) {
+            if (state.earlyReflectionBus == null) {
+                AL11.alSource3i(
+                        source,
+                        EXTEfx.AL_AUXILIARY_SEND_FILTER,
+                        EXTEfx.AL_EFFECTSLOT_NULL,
+                        0,
+                        EXTEfx.AL_FILTER_NULL
+                );
+                return;
+            }
+            // Stop injecting new energy without detaching the delay line. Samples
+            // already travelling toward the reflected arrival must still reach it.
+            EXTEfx.alFilterf(
+                    state.earlyReflectionFilter,
+                    EXTEfx.AL_LOWPASS_GAIN,
+                    0.0F
+            );
+            AL11.alSource3i(
+                    source,
+                    EXTEfx.AL_AUXILIARY_SEND_FILTER,
+                    state.earlyReflectionBus.slot,
+                    0,
+                    state.earlyReflectionFilter
+            );
+            return;
+        }
+
+        Vec3 listenerPan = listenerRelativeDirection(reflection.arrivalDirection());
+        EarlyReflectionKey key = EarlyReflectionKey.from(reflection, listenerPan);
+        assignEarlyReflectionBus(state, key, reflection, listenerPan, mix);
+        if (state.earlyReflectionBus == null) {
             AL11.alSource3i(
                     source,
                     EXTEfx.AL_AUXILIARY_SEND_FILTER,
@@ -619,20 +780,15 @@ public final class OpenALAcousticEffects {
             );
             return;
         }
-
-        Vec3 listenerPan = listenerRelativeDirection(reflection.arrivalDirection());
-        EarlyReflectionKey key = EarlyReflectionKey.from(reflection, listenerPan);
-        assignEarlyReflectionBus(state, key, reflection, listenerPan);
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
                 EXTEfx.AL_LOWPASS_GAIN,
-                reflection.gain() * state.propagationGain
-                        * state.audibilityGain
+                mix.inputGain()
         );
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
                 EXTEfx.AL_LOWPASS_GAINHF,
-                reflection.highFrequencyGain()
+                mix.highFrequencyGain()
         );
         AL11.alSource3i(
                 source,
@@ -675,15 +831,11 @@ public final class OpenALAcousticEffects {
         return local.lengthSqr() <= 1.0E-12 ? Vec3.ZERO : local.normalize();
     }
 
-    private static Vec3 listenerRelativeVector(Vec3 worldVector) {
-        double magnitude = worldVector.length();
-        if (magnitude <= 1.0E-12) {
-            return Vec3.ZERO;
-        }
-        return listenerRelativeDirection(worldVector).scale(Math.min(1.0, magnitude));
-    }
-
     private static boolean ensureSupport() {
+        if (!AcousticQualityConfig.settings().enabled()) {
+            return false;
+        }
+        vanillaProcessing = false;
         if (supportChecked) {
             return supported;
         }
@@ -702,7 +854,7 @@ public final class OpenALAcousticEffects {
         if (advancedEaxReverb) {
             AcousticSystem.LOGGER.info("Unified OpenAL EFX acoustic pipeline enabled with positional direct filtering, EAX reverb and {} auxiliary sends", maximumSends);
             if (!dedicatedSourceRoomSendSupported) {
-                AcousticSystem.LOGGER.info("Two-send routing enabled: listener late field remains persistent while remote fields use the first send");
+                AcousticSystem.LOGGER.warn("The audio context exposed only two auxiliary sends; source-room decay is unavailable, while source reflections and listener reverb remain independent");
             }
         } else {
             AcousticSystem.LOGGER.info("Unified OpenAL EFX acoustic pipeline enabled in compatible two-parameter mode ({} auxiliary send)", maximumSends);
@@ -720,11 +872,13 @@ public final class OpenALAcousticEffects {
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAIN_AUTO, AL10.AL_FALSE);
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO, AL10.AL_FALSE);
         int directFilter = createLowPass(1.0F, 1.0F);
-        int reverbFilter = createLowPass(0.04F, 1.0F);
-        int sourceRoomFilter = advancedEaxReverb
+        int reverbFilter = SoftwareAcousticMixer.available()
+                ? 0
+                : createLowPass(0.04F, 1.0F);
+        int sourceRoomFilter = advancedEaxReverb && !SoftwareAcousticMixer.available()
                 ? createLowPass(0.04F, 1.0F)
                 : 0;
-        int earlyReflectionFilter = advancedEaxReverb
+        int earlyReflectionFilter = advancedEaxReverb && !SoftwareAcousticMixer.available()
                 ? createLowPass(0.0F, 1.0F)
                 : 0;
         return new SourceState(
@@ -735,11 +889,42 @@ public final class OpenALAcousticEffects {
     }
 
     private static int createLowPass(float gain, float highFrequencyGain) {
+        AL10.alGetError();
         int filter = EXTEfx.alGenFilters();
+        int allocationError = AL10.alGetError();
+        if (filter == 0 || allocationError != AL10.AL_NO_ERROR) {
+            if (filter != 0) {
+                EXTEfx.alDeleteFilters(filter);
+                AL10.alGetError();
+            }
+            throw new IllegalStateException(
+                    "OpenAL could not allocate a direct-path filter: "
+                            + allocationError
+            );
+        }
         EXTEfx.alFilteri(filter, EXTEfx.AL_FILTER_TYPE, EXTEfx.AL_FILTER_LOWPASS);
         EXTEfx.alFilterf(filter, EXTEfx.AL_LOWPASS_GAIN, gain);
         EXTEfx.alFilterf(filter, EXTEfx.AL_LOWPASS_GAINHF, highFrequencyGain);
+        int configurationError = AL10.alGetError();
+        if (configurationError != AL10.AL_NO_ERROR) {
+            EXTEfx.alDeleteFilters(filter);
+            AL10.alGetError();
+            throw new IllegalStateException(
+                    "OpenAL could not configure a direct-path filter: "
+                            + configurationError
+            );
+        }
         return filter;
+    }
+
+    private static void throwOnOpenAlError(int source, String operation) {
+        int error = AL10.alGetError();
+        if (error != AL10.AL_NO_ERROR) {
+            throw new IllegalStateException(
+                    operation + " failed for source " + source
+                            + " with OpenAL error " + error
+            );
+        }
     }
 
     private static void assignReverbBus(SourceState state) {
@@ -761,6 +946,7 @@ public final class OpenALAcousticEffects {
 
     private static void assignSourceRoomBus(SourceState state) {
         if (!advancedEaxReverb
+                || !dedicatedSourceRoomSendSupported
                 || state.sourceRoomProbe == null
                 || state.sourcePosition == null
                 || state.sourceRoomProbe.acoustics().gain() <= 1.0E-6F) {
@@ -768,28 +954,62 @@ public final class OpenALAcousticEffects {
             return;
         }
         ReverbKey key = ReverbKey.from(state.sourceRoomProbe.acoustics());
-        if (activeReverbBus != null && key.equals(activeReverbBus.key)) {
+        if (targetListenerRoom != null
+                && key.equals(ReverbKey.from(targetListenerRoom))) {
             // The listener and emitter share the same diffuse field. Feeding both sends
             // would count the same room energy twice.
             releaseSourceRoomBus(state);
             return;
         }
 
-        ReverbBus next = acquireSourceRoomBus(key, state.sourceRoomProbe.acoustics());
-        if (next == null) {
-            // Keep the current assignment until a finished tail becomes recyclable;
-            // losing a whole field is more audible than one delayed topology update.
-            return;
+        if (state.sourceRoomBus != null
+                && !key.equals(state.sourceRoomBus.key)
+                && state.sourceRoomBus.sourceReferences > 1) {
+            ReverbBus replacement = acquireSourceRoomBus(
+                    key, state.sourceRoomProbe.acoustics()
+            );
+            if (replacement != null && replacement != state.sourceRoomBus) {
+                ReverbBus previous = state.sourceRoomBus;
+                previous.references--;
+                previous.sourceReferences--;
+                if (previous.references == 0 && previous != activeReverbBus) {
+                    previous.retire(System.nanoTime());
+                }
+                state.sourceRoomBus = replacement;
+                replacement.references++;
+                replacement.sourceReferences++;
+            }
         }
-        if (state.sourceRoomBus != next) {
-            releaseSourceRoomBus(state);
+        if (state.sourceRoomBus == null) {
+            ReverbBus next = acquireSourceRoomBus(
+                    key, state.sourceRoomProbe.acoustics()
+            );
+            if (next == null) {
+                return;
+            }
             state.sourceRoomBus = next;
             next.references++;
             next.sourceReferences++;
         }
-        next.activate(System.nanoTime());
+        ReverbBus next = state.sourceRoomBus;
+        long now = System.nanoTime();
+        next.activate(now);
         next.sourceField = true;
-        next.room = state.sourceRoomProbe.acoustics();
+        if (next.sourceReferences == 1) {
+            if (!key.equals(next.key)) {
+                if (next.key != null) {
+                    REVERB_BUSES.remove(next.key, next);
+                }
+                next.key = key;
+                REVERB_BUSES.putIfAbsent(key, next);
+            }
+            evolveReverbBusBoundary(
+                    next, state.sourceRoomProbe.acoustics(), now
+            );
+        }
+        // A moving source and edited blocks alter this field's boundary, not the audio
+        // already circulating in its feedback delays. Keep the assigned network and
+        // replace only the current geometric observation and send spectrum.
         next.field = ListenerFieldSnapshot.from(
                 state.sourceRoomProbe, state.sourcePosition
         );
@@ -814,11 +1034,8 @@ public final class OpenALAcousticEffects {
                 .filter(candidate -> candidate != activeReverbBus && candidate.canRecycle(now))
                 .min(Comparator.comparingLong(candidate -> candidate.lastUsed))
                 .orElse(null);
-        if (available == null && REVERB_POOL.size() < MAX_REVERB_BUSES) {
-            available = createReverbBus(null, RoomAcoustics.OUTDOORS);
-        }
         if (available == null) {
-            return null;
+            available = createReverbBus(null, RoomAcoustics.OUTDOORS);
         }
         if (available.key != null) {
             REVERB_BUSES.remove(available.key, available);
@@ -844,25 +1061,43 @@ public final class OpenALAcousticEffects {
 
     private static void assignEarlyReflectionBus(
             SourceState state,
-            EarlyReflectionKey key,
+        EarlyReflectionKey key,
             EarlyReflection reflection,
-            Vec3 listenerPan
+            Vec3 listenerPan,
+            EarlyFieldMix mix
     ) {
-        if (state.earlyReflectionBus != null
-                && state.earlyReflectionBus.key != null
-                && state.earlyReflectionBus.key.equals(key)) {
+        EarlyReflectionBus current = state.earlyReflectionBus;
+        if (current != null && key.equals(current.key)) {
+            return;
+        }
+        EarlyReflectionBus exact = EARLY_REFLECTION_BUSES.get(key);
+        if (current != null && current.references == 1
+                && (exact == null || exact == current)) {
+            boolean keyChanged = current.key == null || !current.key.equals(key);
+            if (keyChanged && current.key != null) {
+                EARLY_REFLECTION_BUSES.remove(current.key, current);
+            }
+            configureEarlyReflectionBus(
+                    current, key, reflection, listenerPan, mix
+            );
+            if (keyChanged) {
+                EARLY_REFLECTION_BUSES.put(key, current);
+            }
             return;
         }
         EarlyReflectionBus next = acquireEarlyReflectionBus(
-                key, reflection, listenerPan
+                key, reflection, listenerPan, mix
         );
+        if (next == null) {
+            return;
+        }
         if (state.earlyReflectionBus == next) {
             return;
         }
         releaseEarlyReflectionBus(state);
         state.earlyReflectionBus = next;
         next.references++;
-        next.lastUsed = System.nanoTime();
+        next.activate(System.nanoTime());
     }
 
     private static void releaseEarlyReflectionBus(SourceState state) {
@@ -870,21 +1105,30 @@ public final class OpenALAcousticEffects {
             return;
         }
         state.earlyReflectionBus.references--;
-        state.earlyReflectionBus.lastUsed = System.nanoTime();
+        long now = System.nanoTime();
+        if (state.earlyReflectionBus.references == 0) {
+            state.earlyReflectionBus.retire(now);
+        } else {
+            state.earlyReflectionBus.lastUsed = now;
+        }
         state.earlyReflectionBus = null;
     }
 
     private static EarlyReflectionBus acquireEarlyReflectionBus(
             EarlyReflectionKey key,
             EarlyReflection reflection,
-            Vec3 listenerPan
+            Vec3 listenerPan,
+            EarlyFieldMix mix
     ) {
         EarlyReflectionBus exact = EARLY_REFLECTION_BUSES.get(key);
         if (exact != null) {
+            exact.activate(System.nanoTime());
             return exact;
         }
+        long now = System.nanoTime();
+        reapExpiredEarlyReflectionBuses(now);
         EarlyReflectionBus replaceable = EARLY_REFLECTION_POOL.stream()
-                .filter(bus -> bus.references == 0)
+                .filter(bus -> bus.canRecycle(now))
                 .min(Comparator.comparingLong(bus -> bus.lastUsed))
                 .orElse(null);
         if (replaceable != null) {
@@ -892,18 +1136,32 @@ public final class OpenALAcousticEffects {
                 EARLY_REFLECTION_BUSES.remove(replaceable.key, replaceable);
             }
             configureEarlyReflectionBus(
-                    replaceable, key, reflection, listenerPan
+                    replaceable, key, reflection, listenerPan, mix
             );
             EARLY_REFLECTION_BUSES.put(key, replaceable);
             return replaceable;
         }
-        return EARLY_REFLECTION_POOL.stream()
-                .min(Comparator.comparingDouble(bus ->
-                        bus.key == null
-                                ? Double.POSITIVE_INFINITY
-                                : bus.key.distanceTo(key)
-                ))
-                .orElseThrow();
+        EarlyReflectionBus created = createEarlyReflectionBus(
+                key, reflection, listenerPan, mix
+        );
+        EARLY_REFLECTION_BUSES.put(key, created);
+        return created;
+    }
+
+    private static void reapExpiredEarlyReflectionBuses(long now) {
+        for (int index = EARLY_REFLECTION_POOL.size() - 1;
+             index >= 0 && EARLY_REFLECTION_POOL.size() > PREWARMED_EARLY_REFLECTION_BUSES;
+             index--) {
+            EarlyReflectionBus bus = EARLY_REFLECTION_POOL.get(index);
+            if (!bus.canRecycle(now)) {
+                continue;
+            }
+            if (bus.key != null) {
+                EARLY_REFLECTION_BUSES.remove(bus.key, bus);
+            }
+            EARLY_REFLECTION_POOL.remove(index);
+            deleteEarlyReflectionBus(bus);
+        }
     }
 
     private static ReverbBus currentReverbBus() {
@@ -920,78 +1178,21 @@ public final class OpenALAcousticEffects {
         return existing;
     }
 
-    private static void updatePersistentReverbBus(
-            ReverbKey key,
-            RoomAcoustics room
-    ) {
-        ReverbBus previous = currentReverbBus();
-        if (key.equals(previous.key)) {
+    private static void reindexListenerReverbBus(ReverbBus bus, ReverbKey key) {
+        if (key.equals(bus.key)) {
             return;
         }
-
-        long now = System.nanoTime();
-        ReverbBus next = REVERB_BUSES.get(key);
-        if (next != null
-                && next != previous
-                && next.tailExpiresAtNanoseconds != 0L
-                && !next.canRecycle(now)) {
-            // Do not turn a previously attenuated tail back into the active room merely
-            // because a boundary probe revisited the same quantized key. That exposes
-            // stored energy at full slot gain and sounds like reverb disappearing and
-            // returning. A genuinely free bus starts a new field; otherwise the current
-            // continuous field remains in charge until one is available.
-            next = null;
-        } else if (next != null
-                && next != previous
-                && next.tailExpiresAtNanoseconds != 0L) {
-            // The previous contents are inaudible or expired. Reinitialize the effect
-            // and its output gain before making it active; otherwise a recycled 0-gain
-            // slot remains silent until some later movement happens to advance it.
-            configureReverbBus(next, key, room);
+        if (bus.key != null) {
+            REVERB_BUSES.remove(bus.key, bus);
         }
-        if (next == null) {
-            next = REVERB_POOL.stream()
-                    .filter(candidate -> candidate != previous && candidate.canRecycle(now))
-                    .min(Comparator.comparingLong(candidate -> candidate.lastUsed))
-                    .orElse(null);
-            if (next == null && REVERB_POOL.size() < MAX_REVERB_BUSES) {
-                next = createReverbBus(null, RoomAcoustics.OUTDOORS);
-            }
-            if (next == null) {
-                // This can only occur while a just-destroyed OpenAL voice has not yet
-                // released its state. Retain the current, valid field for this callback;
-                // the continuously running next result will retry the handover.
-                return;
-            }
-            if (next.key != null) {
-                REVERB_BUSES.remove(next.key, next);
-            }
-            configureReverbBus(next, key, room);
-            REVERB_BUSES.put(key, next);
-        }
-
-        activeReverbBus = next;
-        next.activate(now);
-        // Move every live voice in the same sound-thread transaction. The old field is
-        // no longer fed but its slot stays audible, so its stored energy decays with the
-        // RT60 measured in the previous space instead of being cut or frozen.
-        for (Map.Entry<Integer, SourceState> entry : SOURCES.entrySet()) {
-            SourceState state = entry.getValue();
-            assignReverbBus(state);
-            attachLateReverbSends(entry.getKey(), state);
-        }
-        previous.retire(now);
-        publishTailFieldRequests(now);
+        bus.key = key;
+        REVERB_BUSES.put(key, bus);
     }
 
     /**
-     * A retired EFX network still contains the diffuse energy generated in its former
-     * room. Its output, however, is listener-relative: leaving that room must therefore
-     * change how much of the stored field reaches the listener or the old room appears
-     * to travel outdoors with them. The overlap below is the normalized inner product
-     * of two exponentially decaying, three-band diffuse fields. It stays one for small
-     * coefficient updates inside one space and tends continuously to zero as the new
-     * listener field becomes open or acoustically unrelated.
+     * A stopped source-side EFX network can still contain diffuse energy. Its output is
+     * transported from that fixed source field while it naturally decays. Listener
+     * space changes never enter this path because they stay in one persistent network.
      */
     private static void updateRetiredReverbOutputs(
             long now,
@@ -1041,20 +1242,30 @@ public final class OpenALAcousticEffects {
                     clamp(bus.outputGain, 0.0F, 1.0F)
             );
             bus.lastOutputGainUpdateNanoseconds = now;
-            if (advancedEaxReverb) {
-                updateFastReverbProperties(
-                        bus,
-                        bus.room,
-                        listenerRelativeVector(radiation.arrivalDirection()),
-                        radiation.highFrequencyGain()
-                );
-            }
+            bus.transportHighFrequencyGain = radiation.highFrequencyGain();
         }
+        reapExpiredReverbBuses(now);
         publishTailFieldRequests(now);
     }
 
+    private static void reapExpiredReverbBuses(long now) {
+        for (int index = REVERB_POOL.size() - 1;
+             index >= 0 && REVERB_POOL.size() > PREWARMED_REVERB_BUSES;
+             index--) {
+            ReverbBus bus = REVERB_POOL.get(index);
+            if (bus == activeReverbBus || !bus.canRecycle(now)) {
+                continue;
+            }
+            if (bus.key != null) {
+                REVERB_BUSES.remove(bus.key, bus);
+            }
+            REVERB_POOL.remove(index);
+            deleteReverbBus(bus);
+        }
+    }
+
     private static void publishTailFieldRequests(long now) {
-        List<TailFieldRequest> requests = new ArrayList<>(MAX_REVERB_BUSES);
+        List<TailFieldRequest> requests = new ArrayList<>(REVERB_POOL.size());
         for (ReverbBus bus : REVERB_POOL) {
             if (bus == activeReverbBus
                     || bus.references != 0
@@ -1135,8 +1346,8 @@ public final class OpenALAcousticEffects {
             boolean outsideAperture
     ) {
         if (outsideAperture) {
-            // Once the listener crosses the measured aperture plane, transport is set
-            // by that finite aperture alone. The listener-room probe can remain
+            // Once the listener traverses the measured finite aperture, transport is
+            // set by that aperture alone. The listener-room probe can remain
             // numerically similar to the old room for another background completion;
             // taking max(overlap, aperture) held the tail at full level until that
             // categorical probe change and then cut it in one audible step.
@@ -1201,6 +1412,7 @@ public final class OpenALAcousticEffects {
         bus.sourceField = false;
         bus.field = null;
         bus.fieldToken = ++nextFieldToken;
+        bus.sceneRevision = Long.MIN_VALUE;
         if (advancedEaxReverb) {
             updateEaxReverb(bus.effect, room);
         } else {
@@ -1215,8 +1427,9 @@ public final class OpenALAcousticEffects {
                 bus.effect
         );
         bus.lastUsed = System.nanoTime();
+        bus.lastBoundaryUpdateNanoseconds = bus.lastUsed;
         bus.tailExpiresAtNanoseconds = 0L;
-        bus.fastKey = null;
+        bus.transportHighFrequencyGain = 1.0F;
         bus.outputGain = clamp(room.gain(), 0.0F, 1.0F);
         bus.lastOutputGainUpdateNanoseconds = bus.lastUsed;
         EXTEfx.alAuxiliaryEffectSlotf(
@@ -1229,7 +1442,8 @@ public final class OpenALAcousticEffects {
     private static EarlyReflectionBus createEarlyReflectionBus(
             EarlyReflectionKey key,
             EarlyReflection reflection,
-            Vec3 listenerPan
+            Vec3 listenerPan,
+            EarlyFieldMix mix
     ) {
         int effect = EXTEfx.alGenEffects();
         EXTEfx.alEffecti(
@@ -1244,7 +1458,7 @@ public final class OpenALAcousticEffects {
                 AL10.AL_FALSE
         );
         EarlyReflectionBus bus = new EarlyReflectionBus(key, effect, slot);
-        configureEarlyReflectionBus(bus, key, reflection, listenerPan);
+        configureEarlyReflectionBus(bus, key, reflection, listenerPan, mix);
         EARLY_REFLECTION_POOL.add(bus);
         return bus;
     }
@@ -1253,23 +1467,24 @@ public final class OpenALAcousticEffects {
             EarlyReflectionBus bus,
             EarlyReflectionKey key,
             EarlyReflection reflection,
-            Vec3 listenerPan
+            Vec3 listenerPan,
+            EarlyFieldMix mix
     ) {
         bus.key = key;
         int effect = bus.effect;
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_DENSITY, 0.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_DIFFUSION, 0.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_GAIN, 1.0F);
-        EXTEfx.alEffectf(
-                effect,
-                EXTEfx.AL_EAXREVERB_GAINHF,
-                reflection.highFrequencyGain()
-        );
+        EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_GAINHF, 1.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_GAINLF, 1.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_DECAY_TIME, 0.1F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_DECAY_HFRATIO, 1.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_DECAY_LFRATIO, 1.0F);
-        EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_REFLECTIONS_GAIN, 1.0F);
+        EXTEfx.alEffectf(
+                effect,
+                EXTEfx.AL_EAXREVERB_REFLECTIONS_GAIN,
+                mix.inputGain() > 0.0F ? 1.0F : 0.0F
+        );
         EXTEfx.alEffectf(
                 effect,
                 EXTEfx.AL_EAXREVERB_REFLECTIONS_DELAY,
@@ -1288,6 +1503,7 @@ public final class OpenALAcousticEffects {
                 vector(Vec3.ZERO)
         );
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_ECHO_DEPTH, 0.0F);
+        EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_MODULATION_TIME, 0.25F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_MODULATION_DEPTH, 0.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_AIR_ABSORPTION_GAINHF, 1.0F);
         EXTEfx.alEffectf(effect, EXTEfx.AL_EAXREVERB_ROOM_ROLLOFF_FACTOR, 0.0F);
@@ -1303,6 +1519,8 @@ public final class OpenALAcousticEffects {
                 1.0F
         );
         bus.lastUsed = System.nanoTime();
+        bus.reflectionDelaySeconds = reflection.delay();
+        bus.tailExpiresAtNanoseconds = 0L;
     }
 
     private static void updateEaxReverb(int reverbEffect, RoomAcoustics room) {
@@ -1340,89 +1558,6 @@ public final class OpenALAcousticEffects {
         EXTEfx.alEffecti(reverbEffect, EXTEfx.AL_EAXREVERB_DECAY_HFLIMIT, AL10.AL_TRUE);
     }
 
-    private static void updateFastReverbProperties(
-            ReverbBus bus,
-            RoomAcoustics room,
-            Vec3 latePan,
-            float propagationHighFrequencyGain
-    ) {
-        float highFrequencyGain = clamp(
-                room.gainHighFrequency() * propagationHighFrequencyGain,
-                0.0F,
-                1.0F
-        );
-        FastReverbKey nextKey = FastReverbKey.from(
-                room, latePan, highFrequencyGain
-        );
-        if (nextKey.equals(bus.fastKey)) {
-            return;
-        }
-        if (advancedEaxReverb) {
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_GAINHF,
-                    highFrequencyGain
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_GAINLF,
-                    clamp(room.gainLowFrequency(), 0.0F, 1.0F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_REFLECTIONS_DELAY,
-                    clamp(room.reflectionsDelay(), 0.0F, 0.3F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_LATE_REVERB_GAIN,
-                    clamp(room.lateReverbGain(), 0.0F, 10.0F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_LATE_REVERB_DELAY,
-                    clamp(room.lateReverbDelay(), 0.0F, 0.1F)
-            );
-            EXTEfx.alEffectfv(
-                    bus.effect,
-                    EXTEfx.AL_EAXREVERB_LATE_REVERB_PAN,
-                    vector(latePan)
-            );
-        } else {
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_REVERB_GAINHF,
-                    highFrequencyGain
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_REVERB_REFLECTIONS_GAIN,
-                    clamp(room.reflectionsGain(), 0.0F, 3.16F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_REVERB_REFLECTIONS_DELAY,
-                    clamp(room.reflectionsDelay(), 0.0F, 0.3F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_REVERB_LATE_REVERB_GAIN,
-                    clamp(room.lateReverbGain(), 0.0F, 10.0F)
-            );
-            EXTEfx.alEffectf(
-                    bus.effect,
-                    EXTEfx.AL_REVERB_LATE_REVERB_DELAY,
-                    clamp(room.lateReverbDelay(), 0.0F, 0.1F)
-            );
-        }
-        EXTEfx.alAuxiliaryEffectSloti(
-                bus.slot,
-                EXTEfx.AL_EFFECTSLOT_EFFECT,
-                bus.effect
-        );
-        bus.fastKey = nextKey;
-    }
-
     private static void updateStandardReverb(int reverbEffect, RoomAcoustics room) {
         EXTEfx.alEffectf(reverbEffect, EXTEfx.AL_REVERB_DENSITY, clamp(room.density(), 0.0F, 1.0F));
         EXTEfx.alEffectf(reverbEffect, EXTEfx.AL_REVERB_DIFFUSION, clamp(room.diffusion(), 0.0F, 1.0F));
@@ -1445,6 +1580,9 @@ public final class OpenALAcousticEffects {
 
     private static void detachSource(int source) {
         AL10.alSourcei(source, EXTEfx.AL_DIRECT_FILTER, EXTEfx.AL_FILTER_NULL);
+        if (SoftwareAcousticMixer.available()) {
+            return;
+        }
         AL11.alSource3i(source, EXTEfx.AL_AUXILIARY_SEND_FILTER,
                 EXTEfx.AL_EFFECTSLOT_NULL, 0, EXTEfx.AL_FILTER_NULL);
         if (advancedEaxReverb) {
@@ -1459,7 +1597,9 @@ public final class OpenALAcousticEffects {
 
     private static void deleteSourceState(SourceState state) {
         EXTEfx.alDeleteFilters(state.directFilter);
-        EXTEfx.alDeleteFilters(state.reverbFilter);
+        if (state.reverbFilter != 0) {
+            EXTEfx.alDeleteFilters(state.reverbFilter);
+        }
         if (state.sourceRoomFilter != 0) {
             EXTEfx.alDeleteFilters(state.sourceRoomFilter);
         }
@@ -1512,6 +1652,8 @@ public final class OpenALAcousticEffects {
             deleteSourceState(failed);
         } catch (RuntimeException cleanupFailure) {
             AcousticSystem.LOGGER.debug("Could not delete failed OpenAL filters for source {}", source, cleanupFailure);
+        } finally {
+            AL10.alGetError();
         }
     }
 
@@ -1528,6 +1670,7 @@ public final class OpenALAcousticEffects {
         dedicatedSourceRoomSendSupported = false;
         activeReverbBus = null;
         smoothedListenerRoom = null;
+        targetListenerRoom = null;
         lastListenerRoomUpdateNanoseconds = 0L;
         lastListenerRoomSequence = Long.MIN_VALUE;
         lastDynamicListenerPosition = null;
@@ -1535,6 +1678,7 @@ public final class OpenALAcousticEffects {
         tailFieldRequests = List.of();
         appliedDistanceAttenuationSettings = null;
         atmosphereHighFrequencyCache = null;
+        vanillaProcessing = false;
     }
 
     private static DistanceAttenuationSettings distanceAttenuationSettings() {
@@ -1598,6 +1742,71 @@ public final class OpenALAcousticEffects {
         return (float) (1.0 - Math.exp(-elapsedMilliseconds / responseTimeMilliseconds));
     }
 
+    private static void advanceListenerField(long nowNanoseconds) {
+        if (smoothedListenerRoom == null || targetListenerRoom == null) {
+            lastListenerRoomUpdateNanoseconds = nowNanoseconds;
+            return;
+        }
+        if (lastListenerRoomUpdateNanoseconds == 0L
+                || nowNanoseconds <= lastListenerRoomUpdateNanoseconds) {
+            lastListenerRoomUpdateNanoseconds = nowNanoseconds;
+            return;
+        }
+        double elapsedSeconds = (nowNanoseconds - lastListenerRoomUpdateNanoseconds)
+                / 1_000_000_000.0;
+        smoothedListenerRoom = DiffuseFieldDynamics.advance(
+                smoothedListenerRoom,
+                targetListenerRoom,
+                elapsedSeconds
+        );
+        lastListenerRoomUpdateNanoseconds = nowNanoseconds;
+        if (activeReverbBus != null) {
+            morphReverbBus(activeReverbBus, smoothedListenerRoom);
+        }
+    }
+
+    /**
+     * Changes the boundary conditions of a live feedback field without replacing its
+     * delay network. EFX effect objects are templates, so the slot assignment publishes
+     * the continuously evolved coefficients to OpenAL while the samples already stored
+     * in the slot remain the same acoustic energy.
+     */
+    private static void morphReverbBus(ReverbBus bus, RoomAcoustics room) {
+        if (bus.room.equals(room)) {
+            return;
+        }
+        if (advancedEaxReverb) {
+            updateEaxReverb(bus.effect, room);
+        } else {
+            updateStandardReverb(bus.effect, room);
+        }
+        EXTEfx.alAuxiliaryEffectSloti(
+                bus.slot,
+                EXTEfx.AL_EFFECTSLOT_EFFECT,
+                bus.effect
+        );
+        bus.room = room;
+    }
+
+    private static void evolveReverbBusBoundary(
+            ReverbBus bus,
+            RoomAcoustics boundary,
+            long nowNanoseconds
+    ) {
+        if (bus.lastBoundaryUpdateNanoseconds == 0L
+                || nowNanoseconds <= bus.lastBoundaryUpdateNanoseconds) {
+            bus.lastBoundaryUpdateNanoseconds = nowNanoseconds;
+            return;
+        }
+        double elapsedSeconds = (nowNanoseconds - bus.lastBoundaryUpdateNanoseconds)
+                / 1_000_000_000.0;
+        RoomAcoustics evolved = DiffuseFieldDynamics.advance(
+                bus.room, boundary, elapsedSeconds
+        );
+        bus.lastBoundaryUpdateNanoseconds = nowNanoseconds;
+        morphReverbBus(bus, evolved);
+    }
+
     private static RoomAcoustics interpolateRoom(
             RoomAcoustics from,
             RoomAcoustics to,
@@ -1628,11 +1837,11 @@ public final class OpenALAcousticEffects {
         );
     }
 
-    // Only coefficients that alter the feedback network belong to its identity.
-    // Spectral gain, delays and portal pan are safe real-time properties and are
-    // updated on the existing effect. Treating every interpolated gain as a new room
-    // repeatedly restarted OpenAL Soft's environment transition before it became
-    // audible, which presented as the reverb cutting out and returning.
+    // These slow coefficients identify one persistent feedback network. Its complete
+    // EFX snapshot stays immutable until a genuine field handover. Continuous path and
+    // portal transport is applied through send filters and slot gain instead; repeatedly
+    // reassigning the effect makes OpenAL Soft continuously transition environments and
+    // can prevent a stable late field from forming.
     private record RoomKey(
             int density,
             int diffusion,
@@ -1722,33 +1931,18 @@ public final class OpenALAcousticEffects {
         }
     }
 
-    private record FastReverbKey(
-            int highFrequency,
-            int lowFrequency,
-            int reflectionsGain,
-            int reflectionDelay,
-            int lateGain,
-            int lateDelay,
-            int panX,
-            int panY,
-            int panZ
-    ) {
-        private static FastReverbKey from(
-                RoomAcoustics room,
-                Vec3 pan,
-                float highFrequencyGain
-        ) {
-            return new FastReverbKey(
-                    quantize(highFrequencyGain, 1000.0F),
-                    quantize(room.gainLowFrequency(), 1000.0F),
-                    quantize(room.reflectionsGain(), 1000.0F),
-                    quantize(room.reflectionsDelay(), 1000.0F),
-                    quantize(room.lateReverbGain(), 1000.0F),
-                    quantize(room.lateReverbDelay(), 1000.0F),
-                    Math.round((float) pan.x * 1000.0F),
-                    Math.round((float) pan.y * 1000.0F),
-                    Math.round((float) pan.z * 1000.0F)
-            );
+    private record EarlyFieldMix(float inputGain, float highFrequencyGain) {
+        private static final EarlyFieldMix SILENT = new EarlyFieldMix(0.0F, 1.0F);
+
+        private static EarlyFieldMix from(SourceState state) {
+            float reflectionInput = state.earlyReflection.gain()
+                    * state.propagationGain * state.audibilityGain;
+            return reflectionInput <= 0.0F
+                    ? SILENT
+                    : new EarlyFieldMix(
+                            reflectionInput,
+                            state.earlyReflection.highFrequencyGain()
+                    );
         }
     }
 
@@ -1756,29 +1950,20 @@ public final class OpenALAcousticEffects {
             int panX,
             int panY,
             int panZ,
-            int delay,
-            int highFrequency
+            int delay
     ) {
         private static EarlyReflectionKey from(
                 EarlyReflection reflection,
                 Vec3 listenerPan
         ) {
             return new EarlyReflectionKey(
-                    Math.round((float) listenerPan.x * 4.0F),
-                    Math.round((float) listenerPan.y * 4.0F),
-                    Math.round((float) listenerPan.z * 4.0F),
-                    quantize(reflection.delay(), 200.0F),
-                    quantize(reflection.highFrequencyGain(), 10.0F)
+                    Float.floatToIntBits((float) listenerPan.x),
+                    Float.floatToIntBits((float) listenerPan.y),
+                    Float.floatToIntBits((float) listenerPan.z),
+                    Float.floatToIntBits(reflection.delay())
             );
         }
 
-        private double distanceTo(EarlyReflectionKey other) {
-            return square(panX - other.panX)
-                    + square(panY - other.panY)
-                    + square(panZ - other.panZ)
-                    + square(delay - other.delay)
-                    + square(highFrequency - other.highFrequency);
-        }
     }
 
     private static double square(int value) {
@@ -1789,17 +1974,19 @@ public final class OpenALAcousticEffects {
         private ReverbKey key;
         private RoomAcoustics room;
         private ListenerFieldSnapshot field;
-        private FastReverbKey fastKey;
         private final int effect;
         private final int slot;
         private int references;
         private int sourceReferences;
         private boolean sourceField;
         private long fieldToken;
+        private long sceneRevision = Long.MIN_VALUE;
         private long lastUsed;
         private long tailExpiresAtNanoseconds;
         private float outputGain;
+        private float transportHighFrequencyGain = 1.0F;
         private long lastOutputGainUpdateNanoseconds;
+        private long lastBoundaryUpdateNanoseconds;
 
         private ReverbBus(ReverbKey key, RoomAcoustics room, int effect, int slot) {
             this.key = key;
@@ -1809,6 +1996,7 @@ public final class OpenALAcousticEffects {
             this.lastUsed = System.nanoTime();
             this.outputGain = clamp(room.gain(), 0.0F, 1.0F);
             this.lastOutputGainUpdateNanoseconds = lastUsed;
+            this.lastBoundaryUpdateNanoseconds = lastUsed;
         }
 
         private boolean canRecycle(long now) {
@@ -1841,6 +2029,7 @@ public final class OpenALAcousticEffects {
                     ? Long.MAX_VALUE
                     : now + tailNanoseconds;
         }
+
     }
 
     public record TailFieldRequest(
@@ -1890,6 +2079,27 @@ public final class OpenALAcousticEffects {
                 return listenerOwnedField
                         ? PortalRadiation.INSIDE
                         : PortalRadiation.NONE;
+            }
+            if (listenerOwnedField) {
+                boolean crossedOpening = false;
+                for (Aperture aperture : apertures) {
+                    if (segmentCrossesAperture(
+                            listener,
+                            observation,
+                            aperture.point(),
+                            aperture.outward(),
+                            aperture.area()
+                    )) {
+                        crossedOpening = true;
+                        break;
+                    }
+                }
+                if (!crossedOpening) {
+                    // A listener leaves this field only by traversing the finite opening.
+                    // Moving beyond the opening's infinite supporting plane alongside a
+                    // wall must not discard the room's feedback network.
+                    return PortalRadiation.INSIDE;
+                }
             }
             double receivedPowerFraction = 0.0;
             double receivedHighFrequencyPower = 0.0;
@@ -1996,18 +2206,65 @@ public final class OpenALAcousticEffects {
         return Math.max(0.0, Math.min(1.0, solidAngle / (Math.PI * 2.0)));
     }
 
+    static boolean segmentCrossesAperture(
+            Vec3 start,
+            Vec3 end,
+            Vec3 aperturePoint,
+            Vec3 apertureNormal,
+            double area
+    ) {
+        if (area <= 0.0 || apertureNormal.lengthSqr() <= 1.0E-12) {
+            return false;
+        }
+        Vec3 normal = apertureNormal.normalize();
+        double startSide = start.subtract(aperturePoint).dot(normal);
+        double endSide = end.subtract(aperturePoint).dot(normal);
+        if (startSide > 0.0 || endSide <= 0.0) {
+            return false;
+        }
+        double denominator = startSide - endSide;
+        if (Math.abs(denominator) <= 1.0E-12) {
+            return false;
+        }
+        double fraction = startSide / denominator;
+        Vec3 intersection = start.lerp(end, fraction);
+        Vec3 fromCenter = intersection.subtract(aperturePoint);
+        Vec3 radial = fromCenter.subtract(normal.scale(fromCenter.dot(normal)));
+        return radial.lengthSqr() <= area / Math.PI;
+    }
+
     private static final class EarlyReflectionBus {
         private EarlyReflectionKey key;
         private final int effect;
         private final int slot;
         private int references;
         private long lastUsed;
+        private long tailExpiresAtNanoseconds;
+        private float reflectionDelaySeconds;
 
         private EarlyReflectionBus(EarlyReflectionKey key, int effect, int slot) {
             this.key = key;
             this.effect = effect;
             this.slot = slot;
             this.lastUsed = System.nanoTime();
+        }
+
+        private void activate(long now) {
+            tailExpiresAtNanoseconds = 0L;
+            lastUsed = now;
+        }
+
+        private void retire(long now) {
+            lastUsed = now;
+            double tailSeconds = Math.max(0.0F, reflectionDelaySeconds);
+            long tailNanoseconds = (long) Math.ceil(tailSeconds * 1_000_000_000.0);
+            tailExpiresAtNanoseconds = now > Long.MAX_VALUE - tailNanoseconds
+                    ? Long.MAX_VALUE
+                    : now + tailNanoseconds;
+        }
+
+        private boolean canRecycle(long now) {
+            return references == 0 && now >= tailExpiresAtNanoseconds;
         }
     }
 

@@ -1282,6 +1282,179 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void aLargeCaveProducesALaterFiniteEarlyFieldInsteadOfLosingEcho() {
+        TestWorld smallRoom = new TestWorld(position -> rectangularShell(
+                position, -4, 4, 0, 6, -4, 4
+        ));
+        TestWorld largeCave = new TestWorld(position -> rectangularShell(
+                position, -18, 18, -8, 18, -18, 18
+        ));
+        Vec3 smallSource = new Vec3(-1.5, 3.0, 0.5);
+        Vec3 smallListener = new Vec3(1.5, 3.0, 0.5);
+        Vec3 caveSource = new Vec3(-1.5, 5.0, 0.5);
+        Vec3 caveListener = new Vec3(1.5, 5.0, 0.5);
+        AcousticTracer.ReflectionResult small = AcousticTracer.estimateEarlyReflections(
+                smallRoom,
+                smallSource,
+                smallListener,
+                AcousticTracer.probeSourceRoom(smallRoom, smallSource),
+                4
+        );
+        AcousticTracer.ReflectionResult large = AcousticTracer.estimateEarlyReflections(
+                largeCave,
+                caveSource,
+                caveListener,
+                AcousticTracer.probeSourceRoom(largeCave, caveSource),
+                4
+        );
+
+        assertTrue(small.gain() > 0.02F, () -> "small=" + small);
+        assertTrue(large.gain() > 0.005F, () -> "large=" + large);
+        assertTrue(
+                large.delay() > small.delay(),
+                () -> "A larger enclosure should move its aggregate first reflection later: small="
+                        + small + ", large=" + large
+        );
+    }
+
+    @Test
+    void earlyReflectionRemainsContinuousDuringFineMovementInAComplexRoom() {
+        TestWorld world = new TestWorld(position -> {
+            int x = position.getX();
+            int y = position.getY();
+            int z = position.getZ();
+            boolean shell = rectangularShell(position, -12, 12, 0, 8, -10, 10);
+            boolean leftBaffle = x == -3 && y >= 1 && y <= 6 && z >= -9 && z <= -2;
+            boolean rightBaffle = x == 3 && y >= 1 && y <= 6 && z >= 2 && z <= 9;
+            boolean pillars = (x == -7 || x == 7) && y >= 1 && y <= 6
+                    && (z == -5 || z == 5);
+            return shell || leftBaffle || rightBaffle || pillars;
+        });
+        Vec3 source = new Vec3(-8.5, 3.0, 0.5);
+        RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(world, source);
+        AcousticTracer.ReflectionResult previous = null;
+        for (int step = 0; step <= 40; step++) {
+            Vec3 listener = new Vec3(5.0 + step * 0.05, 3.0, 0.5);
+            AcousticTracer.ReflectionResult current = AcousticTracer.estimateEarlyReflections(
+                    world, source, listener, sourceProbe, 4
+            );
+            assertTrue(Float.isFinite(current.gain()) && Float.isFinite(current.delay()));
+            assertTrue(
+                    current.gain() > 0.002F,
+                    () -> "The complex room lost every early path at " + listener + ": " + current
+            );
+            if (previous != null) {
+                AcousticTracer.ReflectionResult prior = previous;
+                float gainStep = Math.abs(current.gain() - prior.gain());
+                float delayStep = Math.abs(current.delay() - prior.delay());
+                assertTrue(
+                        gainStep < 0.10F,
+                        () -> "A five-centimetre move caused an echo level jump: previous="
+                                + prior + ", current=" + current
+                );
+                assertTrue(
+                        delayStep < 0.010F,
+                        () -> "A five-centimetre move caused an echo-time jump: previous="
+                                + prior + ", current=" + current
+                );
+            }
+            previous = current;
+        }
+    }
+
+    @Test
+    void reflectionPathBudgetAddsEnergyWithoutChangingTheEnvironmentDecision() {
+        TestWorld world = new TestWorld(position -> {
+            int x = position.getX();
+            int y = position.getY();
+            int z = position.getZ();
+            boolean shell = rectangularShell(position, -9, 9, 0, 9, -8, 8);
+            boolean staggeredReflectors = y >= 1 && y <= 7
+                    && ((x == -4 && z >= -7 && z <= -3)
+                    || (x == 4 && z >= 3 && z <= 7)
+                    || (z == -2 && x >= 1 && x <= 6));
+            return shell || staggeredReflectors;
+        });
+        Vec3 source = new Vec3(-2.5, 3.5, 1.5);
+        Vec3 listener = new Vec3(2.5, 3.5, -0.5);
+        RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(world, source);
+        float previousGain = 0.0F;
+        for (int budget : new int[]{1, 2, 4, 8, 16}) {
+            float priorGain = previousGain;
+            AcousticTracer.ReflectionResult reflection = AcousticTracer.estimateEarlyReflections(
+                    world, source, listener, sourceProbe, budget
+            );
+            assertTrue(
+                    reflection.gain() + 1.0E-6F >= priorGain,
+                    () -> "Adding independent image paths removed reflected energy at budget "
+                            + budget + ": " + reflection
+            );
+            assertTrue(reflection.delay() >= 0.0F && reflection.delay() <= 0.3F);
+            assertTrue(Double.isFinite(reflection.pan().lengthSqr()));
+            previousGain = reflection.gain();
+        }
+        assertTrue(previousGain > 0.01F, "The multi-surface room must retain a finite echo field");
+    }
+
+    @Test
+    void openingOrClosingOneExitDoesNotEraseUnrelatedPhysicalReflections() {
+        Vec3 source = new Vec3(-2.5, 3.0, 0.5);
+        Vec3 listener = new Vec3(2.5, 3.0, 0.5);
+        TestWorld closed = new TestWorld(position -> rectangularShell(
+                position, -7, 7, 0, 7, -7, 7
+        ));
+        TestWorld opened = new TestWorld(position -> {
+            boolean shell = rectangularShell(position, -7, 7, 0, 7, -7, 7);
+            boolean doorway = position.getZ() == 7
+                    && Math.abs(position.getX()) <= 1
+                    && position.getY() >= 1 && position.getY() <= 3;
+            return shell && !doorway;
+        });
+        AcousticTracer.ReflectionResult closedReflection = AcousticTracer.estimateEarlyReflections(
+                closed,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(closed, source),
+                4
+        );
+        AcousticTracer.ReflectionResult openReflection = AcousticTracer.estimateEarlyReflections(
+                opened,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(opened, source),
+                4
+        );
+
+        assertTrue(closedReflection.gain() > 0.01F, () -> "closed=" + closedReflection);
+        assertTrue(openReflection.gain() > 0.01F, () -> "open=" + openReflection);
+        assertTrue(
+                openReflection.gain() > closedReflection.gain() * 0.35F,
+                () -> "Editing one exit erased reflections from the remaining walls: closed="
+                        + closedReflection + ", open=" + openReflection
+        );
+    }
+
+    private static boolean rectangularShell(
+            BlockPos position,
+            int minimumX,
+            int maximumX,
+            int minimumY,
+            int maximumY,
+            int minimumZ,
+            int maximumZ
+    ) {
+        int x = position.getX();
+        int y = position.getY();
+        int z = position.getZ();
+        boolean inside = x >= minimumX && x <= maximumX
+                && y >= minimumY && y <= maximumY
+                && z >= minimumZ && z <= maximumZ;
+        return inside && (x == minimumX || x == maximumX
+                || y == minimumY || y == maximumY
+                || z == minimumZ || z == maximumZ);
+    }
+
+    @Test
     void contactVibrationTravelsThroughAConnectedFloorAndReradiatesNearTheListener() {
         SolidGeometry building = position -> {
             int x = position.getX();
