@@ -5,14 +5,18 @@ import org.lwjgl.openal.AL10;
 import org.lwjgl.openal.AL11;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.EXTEfx;
+import org.lwjgl.openal.EXTLinearDistance;
 import org.lwjgl.BufferUtils;
 import org.macaroon.acousticsystem.AcousticSystem;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
+import org.macaroon.acousticsystem.client.material.AcousticTuning;
+import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.simulation.AcousticResult;
 import org.macaroon.acousticsystem.client.simulation.EarlyReflection;
 import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 import org.macaroon.acousticsystem.client.simulation.RoomImpulseResponse;
 import org.macaroon.acousticsystem.client.simulation.RoomProbe;
+import org.macaroon.acousticsystem.physics.AtmosphericAbsorption;
 
 import java.util.HashMap;
 import java.util.ArrayList;
@@ -23,6 +27,7 @@ import java.nio.FloatBuffer;
 
 public final class OpenALAcousticEffects {
     private static final Map<Integer, SourceState> SOURCES = new HashMap<>();
+    private static final Map<Integer, Float> SOURCE_MAX_DISTANCES = new HashMap<>();
     private static final Map<ReverbKey, ReverbBus> REVERB_BUSES = new HashMap<>();
     private static final List<ReverbBus> REVERB_POOL = new ArrayList<>();
     private static final Map<EarlyReflectionKey, EarlyReflectionBus> EARLY_REFLECTION_BUSES = new HashMap<>();
@@ -53,8 +58,20 @@ public final class OpenALAcousticEffects {
     private static Vec3 lastDynamicListenerPosition;
     private static long nextFieldToken;
     private static volatile List<TailFieldRequest> tailFieldRequests = List.of();
+    private static DistanceAttenuationSettings appliedDistanceAttenuationSettings;
+    private static AtmosphereHighFrequencyCache atmosphereHighFrequencyCache;
 
     private OpenALAcousticEffects() {
+    }
+
+    /**
+     * Captures the sound asset's authored reach. The physical solver owns distance
+     * spreading; OpenAL retains only positioning/HRTF so dry and wet paths cannot use
+     * different distance laws.
+     */
+    public static void configureDistanceAttenuation(int source, float maximumDistance) {
+        SOURCE_MAX_DISTANCES.put(source, Math.max(0.1F, maximumDistance));
+        applyDistanceAttenuation(source, distanceAttenuationSettings());
     }
 
     /** Builds the reusable EFX buses while Minecraft is initializing its audio library. */
@@ -265,7 +282,8 @@ public final class OpenALAcousticEffects {
             );
             activeReverbBus.lastOutputGainUpdateNanoseconds = now;
             updateFastReverbProperties(
-                    activeReverbBus, activeReverbBus.room, pan
+                    activeReverbBus, activeReverbBus.room, pan,
+                    activeRadiation.highFrequencyGain()
             );
             updateRetiredReverbOutputs(now, smoothedListenerRoom, listener);
         } catch (RuntimeException exception) {
@@ -311,6 +329,7 @@ public final class OpenALAcousticEffects {
         if (!ensureSupport()) {
             return false;
         }
+        syncDistanceAttenuationSettings();
         if (ordered) {
             if (sequence < lastListenerRoomSequence) {
                 return false;
@@ -360,7 +379,8 @@ public final class OpenALAcousticEffects {
                     ? listenerRelativeVector(activeRadiation.arrivalDirection())
                     : Vec3.ZERO;
             updateFastReverbProperties(
-                    activeReverbBus, room, activePan
+                    activeReverbBus, room, activePan,
+                    activeRadiation.highFrequencyGain()
             );
             float activeTargetGain = clamp(
                     smoothedListenerRoom.gain()
@@ -413,6 +433,7 @@ public final class OpenALAcousticEffects {
         if (!ensureSupport()) {
             return;
         }
+        syncDistanceAttenuationSettings();
 
         try {
             SourceState state = SOURCES.computeIfAbsent(source, OpenALAcousticEffects::createSourceState);
@@ -433,6 +454,7 @@ public final class OpenALAcousticEffects {
     }
 
     public static void releaseSource(int source) {
+        SOURCE_MAX_DISTANCES.remove(source);
         SourceState state = SOURCES.remove(source);
         if (state == null || !supported) {
             return;
@@ -458,7 +480,16 @@ public final class OpenALAcousticEffects {
     }
 
     private static void applyPositionalDirectPath(int source, SourceState state) {
-        EXTEfx.alFilterf(state.directFilter, EXTEfx.AL_LOWPASS_GAIN, clamp(state.directGain, 0.0F, 1.0F));
+        EXTEfx.alFilterf(
+                state.directFilter,
+                EXTEfx.AL_LOWPASS_GAIN,
+                clamp(
+                        state.directGain * state.propagationGain
+                                * state.audibilityGain,
+                        0.0F,
+                        1.0F
+                )
+        );
         EXTEfx.alFilterf(state.directFilter, EXTEfx.AL_LOWPASS_GAINHF, clamp(state.highFrequencyGain, 0.0F, 1.0F));
         updateReverbFilter(state);
         AL10.alSourcei(source, EXTEfx.AL_DIRECT_FILTER, state.directFilter);
@@ -541,7 +572,7 @@ public final class OpenALAcousticEffects {
         EXTEfx.alFilterf(
                 state.sourceRoomFilter,
                 EXTEfx.AL_LOWPASS_GAIN,
-                clamp(state.sourceRoomSend, 0.0F, 1.0F)
+                clamp(state.sourceRoomSend * state.audibilityGain, 0.0F, 1.0F)
         );
         EXTEfx.alFilterf(
                 state.sourceRoomFilter,
@@ -551,7 +582,16 @@ public final class OpenALAcousticEffects {
     }
 
     private static void updateReverbFilter(SourceState state) {
-        EXTEfx.alFilterf(state.reverbFilter, EXTEfx.AL_LOWPASS_GAIN, clamp(state.reverbSend, 0.0F, 1.0F));
+        EXTEfx.alFilterf(
+                state.reverbFilter,
+                EXTEfx.AL_LOWPASS_GAIN,
+                clamp(
+                        state.reverbSend * state.propagationGain
+                                * state.audibilityGain,
+                        0.0F,
+                        1.0F
+                )
+        );
         float roomHighFrequency = smoothedListenerRoom == null
                 ? 1.0F
                 : smoothedListenerRoom.gainHighFrequency();
@@ -582,7 +622,8 @@ public final class OpenALAcousticEffects {
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
                 EXTEfx.AL_LOWPASS_GAIN,
-                reflection.gain()
+                reflection.gain() * state.propagationGain
+                        * state.audibilityGain
         );
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
@@ -667,7 +708,11 @@ public final class OpenALAcousticEffects {
     }
 
     private static SourceState createSourceState(int source) {
+        applyDistanceAttenuation(source, distanceAttenuationSettings());
         AL10.alSourcei(source, EXTEfx.AL_DIRECT_FILTER_GAINHF_AUTO, AL10.AL_FALSE);
+        // All paths now receive the solver's explicit absolute propagation gain.
+        // Automatic EFX distance gain would apply a second, implementation-dependent
+        // attenuation and split the dry/wet energy model again.
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAIN_AUTO, AL10.AL_FALSE);
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO, AL10.AL_FALSE);
         int directFilter = createLowPass(1.0F, 1.0F);
@@ -680,7 +725,8 @@ public final class OpenALAcousticEffects {
                 : 0;
         return new SourceState(
                 directFilter, reverbFilter, sourceRoomFilter,
-                earlyReflectionFilter
+                earlyReflectionFilter,
+                SOURCE_MAX_DISTANCES.getOrDefault(source, Float.POSITIVE_INFINITY)
         );
     }
 
@@ -995,7 +1041,8 @@ public final class OpenALAcousticEffects {
                 updateFastReverbProperties(
                         bus,
                         bus.room,
-                        listenerRelativeVector(radiation.arrivalDirection())
+                        listenerRelativeVector(radiation.arrivalDirection()),
+                        radiation.highFrequencyGain()
                 );
             }
         }
@@ -1292,9 +1339,17 @@ public final class OpenALAcousticEffects {
     private static void updateFastReverbProperties(
             ReverbBus bus,
             RoomAcoustics room,
-            Vec3 latePan
+            Vec3 latePan,
+            float propagationHighFrequencyGain
     ) {
-        FastReverbKey nextKey = FastReverbKey.from(room, latePan);
+        float highFrequencyGain = clamp(
+                room.gainHighFrequency() * propagationHighFrequencyGain,
+                0.0F,
+                1.0F
+        );
+        FastReverbKey nextKey = FastReverbKey.from(
+                room, latePan, highFrequencyGain
+        );
         if (nextKey.equals(bus.fastKey)) {
             return;
         }
@@ -1302,7 +1357,7 @@ public final class OpenALAcousticEffects {
             EXTEfx.alEffectf(
                     bus.effect,
                     EXTEfx.AL_EAXREVERB_GAINHF,
-                    clamp(room.gainHighFrequency(), 0.0F, 1.0F)
+                    highFrequencyGain
             );
             EXTEfx.alEffectf(
                     bus.effect,
@@ -1333,7 +1388,7 @@ public final class OpenALAcousticEffects {
             EXTEfx.alEffectf(
                     bus.effect,
                     EXTEfx.AL_REVERB_GAINHF,
-                    clamp(room.gainHighFrequency(), 0.0F, 1.0F)
+                    highFrequencyGain
             );
             EXTEfx.alEffectf(
                     bus.effect,
@@ -1458,6 +1513,7 @@ public final class OpenALAcousticEffects {
 
     private static void resetState() {
         SOURCES.clear();
+        SOURCE_MAX_DISTANCES.clear();
         REVERB_BUSES.clear();
         REVERB_POOL.clear();
         EARLY_REFLECTION_BUSES.clear();
@@ -1473,6 +1529,51 @@ public final class OpenALAcousticEffects {
         lastDynamicListenerPosition = null;
         nextFieldToken = 0L;
         tailFieldRequests = List.of();
+        appliedDistanceAttenuationSettings = null;
+        atmosphereHighFrequencyCache = null;
+    }
+
+    private static DistanceAttenuationSettings distanceAttenuationSettings() {
+        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
+        return new DistanceAttenuationSettings(
+                tuning.realisticDistanceAttenuation(),
+                (float) tuning.blocks(tuning.distanceReferenceMeters()),
+                tuning.distanceRolloffFactor()
+        );
+    }
+
+    private static void syncDistanceAttenuationSettings() {
+        DistanceAttenuationSettings settings = distanceAttenuationSettings();
+        if (settings.equals(appliedDistanceAttenuationSettings)) {
+            return;
+        }
+        for (int source : SOURCES.keySet()) {
+            applyDistanceAttenuation(source, settings);
+        }
+        appliedDistanceAttenuationSettings = settings;
+    }
+
+    private static void applyDistanceAttenuation(
+            int source,
+            DistanceAttenuationSettings settings
+    ) {
+        if (settings.realistic()) {
+            // Direction and HRTF still use the source position. Only OpenAL's separate
+            // gain law is disabled because the solver supplies one conserved transfer
+            // gain to direct, reflection and late-field paths.
+            AL10.alSourcei(source, AL10.AL_DISTANCE_MODEL, AL10.AL_NONE);
+            return;
+        }
+
+        // Channel.linearAttenuation uses these values. Restoring them makes a live
+        // resource reload reversible without recreating currently playing voices.
+        AL10.alSourcei(
+                source,
+                AL10.AL_DISTANCE_MODEL,
+                EXTLinearDistance.AL_LINEAR_DISTANCE_CLAMPED
+        );
+        AL10.alSourcef(source, AL10.AL_REFERENCE_DISTANCE, 0.0F);
+        AL10.alSourcef(source, AL10.AL_ROLLOFF_FACTOR, 1.0F);
     }
 
     private static float clamp(float value, float min, float max) {
@@ -1573,6 +1674,47 @@ public final class OpenALAcousticEffects {
         }
     }
 
+    private record DistanceAttenuationSettings(
+            boolean realistic,
+            float referenceDistanceBlocks,
+            float rolloffFactor
+    ) {
+    }
+
+    private record AtmosphereHighFrequencyCache(
+            float temperatureCelsius,
+            float humidityPercent,
+            float pressureKilopascals,
+            double fourKilohertzNepersPerMeter,
+            double eightKilohertzNepersPerMeter
+    ) {
+        private static AtmosphereHighFrequencyCache from(AcousticTuning tuning) {
+            return new AtmosphereHighFrequencyCache(
+                    tuning.airTemperatureCelsius(),
+                    tuning.relativeHumidityPercent(),
+                    tuning.airPressureKilopascals(),
+                    AtmosphericAbsorption.amplitudeNepersPerMeter(
+                            AcousticBands.CENTERS_HZ[6],
+                            tuning.airTemperatureCelsius(),
+                            tuning.relativeHumidityPercent(),
+                            tuning.airPressureKilopascals()
+                    ),
+                    AtmosphericAbsorption.amplitudeNepersPerMeter(
+                            AcousticBands.CENTERS_HZ[7],
+                            tuning.airTemperatureCelsius(),
+                            tuning.relativeHumidityPercent(),
+                            tuning.airPressureKilopascals()
+                    )
+            );
+        }
+
+        private boolean matches(AcousticTuning tuning) {
+            return Float.compare(temperatureCelsius, tuning.airTemperatureCelsius()) == 0
+                    && Float.compare(humidityPercent, tuning.relativeHumidityPercent()) == 0
+                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0;
+        }
+    }
+
     private record FastReverbKey(
             int highFrequency,
             int lowFrequency,
@@ -1584,9 +1726,13 @@ public final class OpenALAcousticEffects {
             int panY,
             int panZ
     ) {
-        private static FastReverbKey from(RoomAcoustics room, Vec3 pan) {
+        private static FastReverbKey from(
+                RoomAcoustics room,
+                Vec3 pan,
+                float highFrequencyGain
+        ) {
             return new FastReverbKey(
-                    quantize(room.gainHighFrequency(), 1000.0F),
+                    quantize(highFrequencyGain, 1000.0F),
                     quantize(room.gainLowFrequency(), 1000.0F),
                     quantize(room.reflectionsGain(), 1000.0F),
                     quantize(room.reflectionsDelay(), 1000.0F),
@@ -1739,6 +1885,7 @@ public final class OpenALAcousticEffects {
                         : PortalRadiation.NONE;
             }
             double receivedPowerFraction = 0.0;
+            double receivedHighFrequencyPower = 0.0;
             Vec3 directionMoment = Vec3.ZERO;
             boolean beyondOpeningPlane = false;
             for (Aperture aperture : apertures) {
@@ -1756,6 +1903,11 @@ public final class OpenALAcousticEffects {
                         aperture.area(), axialDistance, distanceSquared
                 );
                 receivedPowerFraction += powerFraction;
+                float highFrequencyGain = atmosphericHighFrequencyGain(
+                        Math.sqrt(distanceSquared)
+                );
+                receivedHighFrequencyPower += powerFraction
+                        * highFrequencyGain * highFrequencyGain;
                 Vec3 arrival = aperture.point().subtract(observation);
                 if (arrival.lengthSqr() > 1.0E-12) {
                     directionMoment = directionMoment.add(
@@ -1773,7 +1925,18 @@ public final class OpenALAcousticEffects {
             Vec3 arrivalDirection = receivedPowerFraction <= 1.0E-12
                     ? Vec3.ZERO
                     : directionMoment.scale(1.0 / receivedPowerFraction);
-            return new PortalRadiation(transmission, arrivalDirection, true);
+            float highFrequencyGain = receivedPowerFraction <= 1.0E-12
+                    ? 1.0F
+                    : clamp(
+                            (float) Math.sqrt(
+                                    receivedHighFrequencyPower / receivedPowerFraction
+                            ),
+                            0.0F,
+                            1.0F
+                    );
+            return new PortalRadiation(
+                    transmission, arrivalDirection, true, highFrequencyGain
+            );
         }
     }
 
@@ -1783,14 +1946,32 @@ public final class OpenALAcousticEffects {
     private record PortalRadiation(
             float transmission,
             Vec3 arrivalDirection,
-            boolean outside
+            boolean outside,
+            float highFrequencyGain
     ) {
         private static final PortalRadiation NONE = new PortalRadiation(
-                0.0F, Vec3.ZERO, true
+                0.0F, Vec3.ZERO, true, 1.0F
         );
         private static final PortalRadiation INSIDE = new PortalRadiation(
-                1.0F, Vec3.ZERO, false
+                1.0F, Vec3.ZERO, false, 1.0F
         );
+    }
+
+    private static float atmosphericHighFrequencyGain(double distanceBlocks) {
+        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
+        double distanceMeters = tuning.meters(distanceBlocks);
+        AtmosphereHighFrequencyCache cache = atmosphereHighFrequencyCache;
+        if (cache == null || !cache.matches(tuning)) {
+            cache = AtmosphereHighFrequencyCache.from(tuning);
+            atmosphereHighFrequencyCache = cache;
+        }
+        float fourGain = AtmosphericAbsorption.amplitudeGain(
+                cache.fourKilohertzNepersPerMeter(), distanceMeters
+        );
+        float eightGain = AtmosphericAbsorption.amplitudeGain(
+                cache.eightKilohertzNepersPerMeter(), distanceMeters
+        );
+        return (float) Math.sqrt(fourGain * eightGain);
     }
 
     static double aperturePowerFraction(
@@ -1828,6 +2009,7 @@ public final class OpenALAcousticEffects {
         private final int reverbFilter;
         private final int sourceRoomFilter;
         private final int earlyReflectionFilter;
+        private final float maximumDistance;
         private ReverbBus reverbBus;
         private ReverbBus sourceRoomBus;
         // The bus currently bound to the primary late send. Retaining this explicit
@@ -1844,6 +2026,8 @@ public final class OpenALAcousticEffects {
         private Vec3 sourcePosition;
         private EarlyReflection earlyReflection = EarlyReflection.SILENT;
         private Vec3 apparentPosition = Vec3.ZERO;
+        private float propagationGain = 1.0F;
+        private float audibilityGain = 1.0F;
         private boolean initialized;
         private long lastUpdateNanoseconds;
         private long lastResultSequence = Long.MIN_VALUE;
@@ -1852,12 +2036,14 @@ public final class OpenALAcousticEffects {
                 int directFilter,
                 int reverbFilter,
                 int sourceRoomFilter,
-                int earlyReflectionFilter
+                int earlyReflectionFilter,
+                float maximumDistance
         ) {
             this.directFilter = directFilter;
             this.reverbFilter = reverbFilter;
             this.sourceRoomFilter = sourceRoomFilter;
             this.earlyReflectionFilter = earlyReflectionFilter;
+            this.maximumDistance = maximumDistance;
         }
 
         private boolean update(
@@ -1881,6 +2067,8 @@ public final class OpenALAcousticEffects {
                 updateSourceRoomTarget(target);
                 earlyReflection = target.earlyReflection();
                 apparentPosition = target.apparentPosition();
+                propagationGain = targetPropagationGain(target);
+                audibilityGain = targetAudibilityGain(target);
                 initialized = true;
                 lastUpdateNanoseconds = now;
                 return true;
@@ -1909,8 +2097,43 @@ public final class OpenALAcousticEffects {
                     )
             );
             apparentPosition = apparentPosition.lerp(target.apparentPosition(), amount);
+            propagationGain = lerp(
+                    propagationGain,
+                    targetPropagationGain(target),
+                    amount
+            );
+            audibilityGain = lerp(
+                    audibilityGain,
+                    targetAudibilityGain(target),
+                    amount
+            );
             lastUpdateNanoseconds = now;
             return true;
+        }
+
+        private float audibilityGain(double propagationDistance) {
+            if (!Float.isFinite(maximumDistance) || maximumDistance <= 0.0F) {
+                return 1.0F;
+            }
+            // Minecraft's authored attenuation distance is the only source-level/SPL
+            // metadata available. Treat it as a smooth perceptual knee, not a cutoff:
+            // inside it the physical 1/r law is unchanged, while inaudible far-field
+            // loops asymptotically fall below the listening floor without a hard edge.
+            double ratio = Math.max(0.0, propagationDistance) / maximumDistance;
+            double fourthPower = ratio * ratio * ratio * ratio;
+            return (float) (1.0 / Math.sqrt(1.0 + fourthPower * fourthPower));
+        }
+
+        private float targetPropagationGain(AcousticResult target) {
+            return AcousticMaterialRegistry.tuning().realisticDistanceAttenuation()
+                    ? target.propagationGain()
+                    : 1.0F;
+        }
+
+        private float targetAudibilityGain(AcousticResult target) {
+            return AcousticMaterialRegistry.tuning().realisticDistanceAttenuation()
+                    ? audibilityGain(target.propagationDistance())
+                    : 1.0F;
         }
 
         private void updateSourceRoomTarget(AcousticResult target) {

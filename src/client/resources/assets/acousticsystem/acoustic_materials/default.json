@@ -1,6 +1,12 @@
 {
   "tuning": {
     "meters_per_block": 1.0,
+    "realistic_distance_attenuation": true,
+    "distance_reference_meters": 1.0,
+    "distance_rolloff_factor": 1.0,
+    "air_temperature_celsius": 20.0,
+    "relative_humidity_percent": 50.0,
+    "air_pressure_kpa": 101.325,
     "reflection_gain_scale": 1.0,
     "reverb_send_scale": 1.0,
     "room_gain_scale": 1.0,

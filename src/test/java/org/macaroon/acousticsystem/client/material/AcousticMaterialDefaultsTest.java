@@ -55,6 +55,18 @@ class AcousticMaterialDefaultsTest {
                 "A connected metal structure must carry vibration farther than insulation"
         );
         assertEquals(1.0F, root.getAsJsonObject("tuning").get("meters_per_block").getAsFloat());
+        assertTrue(root.getAsJsonObject("tuning")
+                .get("realistic_distance_attenuation").getAsBoolean());
+        assertEquals(1.0F, root.getAsJsonObject("tuning")
+                .get("distance_reference_meters").getAsFloat());
+        assertEquals(1.0F, root.getAsJsonObject("tuning")
+                .get("distance_rolloff_factor").getAsFloat());
+        assertEquals(20.0F, root.getAsJsonObject("tuning")
+                .get("air_temperature_celsius").getAsFloat());
+        assertEquals(50.0F, root.getAsJsonObject("tuning")
+                .get("relative_humidity_percent").getAsFloat());
+        assertEquals(101.325F, root.getAsJsonObject("tuning")
+                .get("air_pressure_kpa").getAsFloat());
     }
 
     @Test
@@ -128,6 +140,27 @@ class AcousticMaterialDefaultsTest {
                 (float) (-50.0 / Math.log(0.72)),
                 converted.acousticResponseTimeMilliseconds(),
                 0.01F
+        );
+    }
+
+    @Test
+    void reflectedDistanceAttenuationIsConfigurableAndDefaultsToPhysicalMode() throws Exception {
+        AcousticTuning defaults = AcousticTuning.fromJson(
+                loadDefaults().getAsJsonObject("tuning"),
+                AcousticTuning.DEFAULT
+        );
+        assertTrue(defaults.realisticDistanceAttenuation());
+        assertEquals(1.0F, defaults.distanceReferenceMeters());
+        assertEquals(1.0F, defaults.distanceRolloffFactor());
+        assertEquals(20.0F, defaults.airTemperatureCelsius());
+        assertEquals(50.0F, defaults.relativeHumidityPercent());
+        assertEquals(101.325F, defaults.airPressureKilopascals());
+
+        JsonObject disabled = new JsonObject();
+        disabled.addProperty("realistic_distance_attenuation", false);
+        assertFalse(
+                AcousticTuning.fromJson(disabled, defaults)
+                        .realisticDistanceAttenuation()
         );
     }
 

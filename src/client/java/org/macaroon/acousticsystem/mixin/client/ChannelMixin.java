@@ -34,6 +34,15 @@ abstract class ChannelMixin {
         acousticsystem$relative = relative;
     }
 
+    @Inject(method = "linearAttenuation", at = @At("TAIL"))
+    private void acousticsystem$usePhysicalDistanceAttenuation(
+            float maximumDistance,
+            CallbackInfo ci
+    ) {
+        // Relative/UI sounds call disableAttenuation instead and never pass here.
+        OpenALAcousticEffects.configureDistanceAttenuation(source, maximumDistance);
+    }
+
     @Inject(method = "play", at = @At("HEAD"))
     private void acousticsystem$applyBeforePlayback(CallbackInfo ci) {
         AcousticRuntime.applyBeforePlay(source, acousticsystem$position, acousticsystem$relative);

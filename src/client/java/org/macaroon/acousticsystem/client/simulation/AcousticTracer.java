@@ -19,6 +19,7 @@ import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.material.MediumProfile;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
 import org.macaroon.acousticsystem.physics.DiffractionPhysics;
+import org.macaroon.acousticsystem.physics.AtmosphericAbsorption;
 import org.macaroon.acousticsystem.physics.RoomLeakagePhysics;
 
 import java.util.ArrayDeque;
@@ -52,10 +53,7 @@ public final class AcousticTracer {
             {0, 0, 1}, {0, 0, -1}
     };
     private static final double MAX_SHARED_SURFACE_DIRECTION_DOT = 0.94;
-    private static final float[] AIR_ABSORPTION_PER_METER = {
-            0.000005F, 0.000010F, 0.000025F, 0.000070F,
-            0.00018F, 0.00060F, 0.00220F, 0.00800F
-    };
+    private static volatile AtmosphereCache atmosphereCache;
     private static final Map<Integer, RoomRayGrid> ROOM_RAY_GRIDS = new ConcurrentHashMap<>();
     private static final Map<AirPathCacheKey, PropagationGraphPath> AIR_PATH_CACHE =
             new ConcurrentHashMap<>();
@@ -105,7 +103,8 @@ public final class AcousticTracer {
                 result.propagationDistance(),
                 result.apparentPosition(),
                 result.reverbRoom(),
-                roomProbe.impulseResponse()
+                roomProbe.impulseResponse(),
+                result.propagationGain()
         );
     }
 
@@ -380,7 +379,8 @@ public final class AcousticTracer {
                 // is correctly zero. Null means this source feeds the listener-owned
                 // field directly; disconnected sealed volumes retain their own probe.
                 sameEnclosedDiffuseField ? null : sourceRoomProbe,
-                source
+                source,
+                sphericalSpreadingGain(tuning.meters(directDistance), tuning)
         );
         if (TRACE_CACHE.size() >= 512) {
             TRACE_CACHE.clear();
@@ -3352,7 +3352,54 @@ public final class AcousticTracer {
     }
 
     static float airAbsorption(int band, double distance) {
-        return (float) Math.exp(-AIR_ABSORPTION_PER_METER[band] * Math.max(0.0, distance));
+        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
+        AtmosphereCache cache = atmosphereCache;
+        if (cache == null || !cache.matches(tuning)) {
+            cache = AtmosphereCache.from(tuning);
+            atmosphereCache = cache;
+        }
+        return AtmosphericAbsorption.amplitudeGain(
+                cache.nepersPerMeter()[band], distance
+        );
+    }
+
+    static float sphericalSpreadingGain(double distanceMeters, AcousticTuning tuning) {
+        double reference = tuning.distanceReferenceMeters();
+        double distance = Math.max(reference, Math.max(0.0, distanceMeters));
+        double denominator = reference + tuning.distanceRolloffFactor()
+                * (distance - reference);
+        return (float) Math.min(1.0, reference / Math.max(reference, denominator));
+    }
+
+    private record AtmosphereCache(
+            float temperatureCelsius,
+            float humidityPercent,
+            float pressureKilopascals,
+            double[] nepersPerMeter
+    ) {
+        private static AtmosphereCache from(AcousticTuning tuning) {
+            double[] coefficients = new double[AcousticBands.COUNT];
+            for (int band = 0; band < coefficients.length; band++) {
+                coefficients[band] = AtmosphericAbsorption.amplitudeNepersPerMeter(
+                        AcousticBands.CENTERS_HZ[band],
+                        tuning.airTemperatureCelsius(),
+                        tuning.relativeHumidityPercent(),
+                        tuning.airPressureKilopascals()
+                );
+            }
+            return new AtmosphereCache(
+                    tuning.airTemperatureCelsius(),
+                    tuning.relativeHumidityPercent(),
+                    tuning.airPressureKilopascals(),
+                    coefficients
+            );
+        }
+
+        private boolean matches(AcousticTuning tuning) {
+            return Float.compare(temperatureCelsius, tuning.airTemperatureCelsius()) == 0
+                    && Float.compare(humidityPercent, tuning.relativeHumidityPercent()) == 0
+                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0;
+        }
     }
 
     @FunctionalInterface
@@ -4156,7 +4203,8 @@ public final class AcousticTracer {
                     distance,
                     apparentPosition,
                     room,
-                    RoomImpulseResponse.SILENT
+                    RoomImpulseResponse.SILENT,
+                    sphericalSpreadingGain(distanceMeters, tuning)
             );
         }
     }

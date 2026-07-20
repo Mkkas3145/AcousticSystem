@@ -5,6 +5,12 @@ import net.minecraft.util.Mth;
 
 public record AcousticTuning(
         float metersPerBlock,
+        boolean realisticDistanceAttenuation,
+        float distanceReferenceMeters,
+        float distanceRolloffFactor,
+        float airTemperatureCelsius,
+        float relativeHumidityPercent,
+        float airPressureKilopascals,
         float reflectionGainScale,
         float reverbSendScale,
         float roomGainScale,
@@ -33,6 +39,12 @@ public record AcousticTuning(
 ) {
     public static final AcousticTuning DEFAULT = new AcousticTuning(
             1.0F,
+            true,
+            1.0F,
+            1.0F,
+            20.0F,
+            50.0F,
+            101.325F,
             1.0F,
             1.0F,
             1.0F,
@@ -62,6 +74,11 @@ public record AcousticTuning(
 
     public AcousticTuning {
         metersPerBlock = Mth.clamp(metersPerBlock, 0.25F, 2.0F);
+        distanceReferenceMeters = Mth.clamp(distanceReferenceMeters, 0.1F, 8.0F);
+        distanceRolloffFactor = Mth.clamp(distanceRolloffFactor, 0.1F, 4.0F);
+        airTemperatureCelsius = Mth.clamp(airTemperatureCelsius, -40.0F, 50.0F);
+        relativeHumidityPercent = Mth.clamp(relativeHumidityPercent, 1.0F, 100.0F);
+        airPressureKilopascals = Mth.clamp(airPressureKilopascals, 60.0F, 110.0F);
         reflectionGainScale = Mth.clamp(reflectionGainScale, 0.0F, 4.0F);
         reverbSendScale = Mth.clamp(reverbSendScale, 0.0F, 4.0F);
         roomGainScale = Mth.clamp(roomGainScale, 0.0F, 4.0F);
@@ -101,6 +118,14 @@ public record AcousticTuning(
         }
         return new AcousticTuning(
                 read(object, "meters_per_block", fallback.metersPerBlock),
+                object.has("realistic_distance_attenuation")
+                        ? object.get("realistic_distance_attenuation").getAsBoolean()
+                        : fallback.realisticDistanceAttenuation,
+                read(object, "distance_reference_meters", fallback.distanceReferenceMeters),
+                read(object, "distance_rolloff_factor", fallback.distanceRolloffFactor),
+                read(object, "air_temperature_celsius", fallback.airTemperatureCelsius),
+                read(object, "relative_humidity_percent", fallback.relativeHumidityPercent),
+                read(object, "air_pressure_kpa", fallback.airPressureKilopascals),
                 read(object, "reflection_gain_scale", fallback.reflectionGainScale),
                 read(object, "reverb_send_scale", fallback.reverbSendScale),
                 read(object, "room_gain_scale", fallback.roomGainScale),

@@ -9,6 +9,7 @@ import org.lwjgl.openal.ALC;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.ALCCapabilities;
 import org.lwjgl.openal.EXTEfx;
+import org.lwjgl.openal.EXTSourceDistanceModel;
 import org.lwjgl.BufferUtils;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
 
@@ -41,6 +42,7 @@ class OpenALConvolutionSmokeTest {
         assertTrue(context != 0L);
         assertTrue(ALC10.alcMakeContextCurrent(context));
         AL.createCapabilities(deviceCapabilities);
+        AL10.alEnable(EXTSourceDistanceModel.AL_SOURCE_DISTANCE_MODEL);
 
         int source = AL10.alGenSources();
         try {
@@ -60,6 +62,65 @@ class OpenALConvolutionSmokeTest {
             long started = System.nanoTime();
             OpenALAcousticEffects.applyBeforePlay(source, result);
             double elapsedMilliseconds = (System.nanoTime() - started) / 1_000_000.0;
+            assertEquals(AL10.AL_NONE,
+                    AL10.alGetSourcei(source, AL10.AL_DISTANCE_MODEL));
+            assertEquals(AL10.AL_FALSE, AL10.alGetSourcei(
+                    source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAIN_AUTO
+            ), "The solver, not a second EFX law, owns absolute propagation gain");
+            int conservedSource = AL10.alGenSources();
+            try {
+                AcousticResult distant = new AcousticResult(
+                        1.0F, 0.4F,
+                        1.0F, 0.8F, 0.5F, 0.2F,
+                        0.8F, 0.3F,
+                        new EarlyReflection(0.6F, 0.25F, 0.05F, new Vec3(1.0, 0.0, 0.0)),
+                        0.0F, 500.0, new Vec3(500.0, 0.0, 0.0),
+                        RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
+                        0.002F
+                );
+                OpenALAcousticEffects.applyBeforePlay(conservedSource, distant);
+                int directFilter = sourceStateInt(conservedSource, "directFilter");
+                int reverbFilter = sourceStateInt(conservedSource, "reverbFilter");
+                int reflectionFilter = sourceStateInt(conservedSource, "earlyReflectionFilter");
+                assertEquals(0.002F, EXTEfx.alGetFilterf(
+                        directFilter, EXTEfx.AL_LOWPASS_GAIN
+                ), 0.00001F);
+                assertEquals(0.0016F, EXTEfx.alGetFilterf(
+                        reverbFilter, EXTEfx.AL_LOWPASS_GAIN
+                ), 0.00001F);
+                assertEquals(0.0012F, EXTEfx.alGetFilterf(
+                        reflectionFilter, EXTEfx.AL_LOWPASS_GAIN
+                ), 0.00001F);
+            } finally {
+                OpenALAcousticEffects.releaseSource(conservedSource);
+                AL10.alDeleteSources(conservedSource);
+            }
+            int authoredRangeSource = AL10.alGenSources();
+            try {
+                OpenALAcousticEffects.configureDistanceAttenuation(
+                        authoredRangeSource, 16.0F
+                );
+                AcousticResult distantLoop = new AcousticResult(
+                        1.0F, 1.0F,
+                        1.0F, 1.0F, 1.0F, 1.0F,
+                        1.0F, 1.0F, EarlyReflection.SILENT, 0.0F,
+                        500.0, new Vec3(500.0, 0.0, 0.0),
+                        RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT,
+                        0.002F
+                );
+                OpenALAcousticEffects.applyBeforePlay(
+                        authoredRangeSource, distantLoop
+                );
+                int directFilter = sourceStateInt(
+                        authoredRangeSource, "directFilter"
+                );
+                assertTrue(EXTEfx.alGetFilterf(
+                        directFilter, EXTEfx.AL_LOWPASS_GAIN
+                ) < 1.0E-8F, "A 16 m authored loop must fall below audibility at 500 m");
+            } finally {
+                OpenALAcousticEffects.releaseSource(authoredRangeSource);
+                AL10.alDeleteSources(authoredRangeSource);
+            }
             assertThrows(
                     NoSuchFieldException.class,
                     () -> sourceState(source).getClass().getDeclaredField("equalizerBus"),
@@ -502,6 +563,14 @@ class OpenALConvolutionSmokeTest {
         Field valueField = state.getClass().getDeclaredField(fieldName);
         valueField.setAccessible(true);
         return valueField.getFloat(state);
+    }
+
+    private static int sourceStateInt(int source, String fieldName)
+            throws ReflectiveOperationException {
+        Object state = sourceState(source);
+        Field valueField = state.getClass().getDeclaredField(fieldName);
+        valueField.setAccessible(true);
+        return valueField.getInt(state);
     }
 
     private static void setObjectLong(Object target, String fieldName, long value)
