@@ -14,6 +14,7 @@ import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.simulation.AcousticResult;
 import org.macaroon.acousticsystem.client.simulation.DiffuseFieldDynamics;
+import org.macaroon.acousticsystem.client.simulation.DirectionalArrivalField;
 import org.macaroon.acousticsystem.client.simulation.EarlyReflection;
 import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 import org.macaroon.acousticsystem.client.simulation.RoomImpulseResponse;
@@ -315,11 +316,38 @@ public final class OpenALAcousticEffects {
         }
         Vec3 previousListenerPosition = lastDynamicListenerPosition;
         lastDynamicListenerPosition = listener;
-        if (SoftwareAcousticMixer.available()) {
-            return;
-        }
         try {
             long now = System.nanoTime();
+            ListenerBasis listenerBasis = ListenerBasis.capture();
+            boolean softwareMixer = SoftwareAcousticMixer.available();
+            for (Map.Entry<Integer, SourceState> entry : SOURCES.entrySet()) {
+                int source = entry.getKey();
+                SourceState state = entry.getValue();
+                state.reprojectSpatial(listener, now);
+                AL10.alSource3f(
+                        source,
+                        AL10.AL_POSITION,
+                        (float) state.apparentPosition.x,
+                        (float) state.apparentPosition.y,
+                        (float) state.apparentPosition.z
+                );
+                Vec3 earlyDirection = listenerBasis.project(state.dynamicEarlyDirection);
+                Vec3 propagationDirection = listenerBasis.project(
+                        state.apparentPosition.subtract(listener)
+                );
+                if (softwareMixer) {
+                    SoftwareAcousticMixer.updateSpatial(
+                            source, earlyDirection, propagationDirection
+                    );
+                } else if (advancedEaxReverb
+                        && (state.earlyReflection.gain() > 1.0E-6F
+                        || state.earlyReflectionBus != null)) {
+                    updateEarlyReflectionSend(source, state, earlyDirection);
+                }
+            }
+            if (softwareMixer) {
+                return;
+            }
             reapExpiredEarlyReflectionBuses(now);
             reapExpiredReverbBuses(now);
             if (activeReverbBus == null || smoothedListenerRoom == null) {
@@ -528,7 +556,7 @@ public final class OpenALAcousticEffects {
                         ? RoomAcoustics.OUTDOORS
                         : state.sourceRoomProbe.acoustics();
                 Vec3 earlyDirection = listenerRelativeDirection(
-                        state.earlyReflection.arrivalDirection()
+                        state.dynamicEarlyDirection
                 );
                 Vec3 propagationDirection = lastDynamicListenerPosition == null
                         ? Vec3.ZERO
@@ -607,7 +635,7 @@ public final class OpenALAcousticEffects {
     private static void applyPositionalDirectPath(int source, SourceState state) {
         EXTEfx.alFilterf(
                 state.directFilter,
-                EXTEfx.AL_LOWPASS_GAIN,
+                EXTEfx.AL_BANDPASS_GAIN,
                 clamp(
                         state.directGain * state.propagationGain
                                 * state.audibilityGain,
@@ -615,7 +643,16 @@ public final class OpenALAcousticEffects {
                         1.0F
                 )
         );
-        EXTEfx.alFilterf(state.directFilter, EXTEfx.AL_LOWPASS_GAINHF, clamp(state.highFrequencyGain, 0.0F, 1.0F));
+        EXTEfx.alFilterf(
+                state.directFilter,
+                EXTEfx.AL_BANDPASS_GAINLF,
+                clamp(state.lowFrequencyGain, 0.0F, 1.0F)
+        );
+        EXTEfx.alFilterf(
+                state.directFilter,
+                EXTEfx.AL_BANDPASS_GAINHF,
+                clamp(state.highFrequencyGain, 0.0F, 1.0F)
+        );
         AL10.alSourcei(source, EXTEfx.AL_DIRECT_FILTER, state.directFilter);
         if (SoftwareAcousticMixer.available()) {
             return;
@@ -744,6 +781,18 @@ public final class OpenALAcousticEffects {
     }
 
     private static void updateEarlyReflectionSend(int source, SourceState state) {
+        updateEarlyReflectionSend(
+                source,
+                state,
+                listenerRelativeDirection(state.dynamicEarlyDirection)
+        );
+    }
+
+    private static void updateEarlyReflectionSend(
+            int source,
+            SourceState state,
+            Vec3 listenerPan
+    ) {
         EarlyReflection reflection = state.earlyReflection;
         EarlyFieldMix mix = EarlyFieldMix.from(state);
         if (mix.inputGain() <= 0.0F) {
@@ -774,7 +823,6 @@ public final class OpenALAcousticEffects {
             return;
         }
 
-        Vec3 listenerPan = listenerRelativeDirection(reflection.arrivalDirection());
         EarlyReflectionKey key = EarlyReflectionKey.from(reflection, listenerPan);
         assignEarlyReflectionBus(state, key, reflection, listenerPan, mix);
         if (state.earlyReflectionBus == null) {
@@ -807,35 +855,48 @@ public final class OpenALAcousticEffects {
     }
 
     private static Vec3 listenerRelativeDirection(Vec3 worldDirection) {
-        if (worldDirection.lengthSqr() <= 1.0E-12) {
-            return Vec3.ZERO;
+        return ListenerBasis.capture().project(worldDirection);
+    }
+
+    private record ListenerBasis(Vec3 right, Vec3 up, Vec3 forward) {
+        private static ListenerBasis capture() {
+            FloatBuffer orientation = LISTENER_ORIENTATION.get();
+            orientation.clear();
+            AL10.alGetListenerfv(AL10.AL_ORIENTATION, orientation);
+            Vec3 forward = new Vec3(
+                    orientation.get(0), orientation.get(1), orientation.get(2)
+            );
+            Vec3 up = new Vec3(
+                    orientation.get(3), orientation.get(4), orientation.get(5)
+            );
+            if (forward.lengthSqr() <= 1.0E-10 || up.lengthSqr() <= 1.0E-10) {
+                return new ListenerBasis(
+                        new Vec3(1.0, 0.0, 0.0),
+                        new Vec3(0.0, 1.0, 0.0),
+                        new Vec3(0.0, 0.0, -1.0)
+                );
+            }
+            forward = forward.normalize();
+            up = up.normalize();
+            Vec3 right = forward.cross(up);
+            if (right.lengthSqr() <= 1.0E-10) {
+                return new ListenerBasis(new Vec3(1.0, 0.0, 0.0), up, forward);
+            }
+            return new ListenerBasis(right.normalize(), up, forward);
         }
-        FloatBuffer orientation = LISTENER_ORIENTATION.get();
-        orientation.clear();
-        AL10.alGetListenerfv(AL10.AL_ORIENTATION, orientation);
-        Vec3 forward = new Vec3(
-                orientation.get(0), orientation.get(1), orientation.get(2)
-        );
-        Vec3 up = new Vec3(
-                orientation.get(3), orientation.get(4), orientation.get(5)
-        );
-        if (forward.lengthSqr() <= 1.0E-10 || up.lengthSqr() <= 1.0E-10) {
-            return worldDirection.normalize();
+
+        private Vec3 project(Vec3 worldDirection) {
+            if (worldDirection == null || worldDirection.lengthSqr() <= 1.0E-12) {
+                return Vec3.ZERO;
+            }
+            Vec3 direction = worldDirection.normalize();
+            Vec3 local = new Vec3(
+                    direction.dot(right),
+                    direction.dot(up),
+                    -direction.dot(forward)
+            );
+            return local.lengthSqr() <= 1.0E-12 ? Vec3.ZERO : local.normalize();
         }
-        forward = forward.normalize();
-        up = up.normalize();
-        Vec3 right = forward.cross(up);
-        if (right.lengthSqr() <= 1.0E-10) {
-            return worldDirection.normalize();
-        }
-        right = right.normalize();
-        Vec3 direction = worldDirection.normalize();
-        Vec3 local = new Vec3(
-                direction.dot(right),
-                direction.dot(up),
-                -direction.dot(forward)
-        );
-        return local.lengthSqr() <= 1.0E-12 ? Vec3.ZERO : local.normalize();
     }
 
     private static boolean ensureSupport() {
@@ -878,7 +939,7 @@ public final class OpenALAcousticEffects {
         // attenuation and split the dry/wet energy model again.
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAIN_AUTO, AL10.AL_FALSE);
         AL10.alSourcei(source, EXTEfx.AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO, AL10.AL_FALSE);
-        int directFilter = createLowPass(1.0F, 1.0F);
+        int directFilter = createBandPass(1.0F, 1.0F, 1.0F);
         int reverbFilter = SoftwareAcousticMixer.available()
                 ? 0
                 : createLowPass(0.04F, 1.0F);
@@ -919,6 +980,38 @@ public final class OpenALAcousticEffects {
             throw new IllegalStateException(
                     "OpenAL could not configure a direct-path filter: "
                             + configurationError
+            );
+        }
+        return filter;
+    }
+
+    private static int createBandPass(
+            float gain,
+            float lowFrequencyGain,
+            float highFrequencyGain
+    ) {
+        AL10.alGetError();
+        int filter = EXTEfx.alGenFilters();
+        int allocationError = AL10.alGetError();
+        if (filter == 0 || allocationError != AL10.AL_NO_ERROR) {
+            if (filter != 0) {
+                EXTEfx.alDeleteFilters(filter);
+                AL10.alGetError();
+            }
+            throw new IllegalStateException(
+                    "OpenAL could not allocate a direct-path filter: " + allocationError
+            );
+        }
+        EXTEfx.alFilteri(filter, EXTEfx.AL_FILTER_TYPE, EXTEfx.AL_FILTER_BANDPASS);
+        EXTEfx.alFilterf(filter, EXTEfx.AL_BANDPASS_GAIN, gain);
+        EXTEfx.alFilterf(filter, EXTEfx.AL_BANDPASS_GAINLF, lowFrequencyGain);
+        EXTEfx.alFilterf(filter, EXTEfx.AL_BANDPASS_GAINHF, highFrequencyGain);
+        int configurationError = AL10.alGetError();
+        if (configurationError != AL10.AL_NO_ERROR) {
+            EXTEfx.alDeleteFilters(filter);
+            AL10.alGetError();
+            throw new IllegalStateException(
+                    "OpenAL could not configure a direct-path filter: " + configurationError
             );
         }
         return filter;
@@ -2288,6 +2381,7 @@ public final class OpenALAcousticEffects {
         private ReverbBus primaryLateBus;
         private EarlyReflectionBus earlyReflectionBus;
         private float directGain = 1.0F;
+        private float lowFrequencyGain = 1.0F;
         private float highFrequencyGain = 1.0F;
         private float reverbSend = 0.04F;
         private float reverbHighFrequency = 1.0F;
@@ -2296,11 +2390,21 @@ public final class OpenALAcousticEffects {
         private RoomProbe sourceRoomProbe;
         private Vec3 sourcePosition;
         private EarlyReflection earlyReflection = EarlyReflection.SILENT;
+        private DirectionalArrivalField directionalField = DirectionalArrivalField.EMPTY;
+        private DirectionalArrivalField previousDirectionalField = DirectionalArrivalField.EMPTY;
+        private DirectionalArrivalField earlyDirectionalField = DirectionalArrivalField.EMPTY;
+        private DirectionalArrivalField previousEarlyDirectionalField = DirectionalArrivalField.EMPTY;
+        private Vec3 earlyFallbackDirection = Vec3.ZERO;
+        private Vec3 previousEarlyFallbackDirection = Vec3.ZERO;
         private Vec3 apparentPosition = Vec3.ZERO;
+        private Vec3 dynamicEarlyDirection = Vec3.ZERO;
+        private double propagationDistance;
         private float propagationGain = 1.0F;
         private float audibilityGain = 1.0F;
         private boolean initialized;
         private long lastUpdateNanoseconds;
+        private long directionalTransitionStartedNanoseconds;
+        private long earlyDirectionalTransitionStartedNanoseconds;
         private long lastResultSequence = Long.MIN_VALUE;
 
         private SourceState(
@@ -2331,22 +2435,42 @@ public final class OpenALAcousticEffects {
             }
             long now = System.nanoTime();
             if (!initialized || snapToTarget) {
-                directGain = target.directGain();
-                highFrequencyGain = target.highFrequencyGain();
+                directGain = targetDirectGain(target);
+                lowFrequencyGain = targetLowFrequencyGain(target);
+                highFrequencyGain = targetHighFrequencyGain(target);
                 reverbSend = target.reverbSend();
                 reverbHighFrequency = target.reverbHighFrequencyGain();
                 updateSourceRoomTarget(target);
                 earlyReflection = target.earlyReflection();
+                directionalField = target.directionalField();
+                previousDirectionalField = directionalField;
+                earlyDirectionalField = earlyReflection.directionalField();
+                previousEarlyDirectionalField = earlyDirectionalField;
+                earlyFallbackDirection = normalizedOrZero(earlyReflection.arrivalDirection());
+                previousEarlyFallbackDirection = earlyFallbackDirection;
                 apparentPosition = target.apparentPosition();
+                dynamicEarlyDirection = earlyFallbackDirection;
+                propagationDistance = target.propagationDistance();
                 propagationGain = targetPropagationGain(target);
                 audibilityGain = targetAudibilityGain(target);
                 initialized = true;
                 lastUpdateNanoseconds = now;
+                directionalTransitionStartedNanoseconds = 0L;
+                earlyDirectionalTransitionStartedNanoseconds = 0L;
                 return true;
             }
             float amount = elapsedResponseAmount(lastUpdateNanoseconds, now);
-            directGain = lerp(directGain, target.directGain(), amount);
-            highFrequencyGain = lerp(highFrequencyGain, target.highFrequencyGain(), amount);
+            directGain = lerp(directGain, targetDirectGain(target), amount);
+            lowFrequencyGain = lerp(
+                    lowFrequencyGain,
+                    targetLowFrequencyGain(target),
+                    amount
+            );
+            highFrequencyGain = lerp(
+                    highFrequencyGain,
+                    targetHighFrequencyGain(target),
+                    amount
+            );
             reverbSend = lerp(reverbSend, target.reverbSend(), amount);
             reverbHighFrequency = lerp(
                     reverbHighFrequency,
@@ -2355,6 +2479,8 @@ public final class OpenALAcousticEffects {
             );
             updateSourceRoomTarget(target);
             EarlyReflection targetReflection = target.earlyReflection();
+            beginDirectionalTransition(target.directionalField(), now);
+            beginEarlyDirectionalTransition(targetReflection, now);
             earlyReflection = new EarlyReflection(
                     lerp(earlyReflection.gain(), targetReflection.gain(), amount),
                     lerp(
@@ -2365,9 +2491,11 @@ public final class OpenALAcousticEffects {
                     lerp(earlyReflection.delay(), targetReflection.delay(), amount),
                     earlyReflection.arrivalDirection().lerp(
                             targetReflection.arrivalDirection(), amount
-                    )
+                    ),
+                    targetReflection.directionalField()
             );
-            apparentPosition = apparentPosition.lerp(target.apparentPosition(), amount);
+            propagationDistance = propagationDistance
+                    + (target.propagationDistance() - propagationDistance) * amount;
             propagationGain = lerp(
                     propagationGain,
                     targetPropagationGain(target),
@@ -2380,6 +2508,150 @@ public final class OpenALAcousticEffects {
             );
             lastUpdateNanoseconds = now;
             return true;
+        }
+
+        private void reprojectSpatial(Vec3 listener, long now) {
+            if (!initialized) {
+                return;
+            }
+            float directionalMix = spatialTransitionProgress(
+                    directionalTransitionStartedNanoseconds, now
+            );
+            Vec3 propagationDirection = powerCrossfadedDirection(
+                    directionFrom(previousDirectionalField, Vec3.ZERO, listener),
+                    directionFrom(directionalField, Vec3.ZERO, listener),
+                    directionalMix
+            );
+            apparentPosition = listener.add(propagationDirection.scale(
+                    Math.max(1.0, propagationDistance)
+            ));
+            if (directionalMix >= 1.0F) {
+                previousDirectionalField = directionalField;
+                directionalTransitionStartedNanoseconds = 0L;
+            }
+
+            float earlyMix = spatialTransitionProgress(
+                    earlyDirectionalTransitionStartedNanoseconds, now
+            );
+            dynamicEarlyDirection = powerCrossfadedDirection(
+                    directionFrom(
+                            previousEarlyDirectionalField,
+                            previousEarlyFallbackDirection,
+                            listener
+                    ),
+                    directionFrom(
+                            earlyDirectionalField,
+                            earlyFallbackDirection,
+                            listener
+                    ),
+                    earlyMix
+            );
+            if (earlyMix >= 1.0F) {
+                previousEarlyDirectionalField = earlyDirectionalField;
+                previousEarlyFallbackDirection = earlyFallbackDirection;
+                earlyDirectionalTransitionStartedNanoseconds = 0L;
+            }
+        }
+
+        private void beginDirectionalTransition(
+                DirectionalArrivalField target,
+                long now
+        ) {
+            if (directionalField.equals(target)) {
+                return;
+            }
+            previousDirectionalField = directionalField;
+            directionalField = target;
+            directionalTransitionStartedNanoseconds = now;
+        }
+
+        private void beginEarlyDirectionalTransition(
+                EarlyReflection target,
+                long now
+        ) {
+            DirectionalArrivalField targetField = target.directionalField();
+            Vec3 targetFallback = normalizedOrZero(target.arrivalDirection());
+            boolean fieldChanged = !earlyDirectionalField.equals(targetField);
+            boolean fallbackChanged = !earlyDirectionalField.hasArrivals()
+                    && !targetField.hasArrivals()
+                    && earlyFallbackDirection.distanceToSqr(targetFallback) > 1.0E-10;
+            if (!fieldChanged && !fallbackChanged) {
+                return;
+            }
+            previousEarlyDirectionalField = earlyDirectionalField;
+            previousEarlyFallbackDirection = earlyFallbackDirection;
+            earlyDirectionalField = targetField;
+            earlyFallbackDirection = targetFallback;
+            earlyDirectionalTransitionStartedNanoseconds = now;
+        }
+
+        private static Vec3 directionFrom(
+                DirectionalArrivalField field,
+                Vec3 fallback,
+                Vec3 listener
+        ) {
+            if (field.hasArrivals() || field.fallbackSource() != null) {
+                return field.apparentDirection(listener);
+            }
+            return normalizedOrZero(fallback);
+        }
+
+        private static Vec3 powerCrossfadedDirection(Vec3 previous, Vec3 target, float amount) {
+            float mix = clamp(amount, 0.0F, 1.0F);
+            if (mix <= 0.0F) {
+                return normalizedOrZero(previous);
+            }
+            if (mix >= 1.0F) {
+                return normalizedOrZero(target);
+            }
+            Vec3 first = normalizedOrZero(previous);
+            Vec3 second = normalizedOrZero(target);
+            if (first.lengthSqr() <= 1.0E-12) {
+                return second;
+            }
+            if (second.lengthSqr() <= 1.0E-12) {
+                return first;
+            }
+            // Arrival-field weights are acoustic power. Complementary linear power
+            // weights keep the transition energy-neutral; only localization changes.
+            Vec3 intensity = first.scale(1.0F - mix).add(second.scale(mix));
+            if (intensity.lengthSqr() <= 1.0E-12) {
+                return mix < 0.5F ? first : second;
+            }
+            return intensity.normalize();
+        }
+
+        private static float spatialTransitionProgress(long started, long now) {
+            if (started == 0L || now <= started) {
+                return started == 0L ? 1.0F : 0.0F;
+            }
+            double durationMilliseconds = AcousticMaterialRegistry.tuning()
+                    .acousticResponseTimeMilliseconds();
+            double elapsedMilliseconds = (now - started) / 1_000_000.0;
+            return (float) Math.min(1.0, elapsedMilliseconds / durationMilliseconds);
+        }
+
+        private static Vec3 normalizedOrZero(Vec3 value) {
+            return value == null || value.lengthSqr() <= 1.0E-12
+                    ? Vec3.ZERO
+                    : value.normalize();
+        }
+
+        private static float targetDirectGain(AcousticResult target) {
+            return clamp(target.directGain(), 0.0F, 1.0F);
+        }
+
+        private static float targetLowFrequencyGain(AcousticResult target) {
+            float anchor = Math.max(targetDirectGain(target), 0.001F);
+            return clamp(target.lowBandGain() / anchor, 0.0F, 1.0F);
+        }
+
+        private static float targetHighFrequencyGain(AcousticResult target) {
+            float anchor = Math.max(targetDirectGain(target), 0.001F);
+            return Math.min(
+                    clamp(target.highBandGain() / anchor, 0.0F, 1.0F),
+                    clamp(target.highFrequencyGain(), 0.0F, 1.0F)
+            );
         }
 
         private float audibilityGain(double propagationDistance) {

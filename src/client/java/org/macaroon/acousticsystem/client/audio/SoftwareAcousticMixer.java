@@ -294,6 +294,21 @@ public final class SoftwareAcousticMixer {
         ));
     }
 
+    /** Updates only listener-relative directions; feedback and delay state are untouched. */
+    public static void updateSpatial(
+            int source,
+            Vec3 earlyDirection,
+            Vec3 propagationDirection
+    ) {
+        Voice voice = current(source);
+        if (voice != null) {
+            voice.updateSpatial(
+                    normalizedOrZero(earlyDirection),
+                    AmbisonicDirection.from(propagationDirection)
+            );
+        }
+    }
+
     static int liveRenderVoiceCount() {
         return renderVoices.length;
     }
@@ -637,6 +652,26 @@ public final class SoftwareAcousticMixer {
             // the complete old response or the complete new response, never a send from
             // one geometric result with RT60 values from another.
             acoustics = next;
+        }
+
+        private void updateSpatial(
+                Vec3 earlyDirection,
+                AmbisonicDirection propagationDirection
+        ) {
+            VoiceAcoustics current = acoustics;
+            acoustics = new VoiceAcoustics(
+                    current.early(),
+                    current.earlySend(),
+                    earlyDirection,
+                    propagationDirection,
+                    current.listenerRoom(),
+                    current.listenerSend(),
+                    current.listenerHighFrequency(),
+                    current.sourceRoom(),
+                    current.sourceSend(),
+                    current.sourceHighFrequency(),
+                    current.controlCoefficient()
+            );
         }
 
         private void endInput() {

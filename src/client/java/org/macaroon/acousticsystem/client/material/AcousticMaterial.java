@@ -15,8 +15,8 @@ public final class AcousticMaterial {
     );
     public static final AcousticMaterial DEFAULT_FLUID = new AcousticMaterial(
             new float[]{0.005F, 0.008F, 0.012F, 0.020F, 0.035F, 0.060F, 0.095F, 0.14F},
-            new float[]{0.999F, 0.998F, 0.996F, 0.992F, 0.985F, 0.972F, 0.950F, 0.915F},
-            new float[]{0.52F, 0.46F, 0.38F, 0.29F, 0.21F, 0.14F, 0.085F, 0.045F},
+            new float[]{1.0F, 1.0F, 1.0F, 0.999999F, 0.999993F, 0.999986F, 0.999971F, 0.999914F},
+            new float[]{0.995F, 0.995F, 0.992F, 0.988F, 0.980F, 0.965F, 0.940F, 0.900F},
             MediumProfile.WATER,
             0.08F,
             1.0F

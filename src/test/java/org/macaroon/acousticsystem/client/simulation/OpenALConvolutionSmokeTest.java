@@ -20,6 +20,7 @@ import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
 import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 
 import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -102,6 +103,79 @@ class OpenALConvolutionSmokeTest {
             long started = System.nanoTime();
             OpenALAcousticEffects.applyBeforePlay(source, result);
             double elapsedMilliseconds = (System.nanoTime() - started) / 1_000_000.0;
+            OpenALAcousticEffects.updateListenerPosition(Vec3.ZERO);
+            Vec3 movedListener = new Vec3(3.0, 0.0, 2.0);
+            OpenALAcousticEffects.updateListenerPosition(movedListener);
+            Vec3 reprojectedPosition = (Vec3) sourceStateObject(
+                    source, "apparentPosition"
+            );
+            Vec3 expectedReprojection = movedListener.add(
+                    new Vec3(4.0, 0.0, 0.0).subtract(movedListener).normalize().scale(4.0)
+            );
+            assertEquals(expectedReprojection.x, reprojectedPosition.x, 1.0E-6);
+            assertEquals(expectedReprojection.y, reprojectedPosition.y, 1.0E-6);
+            assertEquals(expectedReprojection.z, reprojectedPosition.z, 1.0E-6);
+            OpenALAcousticEffects.updateListenerPosition(Vec3.ZERO);
+            DirectionalArrivalField reflectionField = new DirectionalArrivalField(
+                    List.of(new DirectionalArrivalField.Arrival(
+                            new Vec3(4.0, 0.0, 0.0), 1.0
+                    )),
+                    new Vec3(4.0, 0.0, 0.0)
+            );
+            AcousticResult directionalReflection = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.25F, 1.0F,
+                    new EarlyReflection(
+                            0.35F, 0.8F, 0.02F,
+                            new Vec3(1.0, 0.0, 0.0),
+                            reflectionField
+                    ),
+                    0.0F, 4.0, new Vec3(4.0, 0.0, 0.0),
+                    RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT
+            );
+            OpenALAcousticEffects.apply(source, directionalReflection);
+            assertEquals(
+                    0L,
+                    sourceStateObject(source, "directionalTransitionStartedNanoseconds"),
+                    "An unchanged world-space arrival field must not start a transition"
+            );
+            setListenerOrientation(0.0F, 0.0F, -1.0F);
+            OpenALAcousticEffects.updateListenerPosition(Vec3.ZERO);
+            Object firstPanKey = objectField(
+                    sourceStateObject(source, "earlyReflectionBus"), "key"
+            );
+            setListenerOrientation(1.0F, 0.0F, 0.0F);
+            OpenALAcousticEffects.updateListenerPosition(Vec3.ZERO);
+            Object rotatedPanKey = objectField(
+                    sourceStateObject(source, "earlyReflectionBus"), "key"
+            );
+            assertNotSame(
+                    firstPanKey,
+                    rotatedPanKey,
+                    "A stationary listener rotation must update reflection localization"
+            );
+            setListenerOrientation(0.0F, 0.0F, -1.0F);
+
+            AcousticResult redirectedPath = new AcousticResult(
+                    1.0F, 1.0F,
+                    1.0F, 1.0F, 1.0F, 1.0F,
+                    0.0F, 1.0F, EarlyReflection.SILENT, 0.0F,
+                    4.0, new Vec3(-4.0, 0.0, 0.0),
+                    RoomAcoustics.OUTDOORS, RoomImpulseResponse.SILENT
+            );
+            OpenALAcousticEffects.apply(source, redirectedPath);
+            assertTrue(
+                    (long) sourceStateObject(
+                            source, "directionalTransitionStartedNanoseconds"
+                    ) > 0L,
+                    "Only a changed arrival topology should start the short spatial crossfade"
+            );
+            Thread.sleep(12L);
+            OpenALAcousticEffects.updateListenerPosition(Vec3.ZERO);
+            Vec3 redirectedPosition = (Vec3) sourceStateObject(source, "apparentPosition");
+            assertEquals(-4.0, redirectedPosition.x, 1.0E-6);
+            assertEquals(0.0, redirectedPosition.z, 1.0E-6);
             assertEquals(AL10.AL_NONE,
                     AL10.alGetSourcei(source, AL10.AL_DISTANCE_MODEL));
             assertEquals(AL10.AL_FALSE, AL10.alGetSourcei(
@@ -123,7 +197,7 @@ class OpenALConvolutionSmokeTest {
                 int reverbFilter = sourceStateInt(conservedSource, "reverbFilter");
                 int reflectionFilter = sourceStateInt(conservedSource, "earlyReflectionFilter");
                 assertEquals(0.002F, EXTEfx.alGetFilterf(
-                        directFilter, EXTEfx.AL_LOWPASS_GAIN
+                        directFilter, EXTEfx.AL_BANDPASS_GAIN
                 ), 0.00001F);
                 assertEquals(0.0016F, EXTEfx.alGetFilterf(
                         reverbFilter, EXTEfx.AL_LOWPASS_GAIN
@@ -155,7 +229,7 @@ class OpenALConvolutionSmokeTest {
                         authoredRangeSource, "directFilter"
                 );
                 assertTrue(EXTEfx.alGetFilterf(
-                        directFilter, EXTEfx.AL_LOWPASS_GAIN
+                        directFilter, EXTEfx.AL_BANDPASS_GAIN
                 ) < 1.0E-8F, "A 16 m authored loop must fall below audibility at 500 m");
             } finally {
                 OpenALAcousticEffects.releaseSource(authoredRangeSource);
@@ -984,6 +1058,13 @@ class OpenALConvolutionSmokeTest {
         Field valueField = state.getClass().getDeclaredField(fieldName);
         valueField.setAccessible(true);
         return valueField.getFloat(state);
+    }
+
+    private static void setListenerOrientation(float x, float y, float z) {
+        FloatBuffer orientation = BufferUtils.createFloatBuffer(6);
+        orientation.put(x).put(y).put(z).put(0.0F).put(1.0F).put(0.0F).flip();
+        AL10.alListenerfv(AL10.AL_ORIENTATION, orientation);
+        assertEquals(AL10.AL_NO_ERROR, AL10.alGetError());
     }
 
     private static int sourceStateInt(int source, String fieldName)

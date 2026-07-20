@@ -82,6 +82,16 @@ class SoftwareAcousticMixerOpenALTest {
             }
             Thread.sleep(80L);
             assertEquals(128, SoftwareAcousticMixer.liveRenderVoiceCount());
+            long spatialStarted = System.nanoTime();
+            OpenALAcousticEffects.updateListenerPosition(
+                    new Vec3(0.25, 1.62, -0.5)
+            );
+            double spatialMilliseconds = (System.nanoTime() - spatialStarted) / 1_000_000.0;
+            assertTrue(
+                    spatialMilliseconds < 10.0,
+                    () -> "128-source frame reprojection exceeded 10 ms: "
+                            + spatialMilliseconds
+            );
             assertEquals(
                     AL10.AL_PLAYING,
                     AL10.alGetSourcei(outputSource(), AL10.AL_SOURCE_STATE)

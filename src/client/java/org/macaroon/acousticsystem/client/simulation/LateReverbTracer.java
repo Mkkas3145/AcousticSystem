@@ -6,6 +6,7 @@ import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.material.AcousticMaterial;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
+import org.macaroon.acousticsystem.client.material.MediumProfile;
 import org.macaroon.acousticsystem.physics.ReverbDecayEstimator;
 import org.macaroon.acousticsystem.physics.ReverbFieldEstimator;
 
@@ -31,12 +32,34 @@ final class LateReverbTracer {
             AcousticTuning tuning,
             float fallbackDecayTime
     ) {
+        return trace(
+                level, listener, directionGrid, initialHits, tuning,
+                MediumProfile.AIR, null, 0.0F, fallbackDecayTime
+        );
+    }
+
+    static Estimate trace(
+            BlockGetter level,
+            Vec3 listener,
+            Vec3[] directionGrid,
+            AcousticTracer.SurfaceHit[] initialHits,
+            AcousticTuning tuning,
+            MediumProfile medium,
+            AcousticMaterial mediumMaterial,
+            float mediumWeight,
+            float fallbackDecayTime
+    ) {
+        double soundSpeed = Mth.lerp(
+                mediumWeight,
+                SPEED_OF_SOUND,
+                medium.soundSpeedMetersPerSecond()
+        );
         int rayCount = Math.min(tuning.lateReverbRayCount(), directionGrid.length);
         int maxBounces = tuning.lateReverbMaxBounces();
         double maximumSegmentDistance = tuning.roomProbeDistance();
         double histogramDuration = Math.max(
                 0.64,
-                maxBounces * tuning.meters(maximumSegmentDistance) / SPEED_OF_SOUND
+                maxBounces * tuning.meters(maximumSegmentDistance) / soundSpeed
         );
         int histogramBins = Math.max(
                 1,
@@ -76,7 +99,7 @@ final class LateReverbTracer {
             for (int bounce = 0; bounce < maxBounces; bounce++) {
                 AcousticTracer.SurfaceHit hit = bounce == 0
                         ? initialHits[directionIndex]
-                        : AcousticTracer.firstSurface(
+                        : AcousticTracer.firstAcousticSurface(
                                 level,
                                 position,
                                 position.add(direction.scale(maximumSegmentDistance)),
@@ -90,21 +113,25 @@ final class LateReverbTracer {
                 double segmentDistanceMeters = tuning.meters(hit.distance());
                 segmentDistanceSum += segmentDistanceMeters;
                 traveledDistance += segmentDistanceMeters;
-                double arrivalTime = traveledDistance / SPEED_OF_SOUND;
+                double arrivalTime = traveledDistance / soundSpeed;
                 AcousticMaterial material = hit.material();
                 for (int band = 0; band < energy.length; band++) {
-                    float air = AcousticTracer.airAbsorption(band, segmentDistanceMeters);
-                    float transmission = material.surfaceTransmission(
+                    float propagation = Mth.lerp(
+                            mediumWeight,
+                            AcousticTracer.airAbsorption(band, segmentDistanceMeters),
+                            mediumMaterial == null
+                                    ? 1.0F
+                                    : mediumMaterial.transmissionGain(
+                                            band,
+                                            segmentDistanceMeters
+                                    )
+                    );
+                    float reflectedPower = AcousticTracer.surfaceReflectedPower(
+                            hit,
                             band,
                             tuning.metersPerBlock()
                     );
-                    float transmissionPower = transmission * transmission;
-                    float reflectedPower = Mth.clamp(
-                            1.0F - material.absorption(band) - transmissionPower,
-                            0.0F,
-                            1.0F
-                    );
-                    energy[band] *= air * air * reflectedPower;
+                    energy[band] *= propagation * propagation * reflectedPower;
                 }
 
                 int bin = Math.min(histogramBins - 1, (int) (arrivalTime / binSeconds));

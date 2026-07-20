@@ -187,6 +187,26 @@ class AcousticMaterialDefaultsTest {
         }
     }
 
+    @Test
+    void waterUsesBulkAbsorptionAndPhysicalMediumProperties() throws Exception {
+        JsonObject root = loadDefaults();
+        JsonObject water = materialObjectFor(
+                root.getAsJsonArray("materials"),
+                "#minecraft:water",
+                "fluids"
+        );
+        JsonObject medium = water.getAsJsonObject("medium");
+
+        assertTrue(water.has("transmission_loss_db_per_meter"));
+        assertFalse(water.has("transmission"));
+        assertEquals(1480.0F, medium.get("sound_speed_meters_per_second").getAsFloat());
+        assertEquals(1_480_000.0F, medium.get("acoustic_impedance_rayl").getAsFloat());
+        assertTrue(
+                water.getAsJsonArray("transmission_loss_db_per_meter").get(7).getAsFloat() < 0.001F,
+                "Even 8 kHz bulk-water loss is measured per kilometre, not as a large per-block muffling"
+        );
+    }
+
     private static float reflectedPower(AcousticMaterial material, int band) {
         return Math.max(
                 0.0F,
@@ -196,15 +216,26 @@ class AcousticMaterialDefaultsTest {
     }
 
     private static AcousticMaterial materialFor(JsonArray materials, String selector) {
+        return AcousticMaterial.fromJson(
+                materialObjectFor(materials, selector, "blocks"),
+                AcousticMaterial.DEFAULT
+        );
+    }
+
+    private static JsonObject materialObjectFor(
+            JsonArray materials,
+            String selector,
+            String selectorArrayName
+    ) {
         for (int index = 0; index < materials.size(); index++) {
             JsonObject object = materials.get(index).getAsJsonObject();
-            JsonArray blocks = object.getAsJsonArray("blocks");
+            JsonArray blocks = object.getAsJsonArray(selectorArrayName);
             if (blocks == null) {
                 continue;
             }
             for (int block = 0; block < blocks.size(); block++) {
                 if (selector.equals(blocks.get(block).getAsString())) {
-                    return AcousticMaterial.fromJson(object, AcousticMaterial.DEFAULT);
+                    return object;
                 }
             }
         }

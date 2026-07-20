@@ -8,11 +8,21 @@ public record EarlyReflection(
         float gain,
         float highFrequencyGain,
         float delay,
-        Vec3 arrivalDirection
+        Vec3 arrivalDirection,
+        DirectionalArrivalField directionalField
 ) {
     public static final EarlyReflection SILENT = new EarlyReflection(
-            0.0F, 1.0F, 0.0F, Vec3.ZERO
+            0.0F, 1.0F, 0.0F, Vec3.ZERO, DirectionalArrivalField.EMPTY
     );
+
+    public EarlyReflection(
+            float gain,
+            float highFrequencyGain,
+            float delay,
+            Vec3 arrivalDirection
+    ) {
+        this(gain, highFrequencyGain, delay, arrivalDirection, DirectionalArrivalField.EMPTY);
+    }
 
     public EarlyReflection {
         gain = Mth.clamp(gain, 0.0F, 1.0F);
@@ -21,5 +31,15 @@ public record EarlyReflection(
         arrivalDirection = arrivalDirection == null || arrivalDirection.lengthSqr() < 1.0E-12
                 ? Vec3.ZERO
                 : arrivalDirection.normalize();
+        directionalField = directionalField == null
+                ? DirectionalArrivalField.EMPTY
+                : directionalField;
+    }
+
+    public Vec3 directionFrom(Vec3 listener) {
+        if (directionalField.hasArrivals()) {
+            return directionalField.apparentDirection(listener);
+        }
+        return arrivalDirection;
     }
 }

@@ -20,6 +20,7 @@ import org.macaroon.acousticsystem.client.material.MediumProfile;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
 import org.macaroon.acousticsystem.physics.DiffractionPhysics;
 import org.macaroon.acousticsystem.physics.AtmosphericAbsorption;
+import org.macaroon.acousticsystem.physics.FluidAcoustics;
 import org.macaroon.acousticsystem.physics.RoomLeakagePhysics;
 
 import java.util.ArrayDeque;
@@ -105,7 +106,10 @@ public final class AcousticTracer {
                 result.apparentPosition(),
                 result.reverbRoom(),
                 roomProbe.impulseResponse(),
-                result.propagationGain()
+                null,
+                null,
+                result.propagationGain(),
+                result.directionalField()
         );
     }
 
@@ -222,14 +226,7 @@ public final class AcousticTracer {
                 level, source, listener, tuning
         );
         float[] directSpectrum = directWavefront.bands().clone();
-        applyAirAbsorption(directSpectrum, tuning.meters(directDistance));
         applyMediumResponse(directSpectrum, listenerMedium);
-        if (diffractionPath != null) {
-            applyAirAbsorption(
-                    diffractionSpectrum,
-                    tuning.meters(diffractionPath.pathDistance())
-            );
-        }
         applyMediumResponse(diffractionSpectrum, listenerMedium);
         diffractionContribution = weightedEnergy(diffractionSpectrum);
         float[] structuralSpectrum = structuralPath == null
@@ -245,7 +242,7 @@ public final class AcousticTracer {
                 PathKind.DIRECT_OR_TRANSMITTED,
                 directSpectrum,
                 1.0F,
-                source.subtract(listener),
+                List.of(new DirectionalArrivalField.Arrival(source, 1.0)),
                 directDistance
         );
         if (diffractionPath != null) {
@@ -253,7 +250,7 @@ public final class AcousticTracer {
                     PathKind.DIFFRACTED,
                     diffractionSpectrum,
                     1.0F,
-                    diffractionPath.point().subtract(listener),
+                    diffractionPath.arrivals(),
                     diffractionPath.pathDistance()
             );
         }
@@ -262,7 +259,9 @@ public final class AcousticTracer {
                     PathKind.STRUCTURAL,
                     structuralSpectrum,
                     1.0F,
-                    structuralPath.arrivalPoint().subtract(listener),
+                    List.of(new DirectionalArrivalField.Arrival(
+                            structuralPath.arrivalPoint(), 1.0
+                    )),
                     structuralPath.pathDistance()
                             + structuralPath.arrivalPoint().distanceTo(listener)
             );
@@ -279,7 +278,7 @@ public final class AcousticTracer {
                         sourceRoomProbe,
                         MAX_EARLY_REFLECTION_PATHS_PER_SOUND,
                         diffractionPath == null || !diffractionPath.multipleBends(),
-                        propagationDistance
+                        center.travelTimeSeconds()
                 );
         // A resolved image reflection is already rendered by the source-specific early
         // reflection channel. Feeding the same path into the shared late-field send
@@ -302,10 +301,11 @@ public final class AcousticTracer {
         // express the remaining spectral tilt through the direct low-pass filter. This
         // keeps every dry component on the source's HRTF-aware path; no dry band is sent
         // through a positionless auxiliary effect slot.
-        float directGain = Mth.clamp(lowEnergy, 0.0F, 1.0F);
-        float highFrequencyGain = Mth.clamp(highEnergy / Math.max(lowEnergy, 0.01F), 0.02F, 1.0F);
+        float directGain = spectralAnchor(geometricSpectrum);
+        float highFrequencyGain = Mth.clamp(highEnergy / Math.max(directGain, 0.01F), 0.02F, 1.0F);
         Vec3 apparentDirection = resolvedField.apparentDirection(
-                source.subtract(listener)
+                listener,
+                source
         );
         Vec3 apparentPosition = listener.add(
                 apparentDirection.scale(Math.max(1.0, directDistance))
@@ -367,7 +367,8 @@ public final class AcousticTracer {
                         reflections.gain(),
                         reflections.highFrequencyGain(),
                         reflections.delay(),
-                        reflections.pan()
+                        reflections.pan(),
+                        reflections.directionalField()
                 ),
                 diffractionContribution,
                 propagationDistance,
@@ -383,7 +384,8 @@ public final class AcousticTracer {
                 // field directly; disconnected sealed volumes retain their own probe.
                 sameEnclosedDiffuseField ? null : sourceRoomProbe,
                 source,
-                sphericalSpreadingGain(tuning.meters(directDistance), tuning)
+                sphericalSpreadingGain(tuning.meters(directDistance), tuning),
+                resolvedField.directionalField(source)
         );
         if (TRACE_CACHE.size() >= 512) {
             TRACE_CACHE.clear();
@@ -419,7 +421,7 @@ public final class AcousticTracer {
 
         for (int ray = 0; ray < hits.length; ray++) {
             Vec3 direction = grid.directions()[ray];
-            SurfaceHit hit = firstSurface(
+            SurfaceHit hit = firstAcousticSurface(
                     level,
                     listener,
                     listener.add(direction.scale(probeDistance)),
@@ -557,8 +559,8 @@ public final class AcousticTracer {
                     * hit.distance() * hit.distance() * hit.distance() / 3.0;
             returnedWeight += raySurfaceArea;
             totalDistance += hit.distance() * raySurfaceArea;
-            absorption += meanMaterialAbsorption(hit.material(), 2, 6) * raySurfaceArea;
-            lowAbsorption += meanMaterialAbsorption(hit.material(), 0, 2) * raySurfaceArea;
+            absorption += meanSurfaceAbsorption(hit, 2, 6) * raySurfaceArea;
+            lowAbsorption += meanSurfaceAbsorption(hit, 0, 2) * raySurfaceArea;
             scattering += hit.material().scattering() * raySurfaceArea;
 
         }
@@ -593,6 +595,9 @@ public final class AcousticTracer {
                         grid.directions(),
                         hits,
                         tuning,
+                        listenerMedium.profile(),
+                        listenerMedium.material(),
+                        listenerMedium.weight(),
                         Mth.clamp(leakage.reverberationTimeSeconds(), 0.12F, 4.0F)
                 );
         float reflectionDelay = Mth.clamp(lateReverb.earlyDelay(), 0.0F, 0.3F);
@@ -916,7 +921,8 @@ public final class AcousticTracer {
         if (directDistance < 1.0E-6 || candidateBudget <= 0
                 || tuning.diffractionGainScale() <= 1.0E-6F) {
             return new DiffractionPath(
-                    new float[AcousticBands.COUNT], source, directDistance, false, false
+                    new float[AcousticBands.COUNT], directDistance, directDistance,
+                    List.of(), false, false
             );
         }
 
@@ -955,7 +961,8 @@ public final class AcousticTracer {
         }
         if (paths.isEmpty() && airPath == null) {
             return new DiffractionPath(
-                    new float[AcousticBands.COUNT], source, directDistance, false, false
+                    new float[AcousticBands.COUNT], directDistance, directDistance,
+                    List.of(), false, false
             );
         }
 
@@ -992,7 +999,8 @@ public final class AcousticTracer {
         }
         if (evaluated.isEmpty() && evaluatedAirPath == null) {
             return new DiffractionPath(
-                    new float[AcousticBands.COUNT], source, directDistance, false, false
+                    new float[AcousticBands.COUNT], directDistance, directDistance,
+                    List.of(), false, false
             );
         }
         if (evaluated.isEmpty()) {
@@ -1003,16 +1011,19 @@ public final class AcousticTracer {
         evaluated = mergeCorrelatedGraphPaths(evaluated, listener, tuning);
 
         float[] power = new float[AcousticBands.COUNT];
-        Vec3 arrivalDirectionSum = Vec3.ZERO;
-        double arrivalDirectionWeight = 0.0;
+        List<DirectionalArrivalField.Arrival> directionalArrivals = new ArrayList<>();
         double bestDistance = evaluated.getFirst().pathDistance();
+        double bestAirDistance = evaluated.getFirst().airDistance();
         // The air-cell solution is a topology-stable estimate of the same first-arrival
         // field, not another independent wave. Keep it as an energy floor rather than
         // power-summing it with edge paths. Its single A* arrival is deliberately not
         // added to the direction moment: with two equal exits, that route represents
         // only one arbitrary member of a physically symmetric arrival field.
         if (evaluatedAirPath != null) {
-            bestDistance = Math.min(bestDistance, evaluatedAirPath.pathDistance());
+            if (evaluatedAirPath.pathDistance() < bestDistance) {
+                bestDistance = evaluatedAirPath.pathDistance();
+                bestAirDistance = evaluatedAirPath.airDistance();
+            }
         }
         int selected = 0;
         for (EvaluatedGraphPath path : evaluated) {
@@ -1024,13 +1035,12 @@ public final class AcousticTracer {
             // candidate contributed to this moment while only the strongest paths
             // contributed sound power; many weak edges on one side could therefore
             // flip the apparent direction without carrying audible energy.
-            Vec3 arrival = path.arrivalPoint().subtract(listener);
             double directionWeight = path.score() * path.score();
-            if (directionWeight > 1.0E-10 && arrival.lengthSqr() > 1.0E-10) {
-                arrivalDirectionSum = arrivalDirectionSum.add(
-                        arrival.normalize().scale(directionWeight)
-                );
-                arrivalDirectionWeight += directionWeight;
+            if (directionWeight > 1.0E-10
+                    && path.arrivalPoint().subtract(listener).lengthSqr() > 1.0E-10) {
+                directionalArrivals.add(new DirectionalArrivalField.Arrival(
+                        path.arrivalPoint(), directionWeight
+                ));
             }
             selected++;
             if (selected >= tuning.diffractionMaxPaths()) {
@@ -1057,37 +1067,9 @@ public final class AcousticTracer {
                 );
             }
         }
-        // OpenAL exposes one position for a source even when the wave reaches the
-        // listener through several doors. Represent that directional distribution by
-        // its first power-weighted moment instead of selecting the first A* route.
-        // The moment magnitude is directional coherence: equal opposing openings
-        // cancel to zero, while one dominant opening approaches one. Blending by that
-        // coherence keeps symmetric exits centred on the real source and moves the
-        // image continuously toward an increasingly dominant exit.
-        Vec3 sourceDirection = source.subtract(listener).normalize();
-        Vec3 apparentDirection = sourceDirection;
-        if (arrivalDirectionWeight > 1.0E-10) {
-            Vec3 meanArrivalDirection = arrivalDirectionSum.scale(
-                    1.0 / arrivalDirectionWeight
-            );
-            double directionalCoherence = Math.min(
-                    1.0,
-                    Math.sqrt(meanArrivalDirection.lengthSqr())
-            );
-            if (directionalCoherence > 1.0E-6) {
-                Vec3 dominantDirection = meanArrivalDirection.normalize();
-                Vec3 blendedDirection = sourceDirection.scale(1.0 - directionalCoherence)
-                        .add(dominantDirection.scale(directionalCoherence));
-                if (blendedDirection.lengthSqr() > 1.0E-10) {
-                    apparentDirection = blendedDirection.normalize();
-                }
-            }
-        }
-        Vec3 arrivalPoint = listener.add(
-                apparentDirection.scale(Math.max(1.0, directDistance))
-        );
         return new DiffractionPath(
-                combined, arrivalPoint, bestDistance, hasClearPath,
+                combined, bestDistance, bestAirDistance,
+                List.copyOf(directionalArrivals), hasClearPath,
                 multipleDiffractionBackbone
         );
     }
@@ -1145,6 +1127,7 @@ public final class AcousticTracer {
                     envelope,
                     weightedEnergy(envelope),
                     Math.min(lobe.pathDistance(), candidate.pathDistance()),
+                    representative.airDistance(),
                     representative.arrivalPoint(),
                     lobe.clear() || candidate.clear()
             ));
@@ -2126,15 +2109,29 @@ public final class AcousticTracer {
         float[] bands = new float[AcousticBands.COUNT];
         Arrays.fill(bands, path.apertureAmplitude());
         double pathDistance = 0.0;
+        double airDistance = 0.0;
+        AcousticMaterial previousEndFluid = null;
+        boolean hasPreviousSegment = false;
         List<Vec3> points = path.points();
         for (int index = 1; index < points.size(); index++) {
             Vec3 from = points.get(index - 1);
             Vec3 to = points.get(index);
             pathDistance += from.distanceTo(to);
-            float[] segmentBands = traceTransmission(level, from, to).bands();
+            Transmission segment = traceTransmission(level, from, to);
+            float[] segmentBands = segment.bands();
+            if (hasPreviousSegment) {
+                applyFluidBoundary(
+                        bands,
+                        previousEndFluid,
+                        segment.startFluid()
+                );
+            }
+            airDistance += segment.airDistance();
             for (int band = 0; band < bands.length; band++) {
                 bands[band] *= segmentBands[band];
             }
+            previousEndFluid = segment.endFluid();
+            hasPreviousSegment = true;
         }
         double directDistance = source.distanceTo(listener);
         double excessMeters = tuning.meters(
@@ -2145,7 +2142,7 @@ public final class AcousticTracer {
             bands[band] *= DiffractionPhysics.knifeEdgeAmplitude(
                     AcousticBands.CENTERS_HZ[band], excessMeters
             );
-            bands[band] *= distanceLoss * airAbsorption(band, excessMeters);
+            bands[band] *= distanceLoss;
         }
         Vec3 arrivalPoint = path.arrivalPoint() != null
                 ? path.arrivalPoint()
@@ -2156,6 +2153,7 @@ public final class AcousticTracer {
                 bands,
                 weightedEnergy(bands),
                 pathDistance,
+                airDistance,
                 arrivalPoint,
                 path.clear()
         );
@@ -2653,7 +2651,7 @@ public final class AcousticTracer {
                 roomProbe,
                 pathBudget,
                 true,
-                source.distanceTo(listener)
+                traceTransmission(level, source, listener).travelTimeSeconds()
         );
     }
 
@@ -2664,7 +2662,7 @@ public final class AcousticTracer {
             RoomProbe sourceRoomProbe,
             int pathBudget,
             boolean allowDiffractedLegs,
-            double firstArrivalDistance
+            double firstArrivalTimeSeconds
     ) {
         List<RoomProbe.SurfaceSample> candidates = reflectionCandidates(
                 source, listener, sourceRoomProbe
@@ -2793,8 +2791,7 @@ public final class AcousticTracer {
                 float contribution = sourceBands[band]
                         * listenerBands[band]
                         * reflection
-                        * distanceGain
-                        * airAbsorption(band, AcousticMaterialRegistry.tuning().meters(pathDistance));
+                        * distanceGain;
                 pathBands[band] = contribution;
             }
             double pathPower = weightedEnergy(pathBands);
@@ -2805,14 +2802,14 @@ public final class AcousticTracer {
                 // silent planes consume the whole budget, making the echo disappear
                 // when the listener moved by a fraction of a block.
                 acceptedReflectionPoints.add(reflectionPoint);
-                double excessMeters = AcousticMaterialRegistry.tuning().meters(
-                        Math.max(0.0, pathDistance - firstArrivalDistance)
-                );
+                double reflectionTravelTime = sourceLeg.travelTimeSeconds()
+                        + listenerLeg.travelTimeSeconds();
                 Vec3 arrivalDirection = reflectionPoint.subtract(listener);
                 ReflectionPathSample sample = new ReflectionPathSample(
                         pathBands,
                         pathPower,
-                        excessMeters / DiffractionPhysics.SPEED_OF_SOUND_METERS_PER_SECOND,
+                        Math.max(0.0, reflectionTravelTime - firstArrivalTimeSeconds),
+                        reflectionPoint,
                         arrivalDirection.lengthSqr() > 1.0E-10
                                 ? arrivalDirection.normalize()
                                 : Vec3.ZERO
@@ -2830,12 +2827,18 @@ public final class AcousticTracer {
         double delayPowerSum = 0.0;
         double directionPower = 0.0;
         Vec3 arrivalDirectionSum = Vec3.ZERO;
+        List<DirectionalArrivalField.Arrival> reflectionArrivals = new ArrayList<>(
+                strongestPaths.size()
+        );
         for (ReflectionPathSample path : strongestPaths) {
             for (int band = 0; band < accumulated.length; band++) {
                 accumulated[band] += path.bands()[band] * path.bands()[band];
             }
             delayPowerSum += path.power() * path.delaySeconds();
             if (path.arrivalDirection().lengthSqr() > 1.0E-10) {
+                reflectionArrivals.add(new DirectionalArrivalField.Arrival(
+                        path.arrivalPoint(), path.power()
+                ));
                 arrivalDirectionSum = arrivalDirectionSum.add(
                         path.arrivalDirection().scale(path.power())
                 );
@@ -2867,7 +2870,13 @@ public final class AcousticTracer {
                 (float) (directionPower > 1.0E-12
                         ? delayPowerSum / directionPower
                         : 0.0),
-                reflectionPan
+                reflectionPan,
+                new DirectionalArrivalField(
+                        reflectionArrivals,
+                        reflectionArrivals.isEmpty() || reflectionPan.lengthSqr() <= 1.0E-10
+                                ? null
+                                : listener.add(reflectionPan.scale(Math.max(1.0, directDistance)))
+                )
         );
     }
 
@@ -2898,6 +2907,7 @@ public final class AcousticTracer {
             float[] bands,
             double power,
             double delaySeconds,
+            Vec3 arrivalPoint,
             Vec3 arrivalDirection
     ) {
     }
@@ -3012,12 +3022,23 @@ public final class AcousticTracer {
                 scratch.fluidSegments,
                 from.distanceTo(to)
         );
+        // Atmospheric loss belongs to a transport segment, just like solid and fluid
+        // loss. Applying it here keeps direct, bent, reflected and graph paths on the
+        // same pipeline and guarantees that only the actually airborne portion is used.
+        applyAirAbsorption(
+                bands,
+                AcousticMaterialRegistry.tuning().meters(fluidStats.airDistance())
+        );
         Transmission result = new Transmission(
                 bands,
                 scratch.firstBounds,
                 scratch.blockers,
                 fluidStats.distance(),
-                fluidStats.scattering()
+                fluidStats.airDistance(),
+                fluidStats.travelTimeSeconds(),
+                fluidStats.scattering(),
+                fluidStats.startFluid(),
+                fluidStats.endFluid()
         );
         if (TRANSMISSION_CACHE.size() >= 4096) {
             TRANSMISSION_CACHE.clear();
@@ -3087,6 +3108,98 @@ public final class AcousticTracer {
 
     static SurfaceHit firstSurface(BlockGetter level, Vec3 from, Vec3 to) {
         return firstSurface(level, from, to, new SurfaceHit[1]);
+    }
+
+    static SurfaceHit firstAcousticSurface(
+            BlockGetter level,
+            Vec3 from,
+            Vec3 to,
+            SurfaceHit[] result
+    ) {
+        SurfaceHit solid = firstSurface(level, from, to, result);
+        SurfaceHit fluid = firstFluidBoundary(level, from, to);
+        if (fluid != null && (solid == null || fluid.distance() < solid.distance())) {
+            result[0] = fluid;
+            return fluid;
+        }
+        result[0] = solid;
+        return solid;
+    }
+
+    private static SurfaceHit firstFluidBoundary(BlockGetter level, Vec3 from, Vec3 to) {
+        BlockPos startPosition = BlockPos.containing(from);
+        FluidState startState = level.getFluidState(startPosition);
+        if (startState.isEmpty()) {
+            return null;
+        }
+        AABB startBounds = startState.getAABB(level, startPosition);
+        if (startBounds == null || !startBounds.contains(from)) {
+            return null;
+        }
+
+        double[] contiguousEnd = {0.0};
+        AABB[] boundaryBounds = {startBounds};
+        AcousticMaterial[] boundaryOtherMaterial = {null};
+        walkBlocks(from, to, (position, endpoint) -> {
+            FluidState state = level.getFluidState(position);
+            if (state.isEmpty() || !state.getType().isSame(startState.getType())) {
+                if (!state.isEmpty()) {
+                    boundaryOtherMaterial[0] = AcousticMaterialRegistry.findFluid(state);
+                }
+                return false;
+            }
+            AABB bounds = state.getAABB(level, position);
+            SegmentInterval interval = bounds == null ? null : intersectSegment(bounds, from, to);
+            if (interval == null || interval.start() > contiguousEnd[0] + 1.0E-6) {
+                return false;
+            }
+            if (interval.end() > contiguousEnd[0]) {
+                contiguousEnd[0] = interval.end();
+                boundaryBounds[0] = bounds;
+            }
+            return contiguousEnd[0] < 1.0 - 1.0E-7;
+        });
+        if (contiguousEnd[0] <= 1.0E-7 || contiguousEnd[0] >= 1.0 - 1.0E-7) {
+            return null;
+        }
+        Vec3 delta = to.subtract(from);
+        Vec3 location = from.add(delta.scale(contiguousEnd[0]));
+        Vec3 normal = exitNormal(boundaryBounds[0], location, delta);
+        return new SurfaceHit(
+                location,
+                normal,
+                boundaryBounds[0],
+                from.distanceTo(location),
+                AcousticMaterialRegistry.findFluid(startState),
+                boundaryOtherMaterial[0],
+                true
+        );
+    }
+
+    private static Vec3 exitNormal(AABB bounds, Vec3 point, Vec3 direction) {
+        double best = Double.POSITIVE_INFINITY;
+        Vec3 normal = Vec3.ZERO;
+        if (direction.x < 0.0 && Math.abs(point.x - bounds.minX) < best) {
+            best = Math.abs(point.x - bounds.minX);
+            normal = NEGATIVE_X_NORMAL;
+        } else if (direction.x > 0.0 && Math.abs(point.x - bounds.maxX) < best) {
+            best = Math.abs(point.x - bounds.maxX);
+            normal = POSITIVE_X_NORMAL;
+        }
+        double yDistance = direction.y < 0.0
+                ? Math.abs(point.y - bounds.minY)
+                : Math.abs(point.y - bounds.maxY);
+        if (direction.y != 0.0 && yDistance < best) {
+            best = yDistance;
+            normal = direction.y < 0.0 ? NEGATIVE_Y_NORMAL : POSITIVE_Y_NORMAL;
+        }
+        double zDistance = direction.z < 0.0
+                ? Math.abs(point.z - bounds.minZ)
+                : Math.abs(point.z - bounds.maxZ);
+        if (direction.z != 0.0 && zDistance < best) {
+            normal = direction.z < 0.0 ? NEGATIVE_Z_NORMAL : POSITIVE_Z_NORMAL;
+        }
+        return normal == Vec3.ZERO ? POSITIVE_Y_NORMAL : normal;
     }
 
     static SurfaceHit firstSurface(BlockGetter level, Vec3 from, Vec3 to, SurfaceHit[] result) {
@@ -3244,6 +3357,17 @@ public final class AcousticTracer {
         return bands[firstBand] * 0.5F + bands[firstBand + 1] * 0.5F;
     }
 
+    private static float spectralAnchor(float[] bands) {
+        return Mth.clamp(
+                Math.max(
+                        Math.max(pairEnergy(bands, 0), pairEnergy(bands, 2)),
+                        Math.max(pairEnergy(bands, 4), pairEnergy(bands, 6))
+                ),
+                0.0F,
+                1.0F
+        );
+    }
+
     private static float meanBands(float[] bands, int fromInclusive, int toExclusive) {
         float sum = 0.0F;
         for (int band = fromInclusive; band < toExclusive; band++) {
@@ -3272,6 +3396,44 @@ public final class AcousticTracer {
         );
     }
 
+    private static float meanSurfaceAbsorption(
+            SurfaceHit hit,
+            int fromInclusive,
+            int toExclusive
+    ) {
+        float sum = 0.0F;
+        for (int band = fromInclusive; band < toExclusive; band++) {
+            sum += 1.0F - surfaceReflectedPower(
+                    hit,
+                    band,
+                    AcousticMaterialRegistry.tuning().metersPerBlock()
+            );
+        }
+        return sum / (toExclusive - fromInclusive);
+    }
+
+    static float surfaceReflectedPower(
+            SurfaceHit hit,
+            int band,
+            double metersPerBlock
+    ) {
+        if (hit.fluidBoundary()) {
+            float reflection = FluidAcoustics.interfaceReflectionAmplitude(
+                    hit.material().medium().acousticImpedanceRayl(),
+                    hit.boundaryOtherMaterial() == null
+                            ? MediumProfile.AIR.acousticImpedanceRayl()
+                            : hit.boundaryOtherMaterial().medium().acousticImpedanceRayl()
+            );
+            return reflection * reflection;
+        }
+        float transmission = hit.material().surfaceTransmission(band, metersPerBlock);
+        return Mth.clamp(
+                1.0F - hit.material().absorption(band) - transmission * transmission,
+                0.0F,
+                1.0F
+        );
+    }
+
     /**
      * One Huygens/Fresnel sample with fixed physical endpoints. The internal wavefront
      * point is included in both legs, so a point inside an obstacle measures the entry
@@ -3295,6 +3457,7 @@ public final class AcousticTracer {
         for (int band = 0; band < bands.length; band++) {
             bands[band] = sourceLeg.bands()[band] * listenerLeg.bands()[band];
         }
+        applyFluidBoundary(bands, sourceLeg.endFluid(), listenerLeg.startFluid());
         return new Transmission(
                 bands,
                 sourceLeg.firstBounds() != null
@@ -3302,7 +3465,11 @@ public final class AcousticTracer {
                         : listenerLeg.firstBounds(),
                 sourceLeg.blockers() + listenerLeg.blockers(),
                 sourceLeg.fluidDistance() + listenerLeg.fluidDistance(),
-                Math.max(sourceLeg.fluidScattering(), listenerLeg.fluidScattering())
+                sourceLeg.airDistance() + listenerLeg.airDistance(),
+                sourceLeg.travelTimeSeconds() + listenerLeg.travelTimeSeconds(),
+                Math.max(sourceLeg.fluidScattering(), listenerLeg.fluidScattering()),
+                sourceLeg.startFluid(),
+                listenerLeg.endFluid()
         );
     }
 
@@ -3328,34 +3495,45 @@ public final class AcousticTracer {
         BlockPos pos = new BlockPos(Mth.floor(point.x), Mth.floor(point.y), Mth.floor(point.z));
         FluidState fluidState = level.getFluidState(pos);
         if (fluidState.isEmpty()) {
-            return new MediumSample(MediumProfile.AIR, 0.0F);
+            return new MediumSample(MediumProfile.AIR, null, 0.0F);
         }
         AABB bounds = fluidState.getAABB(level, pos);
         if (bounds == null || !bounds.contains(point)) {
-            return new MediumSample(MediumProfile.AIR, 0.0F);
+            return new MediumSample(MediumProfile.AIR, null, 0.0F);
         }
-        MediumProfile profile = AcousticMaterialRegistry.findFluid(fluidState).medium();
+        AcousticMaterial material = AcousticMaterialRegistry.findFluid(fluidState);
+        MediumProfile profile = material.medium();
         float depth = (float) Math.max(0.0, bounds.maxY - point.y);
-        return new MediumSample(profile, Mth.clamp(depth / profile.transitionDepth(), 0.0F, 1.0F));
+        return new MediumSample(
+                profile,
+                material,
+                Mth.clamp(depth / profile.transitionDepth(), 0.0F, 1.0F)
+        );
     }
 
     private static RoomAcoustics applyMediumRoom(RoomAcoustics base, MediumSample medium) {
         MediumProfile profile = medium.profile();
         float weight = medium.weight();
+        float propagationTimeScale = mix(
+                1.0F,
+                MediumProfile.AIR.soundSpeedMetersPerSecond()
+                        / profile.soundSpeedMetersPerSecond(),
+                weight
+        );
         return new RoomAcoustics(
                 mix(base.density(), profile.density(), weight),
                 mix(base.diffusion(), profile.diffusion(), weight),
                 mix(base.gain(), profile.roomGain(), weight),
                 mix(base.gainHighFrequency(), profile.roomGainHighFrequency(), weight),
                 mix(base.gainLowFrequency(), profile.roomGainLowFrequency(), weight),
-                mix(base.decayTime(), profile.decayTime(), weight),
+                mix(base.decayTime(), profile.decayTime(), weight) * propagationTimeScale,
                 mix(base.decayHighFrequencyRatio(), profile.decayHighFrequencyRatio(), weight),
                 mix(base.decayLowFrequencyRatio(), profile.decayLowFrequencyRatio(), weight),
                 mix(base.reflectionsGain(), profile.reflectionsGain(), weight),
-                mix(base.reflectionsDelay(), profile.reflectionsDelay(), weight),
+                mix(base.reflectionsDelay(), profile.reflectionsDelay(), weight) * propagationTimeScale,
                 base.reflectionsPan().scale(1.0F - weight),
                 mix(base.lateReverbGain(), profile.lateReverbGain(), weight),
-                mix(base.lateReverbDelay(), profile.lateReverbDelay(), weight),
+                mix(base.lateReverbDelay(), profile.lateReverbDelay(), weight) * propagationTimeScale,
                 base.lateReverbPan().scale(1.0F - weight),
                 mix(base.modulationTime(), profile.modulationTime(), weight),
                 mix(base.modulationDepth(), profile.modulationDepth(), weight),
@@ -3450,7 +3628,18 @@ public final class AcousticTracer {
 
     private static FluidStats applyFluidSegments(float[] bands, List<FluidSegment> segments, double rayDistance) {
         if (segments.isEmpty() || rayDistance <= 1.0E-7) {
-            return new FluidStats(0.0F, 0.0F);
+            double airMeters = AcousticMaterialRegistry.tuning().meters(rayDistance);
+            return new FluidStats(
+                    0.0F,
+                    (float) rayDistance,
+                    FluidAcoustics.travelTimeSeconds(
+                            airMeters,
+                            MediumProfile.AIR.soundSpeedMetersPerSecond()
+                    ),
+                    0.0F,
+                    null,
+                    null
+            );
         }
 
         segments.sort(Comparator.comparingDouble(FluidSegment::start));
@@ -3474,7 +3663,8 @@ public final class AcousticTracer {
         float totalDistance = 0.0F;
         float scatteringDistance = 0.0F;
         AcousticTuning tuning = AcousticMaterialRegistry.tuning();
-        for (FluidSegment segment : merged) {
+        for (int index = 0; index < merged.size(); index++) {
+            FluidSegment segment = merged.get(index);
             double normalizedLength = Math.max(0.0, segment.end() - segment.start());
             float distance = (float) (normalizedLength * rayDistance);
             if (distance <= 1.0E-6F) {
@@ -3482,21 +3672,94 @@ public final class AcousticTracer {
             }
             totalDistance += distance;
             scatteringDistance += distance * segment.material().scattering();
-            int boundaries = (segment.start() > 1.0E-5 ? 1 : 0) + (segment.end() < 1.0 - 1.0E-5 ? 1 : 0);
             for (int band = 0; band < bands.length; band++) {
                 bands[band] *= segment.material().transmissionGain(
                         band,
                         tuning.meters(distance)
                 );
-                if (boundaries > 0) {
-                    bands[band] *= (float) Math.pow(segment.material().boundaryTransmission(band), boundaries);
-                }
             }
+
+            // Each physical interface is evaluated exactly once. Adjacent unlike
+            // fluids transition directly; a real air gap produces the two separate
+            // interfaces that actually exist. Endpoints already inside a fluid do not
+            // invent an air/fluid boundary at the emitter or listener.
+            if (segment.start() > 1.0E-5
+                    && (index == 0 || merged.get(index - 1).end() < segment.start() - 1.0E-6)) {
+                applyFluidBoundary(bands, null, segment);
+            }
+            if (segment.end() < 1.0 - 1.0E-5) {
+                FluidSegment next = index + 1 < merged.size()
+                        && merged.get(index + 1).start() <= segment.end() + 1.0E-6
+                        ? merged.get(index + 1)
+                        : null;
+                applyFluidBoundary(bands, segment, next);
+            }
+        }
+        float airDistance = Math.max(0.0F, (float) rayDistance - totalDistance);
+        double travelTime = FluidAcoustics.travelTimeSeconds(
+                tuning.meters(airDistance),
+                MediumProfile.AIR.soundSpeedMetersPerSecond()
+        );
+        for (FluidSegment segment : merged) {
+            double distance = Math.max(0.0, segment.end() - segment.start()) * rayDistance;
+            travelTime += FluidAcoustics.travelTimeSeconds(
+                    tuning.meters(distance),
+                    segment.material().medium().soundSpeedMetersPerSecond()
+            );
         }
         return new FluidStats(
                 totalDistance,
-                totalDistance <= 1.0E-6F ? 0.0F : scatteringDistance / totalDistance
+                airDistance,
+                travelTime,
+                totalDistance <= 1.0E-6F ? 0.0F : scatteringDistance / totalDistance,
+                merged.getFirst().start() <= 1.0E-5
+                        ? merged.getFirst().material()
+                        : null,
+                merged.getLast().end() >= 1.0 - 1.0E-5
+                        ? merged.getLast().material()
+                        : null
         );
+    }
+
+    private static void applyFluidBoundary(
+            float[] bands,
+            FluidSegment first,
+            FluidSegment second
+    ) {
+        applyFluidBoundary(
+                bands,
+                first == null ? null : first.material(),
+                second == null ? null : second.material()
+        );
+    }
+
+    private static void applyFluidBoundary(
+            float[] bands,
+            AcousticMaterial first,
+            AcousticMaterial second
+    ) {
+        MediumProfile firstProfile = first == null ? MediumProfile.AIR : first.medium();
+        MediumProfile secondProfile = second == null ? MediumProfile.AIR : second.medium();
+        if (firstProfile == secondProfile
+                || Float.compare(
+                        firstProfile.acousticImpedanceRayl(),
+                        secondProfile.acousticImpedanceRayl()
+                ) == 0) {
+            return;
+        }
+        float physicalTransmission = FluidAcoustics.interfaceTransmissionAmplitude(
+                firstProfile.acousticImpedanceRayl(),
+                secondProfile.acousticImpedanceRayl()
+        );
+        if (physicalTransmission >= 0.999999F) {
+            return;
+        }
+        for (int band = 0; band < bands.length; band++) {
+            float firstSurface = first == null ? 1.0F : first.boundaryTransmission(band);
+            float secondSurface = second == null ? 1.0F : second.boundaryTransmission(band);
+            float surfaceCoherence = (float) Math.sqrt(firstSurface * secondSurface);
+            bands[band] *= physicalTransmission * surfaceCoherence;
+        }
     }
 
     private static SegmentInterval intersectSegment(AABB box, Vec3 from, Vec3 to) {
@@ -3727,7 +3990,11 @@ public final class AcousticTracer {
             AABB firstBounds,
             int blockers,
             float fluidDistance,
-            float fluidScattering
+            float airDistance,
+            double travelTimeSeconds,
+            float fluidScattering,
+            AcousticMaterial startFluid,
+            AcousticMaterial endFluid
     ) {
     }
 
@@ -3741,7 +4008,14 @@ public final class AcousticTracer {
     private record FluidSegment(Fluid type, AcousticMaterial material, double start, double end) {
     }
 
-    private record FluidStats(float distance, float scattering) {
+    private record FluidStats(
+            float distance,
+            float airDistance,
+            double travelTimeSeconds,
+            float scattering,
+            AcousticMaterial startFluid,
+            AcousticMaterial endFluid
+    ) {
     }
 
     private record SegmentInterval(double start, double end) {
@@ -3758,14 +4032,26 @@ public final class AcousticTracer {
             Vec3 normal,
             AABB bounds,
             double distance,
-            AcousticMaterial material
+            AcousticMaterial material,
+            AcousticMaterial boundaryOtherMaterial,
+            boolean fluidBoundary
     ) {
+        SurfaceHit(
+                Vec3 location,
+                Vec3 normal,
+                AABB bounds,
+                double distance,
+                AcousticMaterial material
+        ) {
+            this(location, normal, bounds, distance, material, null, false);
+        }
     }
 
     private record DiffractionPath(
             float[] bands,
-            Vec3 point,
             double pathDistance,
+            double airDistance,
+            List<DirectionalArrivalField.Arrival> arrivals,
             boolean clear,
             boolean multipleBends
     ) {
@@ -3980,6 +4266,7 @@ public final class AcousticTracer {
             float[] bands,
             float score,
             double pathDistance,
+            double airDistance,
             Vec3 arrivalPoint,
             boolean clear
     ) {
@@ -4038,7 +4325,8 @@ public final class AcousticTracer {
             float gain,
             float highFrequencyGain,
             float delay,
-            Vec3 pan
+            Vec3 pan,
+            DirectionalArrivalField directionalField
     ) {
         private static ReflectionResult silent() {
             return new ReflectionResult(
@@ -4046,7 +4334,8 @@ public final class AcousticTracer {
                     0.0F,
                     1.0F,
                     0.0F,
-                    Vec3.ZERO
+                    Vec3.ZERO,
+                    DirectionalArrivalField.EMPTY
             );
         }
     }
@@ -4059,7 +4348,7 @@ public final class AcousticTracer {
      */
     private static final class ArrivalFieldAccumulator {
         private final PathEnergyAccumulator energy = new PathEnergyAccumulator();
-        private Vec3 directionMoment = Vec3.ZERO;
+        private final List<DirectionalArrivalField.Arrival> arrivals = new ArrayList<>(6);
         private double directionalPower;
         private double distancePower;
 
@@ -4067,7 +4356,7 @@ public final class AcousticTracer {
                 PathKind kind,
                 float[] amplitudes,
                 float powerWeight,
-                Vec3 arrivalDirection,
+                List<DirectionalArrivalField.Arrival> pathArrivals,
                 double pathDistance
         ) {
             energy.add(kind, amplitudes, powerWeight);
@@ -4076,10 +4365,17 @@ public final class AcousticTracer {
             if (power <= 1.0E-12) {
                 return;
             }
-            if (arrivalDirection.lengthSqr() > 1.0E-10) {
-                directionMoment = directionMoment.add(
-                        arrivalDirection.normalize().scale(power)
-                );
+            double pathArrivalPower = 0.0;
+            for (DirectionalArrivalField.Arrival arrival : pathArrivals) {
+                pathArrivalPower += arrival.power();
+            }
+            if (pathArrivalPower > 1.0E-12) {
+                for (DirectionalArrivalField.Arrival arrival : pathArrivals) {
+                    arrivals.add(new DirectionalArrivalField.Arrival(
+                            arrival.point(),
+                            power * arrival.power() / pathArrivalPower
+                    ));
+                }
             }
             directionalPower += power;
             distancePower += Math.max(0.0, pathDistance) * power;
@@ -4089,25 +4385,12 @@ public final class AcousticTracer {
             return energy.amplitudes();
         }
 
-        private Vec3 apparentDirection(Vec3 fallback) {
-            Vec3 fallbackDirection = fallback.lengthSqr() > 1.0E-10
-                    ? fallback.normalize()
-                    : new Vec3(0.0, 0.0, 1.0);
-            if (directionalPower <= 1.0E-12 || directionMoment.lengthSqr() <= 1.0E-10) {
-                return fallbackDirection;
-            }
-            // The length of the normalized first angular moment is directional
-            // coherence. Opposing or broadly distributed arrivals must not have their
-            // tiny residual normalized into a seemingly certain, frame-dependent
-            // direction. Blend that unresolved part toward the real source direction;
-            // a single coherent arrival still retains its full calculated direction.
-            Vec3 meanDirection = directionMoment.scale(1.0 / directionalPower);
-            double coherence = Mth.clamp(meanDirection.length(), 0.0, 1.0);
-            Vec3 resolved = fallbackDirection.scale(1.0 - coherence)
-                    .add(meanDirection);
-            return resolved.lengthSqr() > 1.0E-10
-                    ? resolved.normalize()
-                    : fallbackDirection;
+        private Vec3 apparentDirection(Vec3 listener, Vec3 fallbackSource) {
+            return directionalField(fallbackSource).apparentDirection(listener);
+        }
+
+        private DirectionalArrivalField directionalField(Vec3 fallbackSource) {
+            return new DirectionalArrivalField(arrivals, fallbackSource);
         }
 
         private double propagationDistance(double fallback) {
@@ -4129,7 +4412,11 @@ public final class AcousticTracer {
         }
     }
 
-    private record MediumSample(MediumProfile profile, float weight) {
+    private record MediumSample(
+            MediumProfile profile,
+            AcousticMaterial material,
+            float weight
+    ) {
     }
 
     public enum TraceQuality {
@@ -4156,11 +4443,11 @@ public final class AcousticTracer {
             // The onset estimate samples the same finite incident wavefront as the full
             // solver. That prevents a point-like centre ray from producing a different
             // first-frame gain when a source starts beside an edge or diagonal seam.
-            float[] transmission = traceImmediateWavefront(
+            FiniteWavefront immediateWavefront = traceImmediateWavefront(
                     level, source, listener
             );
+            float[] transmission = immediateWavefront.bands().clone();
             for (int band = 0; band < transmission.length; band++) {
-                transmission[band] *= airAbsorption(band, distanceMeters);
                 transmission[band] *= switch (band / 2) {
                     case 0 -> lowBandGain;
                     case 1 -> midLowBandGain;
@@ -4223,13 +4510,8 @@ public final class AcousticTracer {
                 }
             }
             return new AcousticResult(
-                    Mth.clamp(
-                            transmission[0] * 0.24F + transmission[1] * 0.26F
-                                    + transmission[2] * 0.27F + transmission[3] * 0.23F,
-                            0.0F,
-                            1.0F
-                    ),
-                    Mth.clamp(high / Math.max(low, 0.01F), 0.02F, 1.0F),
+                    spectralAnchor(transmission),
+                    Mth.clamp(high / Math.max(spectralAnchor(transmission), 0.01F), 0.02F, 1.0F),
                     pairEnergy(transmission, 0),
                     pairEnergy(transmission, 2),
                     pairEnergy(transmission, 4),
@@ -4250,7 +4532,7 @@ public final class AcousticTracer {
         }
     }
 
-    private static float[] traceImmediateWavefront(
+    private static FiniteWavefront traceImmediateWavefront(
             BlockGetter level,
             Vec3 source,
             Vec3 listener
@@ -4258,7 +4540,13 @@ public final class AcousticTracer {
         Vec3 delta = listener.subtract(source);
         double distance = delta.length();
         if (distance < 1.0E-6) {
-            return traceTransmission(level, source, listener).bands().clone();
+            Transmission transmission = traceTransmission(level, source, listener);
+            float[] bands = transmission.bands().clone();
+            float[] power = new float[AcousticBands.COUNT];
+            for (int band = 0; band < power.length; band++) {
+                power[band] = bands[band] * bands[band];
+            }
+            return new FiniteWavefront(transmission, bands, power);
         }
 
         Vec3 direction = delta.scale(1.0 / distance);
@@ -4271,6 +4559,6 @@ public final class AcousticTracer {
         Vec3 up = right.cross(direction).normalize();
         return traceFiniteWavefront(
                 level, source, listener, direction, right, up, 8
-        ).bands().clone();
+        );
     }
 }

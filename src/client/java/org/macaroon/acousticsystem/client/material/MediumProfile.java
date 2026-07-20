@@ -11,15 +11,17 @@ public final class MediumProfile {
             0.0F, 0.2F, 0.02F, 0.9F, 0.95F,
             0.15F, 0.8F, 1.0F,
             0.01F, 0.0F, 0.05F, 0.01F,
-            0.25F, 0.0F, 0.92F, 0.18F
+            0.25F, 0.0F, 0.92F, 0.18F,
+            343.0F, 415.0F
     );
     public static final MediumProfile WATER = new MediumProfile(
-            new float[]{0.88F, 0.82F, 0.72F, 0.54F, 0.32F, 0.15F, 0.060F, 0.018F},
-            0.32F, 0.16F,
+            new float[]{0.34F, 0.48F, 0.68F, 0.86F, 0.82F, 0.64F, 0.42F, 0.23F},
+            0.28F, 0.36F,
             0.95F, 0.90F, 0.19F, 0.16F, 0.85F,
             0.93F, 0.32F, 1.25F,
             0.13F, 0.012F, 0.68F, 0.018F,
-            0.45F, 0.07F, 0.892F, 0.18F
+            0.45F, 0.07F, 0.995F, 0.18F,
+            1480.0F, 1_480_000.0F
     );
 
     private final float[] gain;
@@ -41,6 +43,8 @@ public final class MediumProfile {
     private final float modulationDepth;
     private final float airAbsorptionGainHighFrequency;
     private final float transitionDepth;
+    private final float soundSpeedMetersPerSecond;
+    private final float acousticImpedanceRayl;
 
     public MediumProfile(
             float[] gain,
@@ -61,7 +65,9 @@ public final class MediumProfile {
             float modulationTime,
             float modulationDepth,
             float airAbsorptionGainHighFrequency,
-            float transitionDepth
+            float transitionDepth,
+            float soundSpeedMetersPerSecond,
+            float acousticImpedanceRayl
     ) {
         this.gain = clampBands(gain);
         this.reverbSend = Mth.clamp(reverbSend, 0.0F, 1.0F);
@@ -82,6 +88,8 @@ public final class MediumProfile {
         this.modulationDepth = Mth.clamp(modulationDepth, 0.0F, 1.0F);
         this.airAbsorptionGainHighFrequency = Mth.clamp(airAbsorptionGainHighFrequency, 0.892F, 1.0F);
         this.transitionDepth = Mth.clamp(transitionDepth, 0.01F, 1.0F);
+        this.soundSpeedMetersPerSecond = Mth.clamp(soundSpeedMetersPerSecond, 100.0F, 10_000.0F);
+        this.acousticImpedanceRayl = Mth.clamp(acousticImpedanceRayl, 1.0F, 100_000_000.0F);
     }
 
     public static MediumProfile fromJson(JsonObject object, MediumProfile fallback) {
@@ -107,7 +115,9 @@ public final class MediumProfile {
                 read(object, "modulation_time", fallback.modulationTime),
                 read(object, "modulation_depth", fallback.modulationDepth),
                 read(object, "air_absorption_gain_high_frequency", fallback.airAbsorptionGainHighFrequency),
-                read(object, "transition_depth", fallback.transitionDepth)
+                read(object, "transition_depth", fallback.transitionDepth),
+                read(object, "sound_speed_meters_per_second", fallback.soundSpeedMetersPerSecond),
+                read(object, "acoustic_impedance_rayl", fallback.acousticImpedanceRayl)
         );
     }
 
@@ -130,6 +140,8 @@ public final class MediumProfile {
     public float modulationDepth() { return modulationDepth; }
     public float airAbsorptionGainHighFrequency() { return airAbsorptionGainHighFrequency; }
     public float transitionDepth() { return transitionDepth; }
+    public float soundSpeedMetersPerSecond() { return soundSpeedMetersPerSecond; }
+    public float acousticImpedanceRayl() { return acousticImpedanceRayl; }
 
     private static float read(JsonObject object, String name, float fallback) {
         return object.has(name) ? object.get(name).getAsFloat() : fallback;
