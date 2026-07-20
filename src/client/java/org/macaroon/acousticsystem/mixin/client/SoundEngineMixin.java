@@ -24,6 +24,10 @@ abstract class SoundEngineMixin {
     @Final
     private Map<SoundInstance, ChannelAccess.ChannelHandle> instanceToChannel;
 
+    @Shadow
+    @Final
+    private ChannelAccess channelAccess;
+
     @Inject(method = "play", at = @At("HEAD"))
     private void acousticsystem$prepareFirstFrame(
             SoundInstance sound,
@@ -51,6 +55,6 @@ abstract class SoundEngineMixin {
             return;
         }
         Vec3 listener = camera.position();
-        AcousticRuntime.tick(level, listener, instanceToChannel);
+        AcousticRuntime.tick(level, listener, instanceToChannel, channelAccess);
     }
 }

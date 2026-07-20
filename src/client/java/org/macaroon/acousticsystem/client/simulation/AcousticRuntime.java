@@ -8,6 +8,7 @@ import net.minecraft.client.sounds.ChannelAccess;
 import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.AcousticSystem;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
+import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects.TailFieldRequest;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
@@ -66,6 +67,7 @@ public final class AcousticRuntime {
     private static ClientLevel currentLevel;
     private static volatile PrePlayContext prePlayContext;
     private static volatile ProbeSnapshot latestProbe;
+    private static volatile Vec3 latestObservedListener;
     private static final Map<ProbeCell, CachedRoomProbe> ROOM_PROBE_CACHE = new ConcurrentHashMap<>();
     private static final Map<SourceCell, CachedRoomProbe> SOURCE_ROOM_PROBE_CACHE = new ConcurrentHashMap<>();
     private static final Map<SourceCell, PreparedResult> PREPARED_RESULTS = new ConcurrentHashMap<>();
@@ -87,10 +89,25 @@ public final class AcousticRuntime {
         return ONSET_WORKER_COUNT;
     }
 
-    public static void tick(ClientLevel level, Vec3 listener, Map<SoundInstance, ChannelAccess.ChannelHandle> activeSounds) {
+    public static void tick(
+            ClientLevel level,
+            Vec3 listener,
+            Map<SoundInstance, ChannelAccess.ChannelHandle> activeSounds,
+            ChannelAccess channelAccess
+    ) {
         if (currentLevel != level) {
             switchLevel(level);
         }
+        latestObservedListener = listener;
+        // Listener motion is already known here; portal transport does not need to wait
+        // for the background geometry batch. Read the latest position again on the
+        // sound thread so queued callbacks naturally coalesce to the newest frame.
+        channelAccess.executeOnChannels(ignored -> {
+            Vec3 currentListener = latestObservedListener;
+            if (currentListener != null) {
+                OpenALAcousticEffects.updateListenerPosition(currentListener);
+            }
+        });
 
         List<SoundRequest> positionalSounds = new ArrayList<>();
         for (Map.Entry<SoundInstance, ChannelAccess.ChannelHandle> entry : activeSounds.entrySet()) {
@@ -115,7 +132,12 @@ public final class AcousticRuntime {
             return;
         }
 
-        List<Vec3> sourcePositions = positionalSounds.stream().map(SoundRequest::source).toList();
+        List<TailFieldRequest> tailFields = OpenALAcousticEffects.tailFieldRequests();
+        List<Vec3> sourcePositions = new ArrayList<>(
+                positionalSounds.size() + tailFields.size()
+        );
+        positionalSounds.stream().map(SoundRequest::source).forEach(sourcePositions::add);
+        tailFields.stream().map(TailFieldRequest::position).forEach(sourcePositions::add);
         AcousticScene scene = AcousticSceneManager.capture(level, listener, sourcePositions);
         prePlayContext = new PrePlayContext(level, scene, listener, generation);
         PREPARED_RESULTS.entrySet().removeIf(entry -> {
@@ -132,7 +154,10 @@ public final class AcousticRuntime {
                         || now - entry.getValue().computedNanoseconds()
                         > PREPARED_RESULT_RETENTION_NANOSECONDS
         );
-        submitBatch(level, scene, listener, positionalSounds, generation);
+        submitBatch(
+                level, scene, listener, positionalSounds, tailFields,
+                generation, channelAccess
+        );
     }
 
     /** Called on the client thread before Minecraft allocates the OpenAL channel. */
@@ -306,6 +331,7 @@ public final class AcousticRuntime {
         currentLevel = null;
         prePlayContext = null;
         latestProbe = null;
+        latestObservedListener = null;
         ROOM_PROBE_CACHE.clear();
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
@@ -321,6 +347,7 @@ public final class AcousticRuntime {
         currentLevel = level;
         prePlayContext = null;
         latestProbe = null;
+        latestObservedListener = null;
         ROOM_PROBE_CACHE.clear();
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
@@ -332,7 +359,9 @@ public final class AcousticRuntime {
             AcousticScene scene,
             Vec3 listener,
             List<SoundRequest> sounds,
-            long batchGeneration
+            List<TailFieldRequest> tailFields,
+            long batchGeneration,
+            ChannelAccess channelAccess
     ) {
         long submittedNanoseconds = System.nanoTime();
         CompletableFuture<RoomProbe> roomFuture = CompletableFuture.supplyAsync(
@@ -349,22 +378,38 @@ public final class AcousticRuntime {
                         || entry.getValue().sceneRevision() != scene.revision()
         );
         pendingBatch = roomFuture.thenCompose(roomProbe -> {
-            if (sounds.isEmpty()) {
-                return CompletableFuture.completedFuture(new BatchResult(
-                        level,
-                        batchGeneration,
-                        scene.revision(),
-                        listener,
-                        roomProbe,
-                        submittedNanoseconds
-                ));
+            deliverCompletedListenerRoom(
+                    channelAccess,
+                    roomProbe,
+                    batchGeneration,
+                    listener,
+                    submittedNanoseconds
+            );
+            List<CompletableFuture<Void>> calculations = new ArrayList<>(
+                    tailFields.size() + Math.min(WORKER_COUNT, sounds.size())
+            );
+            for (TailFieldRequest tailField : tailFields) {
+                calculations.add(CompletableFuture.runAsync(() -> {
+                    RoomProbe tailProbe = cachedSourceRoomProbe(
+                            scene,
+                            tailField.position(),
+                            batchGeneration,
+                            submittedNanoseconds
+                    );
+                    deliverCompletedTailField(
+                            channelAccess,
+                            tailField,
+                            tailProbe,
+                            batchGeneration,
+                            submittedNanoseconds
+                    );
+                }, WORKERS));
             }
             Map<TraceKey, AcousticResult> traceCache = new ConcurrentHashMap<>();
             int partitionCount = Math.min(WORKER_COUNT, sounds.size());
-            List<CompletableFuture<Void>> partitions = new ArrayList<>(partitionCount);
             for (int partition = 0; partition < partitionCount; partition++) {
                 int firstIndex = partition;
-                partitions.add(CompletableFuture.supplyAsync(() -> {
+                calculations.add(CompletableFuture.runAsync(() -> {
                     for (int index = firstIndex; index < sounds.size(); index += partitionCount) {
                         SoundRequest request = sounds.get(index);
                         TraceKey key = TraceKey.from(request);
@@ -388,12 +433,11 @@ public final class AcousticRuntime {
                                 batchGeneration,
                                 listener,
                                 submittedNanoseconds
-                        );
+                            );
                     }
-                    return null;
                 }, WORKERS));
             }
-            CompletableFuture<?>[] all = partitions.toArray(CompletableFuture[]::new);
+            CompletableFuture<?>[] all = calculations.toArray(CompletableFuture[]::new);
             return CompletableFuture.allOf(all).thenApply(ignored ->
                     new BatchResult(
                         level,
@@ -405,6 +449,28 @@ public final class AcousticRuntime {
                     )
             );
         });
+    }
+
+    private static void deliverCompletedTailField(
+            ChannelAccess channelAccess,
+            TailFieldRequest request,
+            RoomProbe probe,
+            long batchGeneration,
+            long submittedNanoseconds
+    ) {
+        if (batchGeneration != generation) {
+            return;
+        }
+        long ageMilliseconds = (System.nanoTime() - submittedNanoseconds) / 1_000_000L;
+        if (ageMilliseconds
+                > AcousticMaterialRegistry.tuning().maxResultAgeMilliseconds()) {
+            return;
+        }
+        channelAccess.executeOnChannels(ignored ->
+                OpenALAcousticEffects.updateTailField(
+                        request.fieldToken(), probe, request.position()
+                )
+        );
     }
 
     private static void publishCompletedBatch(
@@ -420,8 +486,7 @@ public final class AcousticRuntime {
         try {
             BatchResult batch = completed.join();
             if (batch.level() != level
-                    || batch.generation() != generation
-                    || !isListenerResultCurrent(batch.listener(), currentListener)) {
+                    || batch.generation() != generation) {
                 return;
             }
 
@@ -487,6 +552,41 @@ public final class AcousticRuntime {
             return;
         }
         handle.execute(channel -> apply(channel, result, submittedNanoseconds));
+    }
+
+    private static void deliverCompletedListenerRoom(
+            ChannelAccess channelAccess,
+            RoomProbe roomProbe,
+            long batchGeneration,
+            Vec3 computedListener,
+            long sequence
+    ) {
+        if (batchGeneration != generation) {
+            return;
+        }
+        Vec3 observedListener = latestObservedListener;
+        if (observedListener == null) {
+            return;
+        }
+        long ageMilliseconds = (System.nanoTime() - sequence) / 1_000_000L;
+        if (ageMilliseconds
+                > AcousticMaterialRegistry.tuning().maxResultAgeMilliseconds()) {
+            return;
+        }
+        // The room field belongs to the listener, not to a voice. ChannelHandle.execute
+        // cannot deliver the final tail update after the last source has stopped. The
+        // channel collection owns Minecraft's OpenAL executor and invokes this consumer
+        // even when its stream is empty, keeping listener movement authoritative for
+        // already stored EFX energy without allocating a silent carrier source. The
+        // probe remains anchored at computedListener: OpenAL projects that measured
+        // field onto the newest per-frame ear position, so walking continuously cannot
+        // starve room transitions merely by crossing a quantization cell before a
+        // background result completes.
+        channelAccess.executeOnChannels(ignored ->
+                OpenALAcousticEffects.updateListenerRoom(
+                        roomProbe, computedListener, sequence
+                )
+        );
     }
 
     private static void apply(Channel channel, AcousticResult result, long sequence) {

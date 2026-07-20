@@ -23,6 +23,7 @@ public final class AcousticMaterialRegistry {
             new ConcurrentHashMap<>(),
             new ConcurrentHashMap<>()
     );
+    private static volatile long revision;
 
     private AcousticMaterialRegistry() {
     }
@@ -69,6 +70,10 @@ public final class AcousticMaterialRegistry {
         return snapshot.tuning();
     }
 
+    public static long revision() {
+        return revision;
+    }
+
     static void replace(
             AcousticMaterial defaultMaterial,
             AcousticMaterial defaultFluidMaterial,
@@ -85,6 +90,7 @@ public final class AcousticMaterialRegistry {
                 new ConcurrentHashMap<>(),
                 new ConcurrentHashMap<>()
         );
+        revision++;
     }
 
     record Snapshot(

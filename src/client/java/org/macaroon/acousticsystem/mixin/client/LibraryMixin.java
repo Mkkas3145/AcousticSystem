@@ -26,7 +26,7 @@ abstract class LibraryMixin {
     }
 
     @Inject(method = "createAttributes", at = @At("RETURN"))
-    private void acousticsystem$requestTwoAuxiliarySends(
+    private void acousticsystem$requestAcousticFieldSends(
             MemoryStack stack,
             boolean enableHrtf,
             CallbackInfoReturnable<IntBuffer> cir
@@ -38,7 +38,10 @@ abstract class LibraryMixin {
                 break;
             }
             if (attribute == EXTEfx.ALC_MAX_AUXILIARY_SENDS) {
-                attributes.put(index + 1, 2);
+                // Early reflections, the listener room, and a remote source-room field.
+                // OpenAL Soft supports more, while devices exposing only two sends keep
+                // the original listener-field pipeline as a compatible fallback.
+                attributes.put(index + 1, 3);
                 break;
             }
         }

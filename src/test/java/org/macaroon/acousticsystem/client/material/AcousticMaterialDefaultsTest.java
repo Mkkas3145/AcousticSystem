@@ -21,6 +21,7 @@ class AcousticMaterialDefaultsTest {
         JsonArray materials = root.getAsJsonArray("materials");
 
         AcousticMaterial stone = materialFor(materials, "#minecraft:mineable/pickaxe");
+        AcousticMaterial concrete = materialFor(materials, "#minecraft:concrete");
         AcousticMaterial wood = materialFor(materials, "#minecraft:logs");
         AcousticMaterial sand = materialFor(materials, "#minecraft:sand");
         AcousticMaterial wool = materialFor(materials, "#minecraft:wool");
@@ -36,6 +37,23 @@ class AcousticMaterialDefaultsTest {
         assertTrue(sand.absorption(3) > wood.absorption(3));
         assertTrue(glass.scattering(5) < stone.scattering(5));
         assertTrue(wool.transmission(6) < carpet.transmission(6));
+        assertTrue(
+                stone.transmission(0) < 0.004F,
+                "A metre of stone must not leave an audible dry low-frequency leak"
+        );
+        assertTrue(
+                concrete.transmission(0) < 0.005F,
+                "A metre of concrete must not leave an audible dry low-frequency leak"
+        );
+        assertTrue(
+                metal.structuralCoupling(1) > stone.structuralCoupling(1)
+                        && stone.structuralCoupling(1) > wool.structuralCoupling(1),
+                "Mechanical contact must couple most strongly into metal and least into wool"
+        );
+        assertTrue(
+                metal.structuralGain(1, 4.0) > wool.structuralGain(1, 4.0) * 1000.0F,
+                "A connected metal structure must carry vibration farther than insulation"
+        );
         assertEquals(1.0F, root.getAsJsonObject("tuning").get("meters_per_block").getAsFloat());
     }
 
@@ -124,6 +142,12 @@ class AcousticMaterialDefaultsTest {
                 assertTrue(
                         material.has("transmission_loss_db_per_meter"),
                         () -> "Solid material has no distance-normalized TL: " + material.get("blocks")
+                );
+                assertTrue(
+                        material.has("structural_coupling")
+                                && material.has("structural_loss_db_per_meter"),
+                        () -> "Solid material has no mechanical propagation model: "
+                                + material.get("blocks")
                 );
             }
         }

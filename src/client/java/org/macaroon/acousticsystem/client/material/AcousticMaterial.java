@@ -27,6 +27,8 @@ public final class AcousticMaterial {
     private final float[] boundaryTransmission;
     private final MediumProfile medium;
     private final float[] scattering;
+    private final float[] structuralCoupling;
+    private final float[] structuralLossDbPerMeter;
     private final float thickness;
 
     public AcousticMaterial(float[] absorption, float[] transmission, float scattering, float thickness) {
@@ -66,11 +68,35 @@ public final class AcousticMaterial {
             float[] scattering,
             float thickness
     ) {
+        this(
+                absorption,
+                transmission,
+                boundaryTransmission,
+                medium,
+                scattering,
+                new float[]{0.42F, 0.36F, 0.27F, 0.17F, 0.09F, 0.040F, 0.014F, 0.004F},
+                new float[]{2.0F, 3.0F, 5.0F, 9.0F, 15.0F, 24.0F, 37.0F, 53.0F},
+                thickness
+        );
+    }
+
+    public AcousticMaterial(
+            float[] absorption,
+            float[] transmission,
+            float[] boundaryTransmission,
+            MediumProfile medium,
+            float[] scattering,
+            float[] structuralCoupling,
+            float[] structuralLossDbPerMeter,
+            float thickness
+    ) {
         this.absorption = clampBands(absorption);
         this.transmissionLossDbPerMeter = gainsToLossDbPerMeter(transmission);
         this.boundaryTransmission = clampBands(boundaryTransmission);
         this.medium = medium;
         this.scattering = clampBands(scattering);
+        this.structuralCoupling = clampBands(structuralCoupling);
+        this.structuralLossDbPerMeter = clampLossBands(structuralLossDbPerMeter);
         this.thickness = Mth.clamp(thickness, 0.05F, 8.0F);
     }
 
@@ -113,6 +139,17 @@ public final class AcousticMaterial {
         return scattering[band];
     }
 
+    public float structuralCoupling(int band) {
+        return structuralCoupling[band];
+    }
+
+    public float structuralGain(int band, double distanceMeters) {
+        return (float) Math.pow(
+                10.0,
+                -structuralLossDbPerMeter[band] * Math.max(0.0, distanceMeters) / 20.0
+        );
+    }
+
     public float thickness() {
         return thickness;
     }
@@ -139,6 +176,10 @@ public final class AcousticMaterial {
                         fallback.medium
                 ),
                 readScattering(object, fallback),
+                readBands(object, "structural_coupling", fallback.structuralCoupling),
+                object.has("structural_loss_db_per_meter")
+                        ? readLossBands(object, "structural_loss_db_per_meter")
+                        : fallback.structuralLossDbPerMeter.clone(),
                 object.has("thickness") ? object.get("thickness").getAsFloat() : fallback.thickness
         );
     }
@@ -180,6 +221,11 @@ public final class AcousticMaterial {
 
     private static float[] readLossBands(JsonObject object, String name) {
         float[] values = AcousticBands.read(object.getAsJsonArray(name), name);
+        return clampLossBands(values);
+    }
+
+    private static float[] clampLossBands(float[] values) {
+        values = values.clone();
         for (int band = 0; band < values.length; band++) {
             values[band] = Mth.clamp(values[band], 0.0F, 240.0F);
         }
