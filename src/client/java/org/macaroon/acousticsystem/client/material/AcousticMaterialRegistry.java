@@ -8,6 +8,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
+import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -67,11 +68,11 @@ public final class AcousticMaterialRegistry {
     }
 
     public static AcousticTuning tuning() {
-        return snapshot.tuning();
+        return AcousticQualityConfig.apply(snapshot.tuning());
     }
 
     public static long revision() {
-        return revision;
+        return 31L * revision + AcousticQualityConfig.revision();
     }
 
     static void replace(

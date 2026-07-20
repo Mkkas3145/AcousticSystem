@@ -177,6 +177,10 @@ public final class OpenALAcousticEffects {
         applyInternal(source, target, false);
     }
 
+    public static void applyOnsetCorrection(int source, AcousticResult target, long sequence) {
+        applyInternal(source, target, false, sequence, true);
+    }
+
     /**
      * Commits the listener-centred acoustic field. This must run on Minecraft's sound
      * thread. Keeping room ownership separate from voice updates prevents a stale or
@@ -1685,6 +1689,7 @@ public final class OpenALAcousticEffects {
             float temperatureCelsius,
             float humidityPercent,
             float pressureKilopascals,
+            float absorptionScale,
             double fourKilohertzNepersPerMeter,
             double eightKilohertzNepersPerMeter
     ) {
@@ -1693,25 +1698,27 @@ public final class OpenALAcousticEffects {
                     tuning.airTemperatureCelsius(),
                     tuning.relativeHumidityPercent(),
                     tuning.airPressureKilopascals(),
+                    tuning.airAbsorptionScale(),
                     AtmosphericAbsorption.amplitudeNepersPerMeter(
                             AcousticBands.CENTERS_HZ[6],
                             tuning.airTemperatureCelsius(),
                             tuning.relativeHumidityPercent(),
                             tuning.airPressureKilopascals()
-                    ),
+                    ) * tuning.airAbsorptionScale(),
                     AtmosphericAbsorption.amplitudeNepersPerMeter(
                             AcousticBands.CENTERS_HZ[7],
                             tuning.airTemperatureCelsius(),
                             tuning.relativeHumidityPercent(),
                             tuning.airPressureKilopascals()
-                    )
+                    ) * tuning.airAbsorptionScale()
             );
         }
 
         private boolean matches(AcousticTuning tuning) {
             return Float.compare(temperatureCelsius, tuning.airTemperatureCelsius()) == 0
                     && Float.compare(humidityPercent, tuning.relativeHumidityPercent()) == 0
-                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0;
+                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0
+                    && Float.compare(absorptionScale, tuning.airAbsorptionScale()) == 0;
         }
     }
 

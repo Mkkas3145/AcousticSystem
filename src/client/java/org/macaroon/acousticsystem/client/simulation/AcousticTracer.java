@@ -268,14 +268,16 @@ public final class AcousticTracer {
         }
         float[] geometricSpectrum = resolvedField.amplitudes();
 
-        ReflectionResult reflections = estimateEarlyReflections(
-                level,
-                source,
-                listener,
-                sourceRoomProbe,
-                MAX_EARLY_REFLECTION_PATHS_PER_SOUND,
-                diffractionPath == null || !diffractionPath.multipleBends()
-        );
+        ReflectionResult reflections = tuning.reflectionGainScale() <= 1.0E-6F
+                ? ReflectionResult.silent()
+                : estimateEarlyReflections(
+                        level,
+                        source,
+                        listener,
+                        sourceRoomProbe,
+                        MAX_EARLY_REFLECTION_PATHS_PER_SOUND,
+                        diffractionPath == null || !diffractionPath.multipleBends()
+                );
         // A resolved image reflection is already rendered by the source-specific early
         // reflection channel. Feeding the same path into the shared late-field send
         // counts it twice and lets one image-path topology change spike total loudness.
@@ -582,14 +584,16 @@ public final class AcousticTracer {
         float meanLowAbsorption = (float) (lowAbsorption / returnedWeight);
         float meanScattering = (float) (scattering / returnedWeight);
         float reflective = 1.0F - meanAbsorption;
-        LateReverbTracer.Estimate lateReverb = LateReverbTracer.trace(
-                level,
-                listener,
-                grid.directions(),
-                hits,
-                tuning,
-                Mth.clamp(leakage.reverberationTimeSeconds(), 0.12F, 4.0F)
-        );
+        LateReverbTracer.Estimate lateReverb = tuning.reverbSendScale() <= 1.0E-6F
+                ? LateReverbTracer.Estimate.silent()
+                : LateReverbTracer.trace(
+                        level,
+                        listener,
+                        grid.directions(),
+                        hits,
+                        tuning,
+                        Mth.clamp(leakage.reverberationTimeSeconds(), 0.12F, 4.0F)
+                );
         float reflectionDelay = Mth.clamp(lateReverb.earlyDelay(), 0.0F, 0.3F);
         float lateDelay = Mth.clamp(lateReverb.lateDelay(), 0.0F, 0.1F);
         float totalReturnedEnergy = lateReverb.earlyEnergy() + lateReverb.lateEnergy();
@@ -908,7 +912,8 @@ public final class AcousticTracer {
             boolean preferAirCellGraph
     ) {
         double directDistance = source.distanceTo(listener);
-        if (directDistance < 1.0E-6 || candidateBudget <= 0) {
+        if (directDistance < 1.0E-6 || candidateBudget <= 0
+                || tuning.diffractionGainScale() <= 1.0E-6F) {
             return new DiffractionPath(
                     new float[AcousticBands.COUNT], source, directDistance, false, false
             );
@@ -3375,6 +3380,7 @@ public final class AcousticTracer {
             float temperatureCelsius,
             float humidityPercent,
             float pressureKilopascals,
+            float absorptionScale,
             double[] nepersPerMeter
     ) {
         private static AtmosphereCache from(AcousticTuning tuning) {
@@ -3385,12 +3391,13 @@ public final class AcousticTracer {
                         tuning.airTemperatureCelsius(),
                         tuning.relativeHumidityPercent(),
                         tuning.airPressureKilopascals()
-                );
+                ) * tuning.airAbsorptionScale();
             }
             return new AtmosphereCache(
                     tuning.airTemperatureCelsius(),
                     tuning.relativeHumidityPercent(),
                     tuning.airPressureKilopascals(),
+                    tuning.airAbsorptionScale(),
                     coefficients
             );
         }
@@ -3398,7 +3405,8 @@ public final class AcousticTracer {
         private boolean matches(AcousticTuning tuning) {
             return Float.compare(temperatureCelsius, tuning.airTemperatureCelsius()) == 0
                     && Float.compare(humidityPercent, tuning.relativeHumidityPercent()) == 0
-                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0;
+                    && Float.compare(pressureKilopascals, tuning.airPressureKilopascals()) == 0
+                    && Float.compare(absorptionScale, tuning.airAbsorptionScale()) == 0;
         }
     }
 

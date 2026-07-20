@@ -11,6 +11,7 @@ public record AcousticTuning(
         float airTemperatureCelsius,
         float relativeHumidityPercent,
         float airPressureKilopascals,
+        float airAbsorptionScale,
         float reflectionGainScale,
         float reverbSendScale,
         float roomGainScale,
@@ -19,7 +20,6 @@ public record AcousticTuning(
         float enclosedRoomSend,
         float acousticResponseTimeMilliseconds,
         int maxResultAgeMilliseconds,
-        float maxSourceMovement,
         float maxDecayTime,
         int roomRayCount,
         int sourceRoomRayCount,
@@ -51,9 +51,9 @@ public record AcousticTuning(
             1.0F,
             1.0F,
             1.0F,
+            1.0F,
             8.0F,
             500,
-            1.25F,
             3.0F,
             256,
             128,
@@ -79,6 +79,7 @@ public record AcousticTuning(
         airTemperatureCelsius = Mth.clamp(airTemperatureCelsius, -40.0F, 50.0F);
         relativeHumidityPercent = Mth.clamp(relativeHumidityPercent, 1.0F, 100.0F);
         airPressureKilopascals = Mth.clamp(airPressureKilopascals, 60.0F, 110.0F);
+        airAbsorptionScale = Mth.clamp(airAbsorptionScale, 0.0F, 4.0F);
         reflectionGainScale = Mth.clamp(reflectionGainScale, 0.0F, 4.0F);
         reverbSendScale = Mth.clamp(reverbSendScale, 0.0F, 4.0F);
         roomGainScale = Mth.clamp(roomGainScale, 0.0F, 4.0F);
@@ -89,7 +90,6 @@ public record AcousticTuning(
                 acousticResponseTimeMilliseconds, 1.0F, 2000.0F
         );
         maxResultAgeMilliseconds = Mth.clamp(maxResultAgeMilliseconds, 25, 2000);
-        maxSourceMovement = Mth.clamp(maxSourceMovement, 0.1F, 16.0F);
         maxDecayTime = Mth.clamp(maxDecayTime, 0.1F, 20.0F);
         roomRayCount = Mth.clamp(roomRayCount, 32, 1024);
         sourceRoomRayCount = Mth.clamp(sourceRoomRayCount, 16, roomRayCount);
@@ -126,6 +126,7 @@ public record AcousticTuning(
                 read(object, "air_temperature_celsius", fallback.airTemperatureCelsius),
                 read(object, "relative_humidity_percent", fallback.relativeHumidityPercent),
                 read(object, "air_pressure_kpa", fallback.airPressureKilopascals),
+                read(object, "air_absorption_scale", fallback.airAbsorptionScale),
                 read(object, "reflection_gain_scale", fallback.reflectionGainScale),
                 read(object, "reverb_send_scale", fallback.reverbSendScale),
                 read(object, "room_gain_scale", fallback.roomGainScale),
@@ -136,7 +137,6 @@ public record AcousticTuning(
                 object.has("max_result_age_ms")
                         ? object.get("max_result_age_ms").getAsInt()
                         : fallback.maxResultAgeMilliseconds,
-                read(object, "max_source_movement", fallback.maxSourceMovement),
                 read(object, "max_decay_time", fallback.maxDecayTime),
                 object.has("room_ray_count")
                         ? object.get("room_ray_count").getAsInt()

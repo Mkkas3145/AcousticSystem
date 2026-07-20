@@ -151,6 +151,7 @@ class AcousticMaterialDefaultsTest {
         );
         assertTrue(defaults.realisticDistanceAttenuation());
         assertEquals(1.0F, defaults.distanceReferenceMeters());
+        assertEquals(1.0F, defaults.airAbsorptionScale());
         assertEquals(1.0F, defaults.distanceRolloffFactor());
         assertEquals(20.0F, defaults.airTemperatureCelsius());
         assertEquals(50.0F, defaults.relativeHumidityPercent());

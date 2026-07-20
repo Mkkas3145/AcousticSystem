@@ -5,12 +5,14 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.resource.v1.ResourceLoader;
 import net.minecraft.server.packs.PackType;
 import org.macaroon.acousticsystem.AcousticSystem;
+import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialReloadListener;
 import org.macaroon.acousticsystem.client.simulation.AcousticRuntime;
 
 public final class AcousticSystemClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
+        AcousticQualityConfig.load();
         ResourceLoader.get(PackType.CLIENT_RESOURCES).registerReloadListener(
                 AcousticSystem.id("acoustic_materials"),
                 new AcousticMaterialReloadListener()

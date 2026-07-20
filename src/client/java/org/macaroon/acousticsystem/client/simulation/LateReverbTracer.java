@@ -338,6 +338,15 @@ final class LateReverbTracer {
             float lateDelay,
             RoomImpulseResponse impulseResponse
     ) {
+        static Estimate silent() {
+            return new Estimate(
+                    0.0F, 0.0F, 0.0F,
+                    0.12F, 1.0F, 1.0F,
+                    0.0F, 0.0F, 1.0F,
+                    0.0F, 0.0F,
+                    RoomImpulseResponse.SILENT
+            );
+        }
     }
 
 }

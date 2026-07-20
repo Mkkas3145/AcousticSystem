@@ -384,6 +384,12 @@ class OpenALConvolutionSmokeTest {
                     sourceStateFloat(source, "directGain"),
                     "An older channel callback must not roll a voice response backward"
             );
+            OpenALAcousticEffects.applyOnsetCorrection(source, staleResult, 150L);
+            assertEquals(
+                    acceptedDirectGain,
+                    sourceStateFloat(source, "directGain"),
+                    "A late onset completion must not overwrite a newer moving-source snapshot"
+            );
 
             int laggingSource = AL10.alGenSources();
             try {

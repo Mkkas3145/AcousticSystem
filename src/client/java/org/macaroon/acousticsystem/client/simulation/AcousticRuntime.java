@@ -303,16 +303,9 @@ public final class AcousticRuntime {
                 PREPARED_SOUNDS.remove(sound, prepared);
                 return;
             }
-            Vec3 currentSource = new Vec3(sound.getX(), sound.getY(), sound.getZ());
-            double maximumMovement = AcousticMaterialRegistry.tuning().maxSourceMovement();
-            if (currentSource.distanceToSqr(prepared.source())
-                    > maximumMovement * maximumMovement) {
-                PREPARED_SOUNDS.remove(sound, prepared);
-                return;
-            }
             handle.execute(channel -> {
                 if (PREPARED_SOUNDS.remove(sound, prepared)) {
-                    applyOnsetCorrection(channel, result);
+                    applyOnsetCorrection(channel, result, prepared.computedNanoseconds());
                 }
             });
         }).exceptionally(exception -> {
@@ -336,6 +329,20 @@ public final class AcousticRuntime {
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
         AcousticSceneManager.clear();
+    }
+
+    /** Drops results measured with a previous GUI quality configuration. */
+    public static void configurationChanged() {
+        generation++;
+        if (pendingBatch != null) {
+            pendingBatch.cancel(false);
+            pendingBatch = null;
+        }
+        prePlayContext = null;
+        latestProbe = null;
+        ROOM_PROBE_CACHE.clear();
+        SOURCE_ROOM_PROBE_CACHE.clear();
+        cancelPreparedComputations();
     }
 
     private static void switchLevel(ClientLevel level) {
@@ -541,16 +548,10 @@ public final class AcousticRuntime {
         if (ageMilliseconds > tuning.maxResultAgeMilliseconds()) {
             return;
         }
-        Vec3 currentPosition = new Vec3(
-                request.sound().getX(),
-                request.sound().getY(),
-                request.sound().getZ()
-        );
-        double maximumMovement = tuning.maxSourceMovement();
-        if (currentPosition.distanceToSqr(request.source())
-                > maximumMovement * maximumMovement) {
-            return;
-        }
+        // Completed traces form an ordered stream of physical snapshots. A fixed
+        // movement cutoff can starve a fast source by rejecting every completion. Keep
+        // each valid snapshot, then let the already-running next snapshot replace it;
+        // source sequencing prevents older work from overwriting newer geometry.
         handle.execute(channel -> apply(channel, result, submittedNanoseconds));
     }
 
@@ -594,9 +595,13 @@ public final class AcousticRuntime {
         OpenALAcousticEffects.applySequenced(source, result, sequence);
     }
 
-    private static void applyOnsetCorrection(Channel channel, AcousticResult result) {
+    private static void applyOnsetCorrection(
+            Channel channel,
+            AcousticResult result,
+            long sequence
+    ) {
         int source = ((ChannelAccessor) channel).acousticsystem$getSource();
-        OpenALAcousticEffects.applyOnsetCorrection(source, result);
+        OpenALAcousticEffects.applyOnsetCorrection(source, result, sequence);
     }
 
     private static RoomProbe cachedRoomProbe(
