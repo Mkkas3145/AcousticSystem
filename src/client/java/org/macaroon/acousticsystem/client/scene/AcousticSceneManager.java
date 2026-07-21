@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
+import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.scene.AcousticScene.SectionKey;
 
 import java.util.HashMap;
@@ -25,6 +26,11 @@ public final class AcousticSceneManager {
     private static long captureSequence;
     private static Set<SectionKey> lastRequiredSections = Set.of();
     private static AcousticScene lastScene;
+    private static BlockPos sparseProbeCell;
+    private static float sparseProbeDenseDistance;
+    private static float sparseProbeMaximumDistance;
+    private static int sparseProbeRayCount;
+    private static Set<SectionKey> sparseProbeSections = Set.of();
 
     private AcousticSceneManager() {
     }
@@ -66,6 +72,7 @@ public final class AcousticSceneManager {
             DIRTY_SECTIONS.clear();
             lastRequiredSections = Set.of();
             lastScene = null;
+            clearSparseProbe();
             revision++;
         }
 
@@ -138,7 +145,11 @@ public final class AcousticSceneManager {
         int sectionX = Math.floorDiv(pos.getX(), 16);
         int sectionY = Math.floorDiv(pos.getY(), 16);
         int sectionZ = Math.floorDiv(pos.getZ(), 16);
-        DIRTY_SECTIONS.add(new SectionKey(sectionX, sectionY, sectionZ));
+        SectionKey changedSection = new SectionKey(sectionX, sectionY, sectionZ);
+        DIRTY_SECTIONS.add(changedSection);
+        if (sparseProbeSections.contains(changedSection)) {
+            sparseProbeCell = null;
+        }
 
         int localX = Math.floorMod(pos.getX(), 16);
         int localY = Math.floorMod(pos.getY(), 16);
@@ -158,6 +169,7 @@ public final class AcousticSceneManager {
         DIRTY_SECTIONS.clear();
         lastRequiredSections = Set.of();
         lastScene = null;
+        clearSparseProbe();
         revision++;
     }
 
@@ -201,8 +213,10 @@ public final class AcousticSceneManager {
 
     private static Set<SectionKey> requiredSections(ClientLevel level, Vec3 listener, List<Vec3> sources) {
         Set<SectionKey> required = new HashSet<>();
-        double probeDistance = AcousticMaterialRegistry.tuning().roomProbeDistance();
+        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
+        double probeDistance = tuning.roomProbeDistance();
         addSphere(required, listener, probeDistance);
+        required.addAll(sparseProbeSections(level, listener, tuning));
         double probeDistanceSquared = probeDistance * probeDistance;
         for (Vec3 source : sources) {
             // The listener sphere already contains the complete straight segment for
@@ -217,6 +231,90 @@ public final class AcousticSceneManager {
         int maximumSectionY = Math.floorDiv(level.getMinY() + level.getHeight() - 1, 16);
         required.removeIf(key -> key.y() < minimumSectionY || key.y() > maximumSectionY);
         return required;
+    }
+
+    /**
+     * Extends only the directions which leave the dense listener sphere. Copying a
+     * second complete sphere would make a 64-block probe roughly eight times larger;
+     * section corridors retain the far walls needed by the worker while empty space
+     * remains represented by a few cheap palette copies.
+     */
+    private static Set<SectionKey> sparseProbeSections(
+            ClientLevel level,
+            Vec3 listener,
+            AcousticTuning tuning
+    ) {
+        float denseDistance = tuning.roomProbeDistance();
+        float maximumDistance = tuning.adaptiveRoomProbeDistance();
+        int rayCount = Math.min(256, tuning.roomRayCount());
+        BlockPos listenerCell = BlockPos.containing(listener);
+        if (listenerCell.equals(sparseProbeCell)
+                && denseDistance == sparseProbeDenseDistance
+                && maximumDistance == sparseProbeMaximumDistance
+                && rayCount == sparseProbeRayCount) {
+            return sparseProbeSections;
+        }
+
+        Set<SectionKey> sections = new HashSet<>();
+        int elevationSamples = Math.max(4, (int) Math.round(Math.sqrt(rayCount / 4.0)));
+        int azimuthSamples = Math.max(8, (int) Math.ceil(rayCount / (double) elevationSamples));
+        int minimumSectionY = Math.floorDiv(level.getMinY(), 16);
+        int maximumSectionY = Math.floorDiv(level.getMinY() + level.getHeight() - 1, 16);
+        Map<SectionKey, Boolean> emptySections = new HashMap<>();
+        for (int row = 0; row < elevationSamples; row++) {
+            double y = -1.0 + (row + 0.5) * 2.0 / elevationSamples;
+            double horizontal = Math.sqrt(Math.max(0.0, 1.0 - y * y));
+            double phase = (row & 1) == 0 ? 0.0 : Math.PI / azimuthSamples;
+            for (int column = 0; column < azimuthSamples; column++) {
+                double azimuth = column * Math.PI * 2.0 / azimuthSamples + phase;
+                Vec3 direction = new Vec3(
+                        Math.cos(azimuth) * horizontal,
+                        y,
+                        Math.sin(azimuth) * horizontal
+                );
+                SectionKey previous = null;
+                for (double distance = denseDistance + 4.0;
+                     distance <= maximumDistance + 1.0E-6;
+                     distance += 4.0) {
+                    Vec3 point = listener.add(direction.scale(distance));
+                    SectionKey key = SectionKey.fromBlock(
+                            Mth.floor(point.x), Mth.floor(point.y), Mth.floor(point.z)
+                    );
+                    if (key.equals(previous)) {
+                        continue;
+                    }
+                    previous = key;
+                    if (key.y() < minimumSectionY || key.y() > maximumSectionY
+                            || !isAvailable(level, key)) {
+                        break;
+                    }
+                    sections.add(key);
+                    boolean empty = emptySections.computeIfAbsent(key, section -> {
+                        int sectionIndex = level.getSectionIndexFromSectionY(section.y());
+                        return level.getChunk(section.x(), section.z())
+                                .getSection(sectionIndex)
+                                .hasOnlyAir();
+                    });
+                    if (!empty) {
+                        break;
+                    }
+                }
+            }
+        }
+        sparseProbeCell = listenerCell.immutable();
+        sparseProbeDenseDistance = denseDistance;
+        sparseProbeMaximumDistance = maximumDistance;
+        sparseProbeRayCount = rayCount;
+        sparseProbeSections = Set.copyOf(sections);
+        return sparseProbeSections;
+    }
+
+    private static void clearSparseProbe() {
+        sparseProbeCell = null;
+        sparseProbeDenseDistance = 0.0F;
+        sparseProbeMaximumDistance = 0.0F;
+        sparseProbeRayCount = 0;
+        sparseProbeSections = Set.of();
     }
 
     private static void addSphere(Set<SectionKey> target, Vec3 center, double radius) {

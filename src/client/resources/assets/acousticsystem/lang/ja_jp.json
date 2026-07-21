@@ -81,7 +81,7 @@
   "acousticsystem.options.late_reverb_cutoff": "残響エネルギーしきい値",
   "acousticsystem.options.late_reverb_cutoff.tooltip": "経路のエネルギーがこの値を下回ると残響追跡を終了します。",
   "acousticsystem.options.room_probe_distance": "空間探索距離 (ブロック)",
-  "acousticsystem.options.room_probe_distance.tooltip": "壁と開口部を探すためにリスナーから探索する最大距離です。",
+  "acousticsystem.options.room_probe_distance.tooltip": "リスナー周辺を精密に探索する範囲です。境界を越えた方向は疎な探索でさらに遠くまで追跡します。",
   "acousticsystem.options.room_opening_contrast": "開口部の深度差",
   "acousticsystem.options.room_opening_contrast.tooltip": "周囲の表面よりどれだけ深い方向を開口部として認識するかを設定します。",
   "acousticsystem.options.room_opening_area": "開口面積の倍率",

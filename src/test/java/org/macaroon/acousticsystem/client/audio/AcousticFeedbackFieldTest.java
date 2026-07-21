@@ -1,6 +1,8 @@
 package org.macaroon.acousticsystem.client.audio;
 
 import net.minecraft.world.phys.Vec3;
+import org.macaroon.acousticsystem.client.simulation.DirectionalArrivalField;
+import org.macaroon.acousticsystem.client.simulation.EarlyReflection;
 import org.junit.jupiter.api.Test;
 import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 
@@ -99,6 +101,34 @@ class AcousticFeedbackFieldTest {
     }
 
     @Test
+    void earlyReflectionPreservesMaterialLowFrequencyColoration() {
+        EarlyReflection neutral = new EarlyReflection(
+                1.0F, 1.0F, 1.0F, 0.0F,
+                Vec3.ZERO, DirectionalArrivalField.EMPTY
+        );
+        EarlyReflection porousWoodLike = new EarlyReflection(
+                1.0F, 0.20F, 1.0F, 0.0F,
+                Vec3.ZERO, DirectionalArrivalField.EMPTY
+        );
+
+        double neutralLowEnergy = earlyDelayToneEnergy(neutral, 100.0F);
+        double coloredLowEnergy = earlyDelayToneEnergy(porousWoodLike, 100.0F);
+        double neutralMidEnergy = earlyDelayToneEnergy(neutral, 1_000.0F);
+        double coloredMidEnergy = earlyDelayToneEnergy(porousWoodLike, 1_000.0F);
+
+        assertTrue(
+                coloredLowEnergy < neutralLowEnergy * 0.45,
+                () -> "The reflected low shelf was discarded: neutral="
+                        + neutralLowEnergy + ", colored=" + coloredLowEnergy
+        );
+        assertTrue(
+                coloredMidEnergy > neutralMidEnergy * 0.55,
+                () -> "The material low shelf must not turn into broadband attenuation: neutral="
+                        + neutralMidEnergy + ", colored=" + coloredMidEnergy
+        );
+    }
+
+    @Test
     void fullOpenAlVoiceCountRendersInsideTheAudioDeadline() {
         AcousticFeedbackField[] fields = new AcousticFeedbackField[255];
         for (int index = 0; index < fields.length; index++) {
@@ -129,6 +159,27 @@ class AcousticFeedbackFieldTest {
                 field.process(0.0F, 0.75F);
             }
         }
+    }
+
+    private static double earlyDelayToneEnergy(
+            EarlyReflection reflection,
+            float frequency
+    ) {
+        SoftwareAcousticMixer.EarlyDelay delay = new SoftwareAcousticMixer.EarlyDelay();
+        delay.configure(reflection, 1.0F, Vec3.ZERO, 1.0F);
+        double energy = 0.0;
+        int samples = SoftwareAcousticMixer.OUTPUT_RATE;
+        for (int sample = 0; sample < samples; sample++) {
+            float input = (float) Math.sin(
+                    2.0 * Math.PI * frequency * sample
+                            / SoftwareAcousticMixer.OUTPUT_RATE
+            );
+            float output = delay.process(input);
+            if (sample > samples / 10) {
+                energy += output * output;
+            }
+        }
+        return energy;
     }
 
     private static float unpackLeft(long packed) {

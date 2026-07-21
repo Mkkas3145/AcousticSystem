@@ -809,14 +809,18 @@ public final class SoftwareAcousticMixer {
         }
     }
 
-    private static final class EarlyDelay {
+    static final class EarlyDelay {
         private static final int CAPACITY = 16_384;
+        private static final float LOW_SPLIT = onePoleCoefficient(250.0F);
+        private static final float HIGH_SPLIT = onePoleCoefficient(4_000.0F);
         private float[] delay;
         private int write;
         private float currentDelayFrames;
         private float targetDelayFrames;
         private float currentGain;
         private float targetGain;
+        private float currentLowFrequency = 1.0F;
+        private float targetLowFrequency = 1.0F;
         private float currentHighFrequency = 1.0F;
         private float targetHighFrequency = 1.0F;
         private float currentLeftPan = 0.70710677F;
@@ -830,10 +834,11 @@ public final class SoftwareAcousticMixer {
         private float targetDirectionY;
         private float targetDirectionZ;
         private float response = 0.001F;
-        private float lowPassState;
+        private float lowSplitState;
+        private float highSplitState;
         private int remainingFrames;
 
-        private void configure(
+        void configure(
                 EarlyReflection reflection,
                 float transportGain,
                 Vec3 listenerDirection,
@@ -846,6 +851,9 @@ public final class SoftwareAcousticMixer {
             );
             targetGain = clamp(
                     reflection.gain() * transportGain, 0.0F, 1.0F
+            );
+            targetLowFrequency = clamp(
+                    reflection.lowFrequencyGain(), 0.0F, 1.0F
             );
             targetHighFrequency = clamp(
                     reflection.highFrequencyGain(), 0.0F, 1.0F
@@ -861,6 +869,7 @@ public final class SoftwareAcousticMixer {
                 delay = new float[CAPACITY];
                 currentDelayFrames = targetDelayFrames;
                 currentGain = targetGain;
+                currentLowFrequency = targetLowFrequency;
                 currentHighFrequency = targetHighFrequency;
                 currentLeftPan = targetLeftPan;
                 currentRightPan = targetRightPan;
@@ -870,12 +879,15 @@ public final class SoftwareAcousticMixer {
             }
         }
 
-        private float process(float input) {
+        float process(float input) {
             if (delay == null) {
                 return 0.0F;
             }
             currentDelayFrames += (targetDelayFrames - currentDelayFrames) * response;
             currentGain += (targetGain - currentGain) * response;
+            currentLowFrequency += (
+                    targetLowFrequency - currentLowFrequency
+            ) * response;
             currentHighFrequency += (
                     targetHighFrequency - currentHighFrequency
             ) * response;
@@ -895,10 +907,16 @@ public final class SoftwareAcousticMixer {
             int second = (first + 1) % CAPACITY;
             float delayed = delay[first] + (delay[second] - delay[first]) * (read - first);
             write = (write + 1) % CAPACITY;
-            lowPassState += (delayed - lowPassState) * (
-                    0.04F + currentHighFrequency * 0.94F
-            );
-            float sample = lowPassState * currentGain;
+            lowSplitState += (delayed - lowSplitState) * LOW_SPLIT;
+            highSplitState += (delayed - highSplitState) * HIGH_SPLIT;
+            float low = lowSplitState;
+            float middle = highSplitState - low;
+            float high = delayed - highSplitState;
+            float sample = (
+                    low * currentLowFrequency
+                            + middle
+                            + high * currentHighFrequency
+            ) * currentGain;
             if (Math.abs(input) > 1.0E-7F) {
                 remainingFrames = Math.max(remainingFrames, (int) Math.ceil(targetDelayFrames) + 2);
             } else if (remainingFrames > 0) {
@@ -932,7 +950,15 @@ public final class SoftwareAcousticMixer {
         }
 
         private boolean hasPendingEnergy() {
-            return remainingFrames > 0 || Math.abs(lowPassState) > 1.0E-7F;
+            return remainingFrames > 0
+                    || Math.abs(lowSplitState) > 1.0E-7F
+                    || Math.abs(highSplitState) > 1.0E-7F;
+        }
+
+        private static float onePoleCoefficient(float cutoff) {
+            return 1.0F - (float) Math.exp(
+                    -2.0 * Math.PI * cutoff / OUTPUT_RATE
+            );
         }
     }
 

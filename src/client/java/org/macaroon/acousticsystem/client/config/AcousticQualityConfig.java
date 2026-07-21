@@ -19,6 +19,7 @@ import java.util.function.UnaryOperator;
 public final class AcousticQualityConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String FILE_NAME = "acousticsystem.json";
+    private static final int CURRENT_CONFIG_VERSION = 2;
     private static volatile Settings settings = Settings.fromPreset(QualityPreset.HIGH);
     private static volatile long revision;
 
@@ -33,7 +34,9 @@ public final class AcousticQualityConfig {
         }
         try (Reader reader = Files.newBufferedReader(path)) {
             StoredSettings stored = GSON.fromJson(reader, StoredSettings.class);
-            settings = stored == null ? Settings.fromPreset(QualityPreset.HIGH) : stored.validated();
+            settings = stored == null
+                    ? Settings.fromPreset(QualityPreset.HIGH)
+                    : migrate(stored, stored.validated());
             revision++;
         } catch (Exception exception) {
             AcousticSystem.LOGGER.warn("Could not read {}; using the high quality preset", path, exception);
@@ -104,7 +107,19 @@ public final class AcousticQualityConfig {
 
     static Settings deserialize(String json) {
         StoredSettings stored = GSON.fromJson(json, StoredSettings.class);
-        return stored == null ? Settings.fromPreset(QualityPreset.HIGH) : stored.validated();
+        return stored == null
+                ? Settings.fromPreset(QualityPreset.HIGH)
+                : migrate(stored, stored.validated());
+    }
+
+    private static Settings migrate(StoredSettings stored, Settings loaded) {
+        if (stored.version < 2
+                && Math.abs(loaded.physics().maxDecayTime() - 3.0F) < 1.0E-6F) {
+            return loaded.withPhysics(
+                    loaded.physics().with(PhysicsParameter.MAX_DECAY_TIME, 8.0F)
+            );
+        }
+        return loaded;
     }
 
     public static AcousticTuning apply(AcousticTuning base) {
@@ -511,6 +526,7 @@ public final class AcousticQualityConfig {
     }
 
     private static final class StoredSettings {
+        private int version;
         private String preset;
         private boolean customized;
         private Boolean enabled;
@@ -543,6 +559,7 @@ public final class AcousticQualityConfig {
 
         private static StoredSettings from(Settings settings) {
             StoredSettings stored = new StoredSettings();
+            stored.version = CURRENT_CONFIG_VERSION;
             stored.preset = settings.preset().serializedName();
             stored.customized = settings.customized();
             stored.enabled = settings.enabled();

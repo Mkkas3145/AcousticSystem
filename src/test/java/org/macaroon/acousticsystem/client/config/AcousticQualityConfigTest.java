@@ -131,4 +131,19 @@ class AcousticQualityConfigTest {
 
         assertEquals(original.validated(), restored);
     }
+
+    @Test
+    void legacyThreeSecondDefaultMigratesToThePhysicalCavernLimit() {
+        Settings legacySettings = Settings.fromPreset(QualityPreset.HIGH)
+                .withPhysics(PhysicsSettings.DEFAULT.with(
+                        PhysicsParameter.MAX_DECAY_TIME,
+                        3.0F
+                ));
+        String legacyJson = AcousticQualityConfig.serialize(legacySettings)
+                .replaceFirst("\\s*\\\"version\\\"\\s*:\\s*2\\s*,", "");
+
+        Settings migrated = AcousticQualityConfig.deserialize(legacyJson);
+
+        assertEquals(8.0F, migrated.physics().maxDecayTime(), 1.0E-6F);
+    }
 }

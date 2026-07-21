@@ -16,7 +16,7 @@
     "enclosed_room_send": 1.0,
     "acoustic_response_time_ms": 8.0,
     "max_result_age_ms": 500,
-    "max_decay_time": 3.0,
+    "max_decay_time": 8.0,
     "room_ray_count": 256,
     "source_room_ray_count": 128,
     "room_probe_distance": 32.0,

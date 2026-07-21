@@ -81,7 +81,7 @@
   "acousticsystem.options.late_reverb_cutoff": "Reverb Energy Cutoff",
   "acousticsystem.options.late_reverb_cutoff.tooltip": "Stops tracing a reverb path when its energy falls below this value.",
   "acousticsystem.options.room_probe_distance": "Room Probe Range (blocks)",
-  "acousticsystem.options.room_probe_distance.tooltip": "Maximum listener-centered distance searched for walls and openings.",
+  "acousticsystem.options.room_probe_distance.tooltip": "Dense listener-centered search range. Escaping directions continue farther with sparse probes.",
   "acousticsystem.options.room_opening_contrast": "Opening Depth Contrast",
   "acousticsystem.options.room_opening_contrast.tooltip": "How much deeper a direction must be than nearby surfaces to count as an opening.",
   "acousticsystem.options.room_opening_area": "Opening Area Scale",

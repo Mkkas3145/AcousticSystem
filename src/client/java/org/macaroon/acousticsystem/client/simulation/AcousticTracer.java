@@ -365,6 +365,7 @@ public final class AcousticTracer {
                 ),
                 new EarlyReflection(
                         reflections.gain(),
+                        reflections.lowFrequencyGain(),
                         reflections.highFrequencyGain(),
                         reflections.delay(),
                         reflections.pan(),
@@ -410,7 +411,7 @@ public final class AcousticTracer {
         MediumSample listenerMedium = sampleMedium(level, listener);
         AcousticTuning tuning = AcousticMaterialRegistry.tuning();
         RoomRayGrid grid = roomRayGrid(requestedRayCount);
-        double probeDistance = tuning.roomProbeDistance();
+        double probeDistance = tuning.adaptiveRoomProbeDistance();
         SurfaceHit[] hits = new SurfaceHit[grid.directions().length];
         double[] distances = new double[hits.length];
         double[] openingBoundaries = new double[hits.length];
@@ -598,7 +599,11 @@ public final class AcousticTracer {
                         listenerMedium.profile(),
                         listenerMedium.material(),
                         listenerMedium.weight(),
-                        Mth.clamp(leakage.reverberationTimeSeconds(), 0.12F, 4.0F)
+                        Mth.clamp(
+                                leakage.reverberationTimeSeconds(),
+                                0.12F,
+                                tuning.maxDecayTime()
+                        )
                 );
         float reflectionDelay = Mth.clamp(lateReverb.earlyDelay(), 0.0F, 0.3F);
         float lateDelay = Mth.clamp(lateReverb.lateDelay(), 0.0F, 0.1F);
@@ -635,7 +640,11 @@ public final class AcousticTracer {
                 roomGain,
                 lateReverb.highFrequencyGain(),
                 lowFrequencyGain,
-                Mth.clamp(lateReverb.decayTime(), 0.12F, 4.0F),
+                Mth.clamp(
+                        lateReverb.decayTime(),
+                        0.12F,
+                        tuning.maxDecayTime()
+                ),
                 lateReverb.decayHighFrequencyRatio(),
                 lateReverb.decayLowFrequencyRatio(),
                 Mth.clamp(
@@ -2853,20 +2862,21 @@ public final class AcousticTracer {
                     1.0F
             );
         }
-        float low = meanBands(accumulated, 0, 4);
-        float high = meanBands(accumulated, 4, 8);
+        float low = pairEnergy(accumulated, 0);
+        float high = pairEnergy(accumulated, 6);
+        // OpenAL's band-pass shelves can only attenuate around one broadband anchor.
+        // Preserve the strongest traced pair as that anchor, then retain the actual
+        // low/high ratios instead of discarding material-dependent bass transmission.
+        float reflectionAnchor = spectralAnchor(accumulated);
         Vec3 reflectionPan = directionPower > 1.0E-12
                 && arrivalDirectionSum.lengthSqr() > 1.0E-10
                 ? arrivalDirectionSum.normalize()
                 : Vec3.ZERO;
         return new ReflectionResult(
                 accumulated,
-                Mth.clamp(
-                        weightedEnergy(accumulated),
-                        0.0F,
-                        0.90F
-                ),
-                Mth.clamp(high / Math.max(low, 0.01F), 0.05F, 1.0F),
+                Mth.clamp(reflectionAnchor, 0.0F, 0.90F),
+                Mth.clamp(low / Math.max(reflectionAnchor, 0.01F), 0.02F, 1.0F),
+                Mth.clamp(high / Math.max(reflectionAnchor, 0.01F), 0.02F, 1.0F),
                 (float) (directionPower > 1.0E-12
                         ? delayPowerSum / directionPower
                         : 0.0),
@@ -4323,6 +4333,7 @@ public final class AcousticTracer {
     record ReflectionResult(
             float[] bands,
             float gain,
+            float lowFrequencyGain,
             float highFrequencyGain,
             float delay,
             Vec3 pan,
@@ -4332,6 +4343,7 @@ public final class AcousticTracer {
             return new ReflectionResult(
                     new float[AcousticBands.COUNT],
                     0.0F,
+                    1.0F,
                     1.0F,
                     0.0F,
                     Vec3.ZERO,

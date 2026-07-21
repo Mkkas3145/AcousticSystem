@@ -54,7 +54,7 @@ public record AcousticTuning(
             1.0F,
             8.0F,
             500,
-            3.0F,
+            8.0F,
             256,
             128,
             32.0F,
@@ -193,6 +193,15 @@ public record AcousticTuning(
 
     public double blocks(double meters) {
         return meters / metersPerBlock;
+    }
+
+    /**
+     * The configured range is the dense listener volume. Rays which leave that volume
+     * continue through sparse section corridors so a far cavern wall is not mistaken
+     * for an outdoor opening.
+     */
+    public float adaptiveRoomProbeDistance() {
+        return Math.min(128.0F, roomProbeDistance * 2.0F);
     }
 
     private static float readOpeningAreaScale(JsonObject object, float fallback) {

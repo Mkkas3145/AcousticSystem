@@ -56,7 +56,7 @@ final class LateReverbTracer {
         );
         int rayCount = Math.min(tuning.lateReverbRayCount(), directionGrid.length);
         int maxBounces = tuning.lateReverbMaxBounces();
-        double maximumSegmentDistance = tuning.roomProbeDistance();
+        double maximumSegmentDistance = tuning.adaptiveRoomProbeDistance();
         double histogramDuration = Math.max(
                 0.64,
                 maxBounces * tuning.meters(maximumSegmentDistance) / soundSpeed

@@ -810,7 +810,7 @@ public final class OpenALAcousticEffects {
             // already travelling toward the reflected arrival must still reach it.
             EXTEfx.alFilterf(
                     state.earlyReflectionFilter,
-                    EXTEfx.AL_LOWPASS_GAIN,
+                    EXTEfx.AL_BANDPASS_GAIN,
                     0.0F
             );
             AL11.alSource3i(
@@ -837,12 +837,17 @@ public final class OpenALAcousticEffects {
         }
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
-                EXTEfx.AL_LOWPASS_GAIN,
+                EXTEfx.AL_BANDPASS_GAIN,
                 mix.inputGain()
         );
         EXTEfx.alFilterf(
                 state.earlyReflectionFilter,
-                EXTEfx.AL_LOWPASS_GAINHF,
+                EXTEfx.AL_BANDPASS_GAINLF,
+                mix.lowFrequencyGain()
+        );
+        EXTEfx.alFilterf(
+                state.earlyReflectionFilter,
+                EXTEfx.AL_BANDPASS_GAINHF,
                 mix.highFrequencyGain()
         );
         AL11.alSource3i(
@@ -947,7 +952,7 @@ public final class OpenALAcousticEffects {
                 ? createLowPass(0.04F, 1.0F)
                 : 0;
         int earlyReflectionFilter = advancedEaxReverb && !SoftwareAcousticMixer.available()
-                ? createLowPass(0.0F, 1.0F)
+                ? createBandPass(0.0F, 1.0F, 1.0F)
                 : 0;
         return new SourceState(
                 directFilter, reverbFilter, sourceRoomFilter,
@@ -2031,8 +2036,14 @@ public final class OpenALAcousticEffects {
         }
     }
 
-    private record EarlyFieldMix(float inputGain, float highFrequencyGain) {
-        private static final EarlyFieldMix SILENT = new EarlyFieldMix(0.0F, 1.0F);
+    private record EarlyFieldMix(
+            float inputGain,
+            float lowFrequencyGain,
+            float highFrequencyGain
+    ) {
+        private static final EarlyFieldMix SILENT = new EarlyFieldMix(
+                0.0F, 1.0F, 1.0F
+        );
 
         private static EarlyFieldMix from(SourceState state) {
             float reflectionInput = state.earlyReflection.gain()
@@ -2041,6 +2052,7 @@ public final class OpenALAcousticEffects {
                     ? SILENT
                     : new EarlyFieldMix(
                             reflectionInput,
+                            state.earlyReflection.lowFrequencyGain(),
                             state.earlyReflection.highFrequencyGain()
                     );
         }
@@ -2483,6 +2495,11 @@ public final class OpenALAcousticEffects {
             beginEarlyDirectionalTransition(targetReflection, now);
             earlyReflection = new EarlyReflection(
                     lerp(earlyReflection.gain(), targetReflection.gain(), amount),
+                    lerp(
+                            earlyReflection.lowFrequencyGain(),
+                            targetReflection.lowFrequencyGain(),
+                            amount
+                    ),
                     lerp(
                             earlyReflection.highFrequencyGain(),
                             targetReflection.highFrequencyGain(),

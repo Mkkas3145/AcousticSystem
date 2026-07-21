@@ -32,6 +32,11 @@ class AcousticMaterialDefaultsTest {
         assertTrue(materials.size() >= 17);
         assertTrue(reflectedPower(stone, 3) > 0.95F);
         assertTrue(reflectedPower(metal, 3) > reflectedPower(stone, 3));
+        assertTrue(
+                reflectedPairGain(wood, 0) / reflectedAnchor(wood)
+                        < reflectedPairGain(stone, 0) / reflectedAnchor(stone) - 0.05F,
+                "Wood's low-frequency transmission must remain distinguishable from stone reflections"
+        );
         assertTrue(reflectedPower(wool, 3) < 0.11F);
         assertTrue(wool.absorption(3) > sand.absorption(3));
         assertTrue(sand.absorption(3) > wood.absorption(3));
@@ -213,6 +218,19 @@ class AcousticMaterialDefaultsTest {
                 1.0F - material.absorption(band)
                         - material.transmission(band) * material.transmission(band)
         );
+    }
+
+    private static float reflectedPairGain(AcousticMaterial material, int firstBand) {
+        return ((float) Math.sqrt(reflectedPower(material, firstBand))
+                + (float) Math.sqrt(reflectedPower(material, firstBand + 1))) * 0.5F;
+    }
+
+    private static float reflectedAnchor(AcousticMaterial material) {
+        float anchor = 0.0F;
+        for (int band = 0; band < AcousticBands.COUNT; band += 2) {
+            anchor = Math.max(anchor, reflectedPairGain(material, band));
+        }
+        return anchor;
     }
 
     private static AcousticMaterial materialFor(JsonArray materials, String selector) {

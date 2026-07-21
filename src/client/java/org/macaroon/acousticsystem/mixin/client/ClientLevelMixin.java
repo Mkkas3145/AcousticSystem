@@ -9,20 +9,23 @@ import org.macaroon.acousticsystem.client.scene.AcousticSceneManager;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientLevel.class)
 abstract class ClientLevelMixin {
-    @Inject(method = "setBlock", at = @At("RETURN"))
+    /**
+     * Level#setBlock invokes this virtual renderer hook after every real state change.
+     * Server-verified command packets deliberately call Level#setBlock directly and
+     * therefore bypass ClientLevel#setBlock, which was the old injection point.
+     */
+    @Inject(method = "setBlocksDirty", at = @At("TAIL"))
     private void acousticsystem$invalidateSection(
             BlockPos pos,
-            BlockState state,
-            int flags,
-            int recursionLeft,
-            CallbackInfoReturnable<Boolean> cir
+            BlockState oldState,
+            BlockState newState,
+            CallbackInfo ci
     ) {
-        if (cir.getReturnValue()) {
+        if (oldState != newState) {
             AcousticSceneManager.markDirty((ClientLevel) (Object) this, pos);
         }
     }

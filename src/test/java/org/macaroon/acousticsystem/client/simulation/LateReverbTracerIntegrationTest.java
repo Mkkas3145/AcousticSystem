@@ -39,16 +39,46 @@ class LateReverbTracerIntegrationTest {
                 position.getY() <= -8 || position.getY() >= 16
                         || position.getX() <= -18 || position.getX() >= 18
                         || position.getZ() <= -18 || position.getZ() >= 18;
+        SolidGeometry widerCavern = position ->
+                position.getY() <= -8 || position.getY() >= 16
+                        || position.getX() <= -35 || position.getX() >= 35
+                        || position.getZ() <= -35 || position.getZ() >= 35;
         LateReverbTracer.Estimate houseEstimate = trace(house);
         LateReverbTracer.Estimate cavernEstimate = trace(cavern);
         RoomProbe houseProbe = AcousticTracer.probeRoom(new TestWorld(house), LISTENER);
         RoomProbe cavernProbe = AcousticTracer.probeRoom(new TestWorld(cavern), LISTENER);
+        RoomProbe widerCavernProbe = AcousticTracer.probeRoom(new TestWorld(widerCavern), LISTENER);
         RoomAcoustics houseRoom = houseProbe.acoustics();
         RoomAcoustics cavernRoom = cavernProbe.acoustics();
+        RoomAcoustics widerCavernRoom = widerCavernProbe.acoustics();
 
         assertTrue(houseRoom.decayTime() < cavernRoom.decayTime() * 0.55F);
         assertTrue(houseEstimate.earlyDelay() < cavernEstimate.earlyDelay() * 0.35F);
         assertTrue(houseRoom.density() > cavernRoom.density());
+        assertTrue(
+                cavernRoom.gain() < houseRoom.gain() * 0.50F,
+                () -> "A larger absorption area must lower the diffuse field level: house="
+                        + houseRoom + ", cavern=" + cavernRoom
+        );
+        assertTrue(
+                cavernRoom.gain() > 0.12F
+                        && cavernRoom.lateReverbGain() > 0.75F,
+                () -> "A large enclosed cavern must keep an audible long tail instead of "
+                        + "collapsing to a weak dry sound: " + cavernRoom
+        );
+        assertTrue(
+                widerCavernProbe.openings().isEmpty(),
+                () -> "A sealed cavern wall beyond the dense probe radius was mistaken "
+                        + "for an outdoor opening: " + widerCavernProbe.openings()
+        );
+        assertTrue(
+                widerCavernRoom.decayTime() > cavernRoom.decayTime() * 0.90F
+                        && widerCavernRoom.reflectionsDelay()
+                        > cavernRoom.reflectionsDelay() * 1.25F
+                        && widerCavernRoom.lateReverbGain() > 0.70F,
+                () -> "The wider cavern must become quieter and later without losing its tail: medium="
+                        + cavernRoom + ", wider=" + widerCavernRoom
+        );
     }
 
     @Test
@@ -191,7 +221,7 @@ class LateReverbTracerIntegrationTest {
             firstHits[ray] = AcousticTracer.firstSurface(
                 world,
                 listener,
-                listener.add(DIRECTIONS[ray].scale(tuning.roomProbeDistance()))
+                listener.add(DIRECTIONS[ray].scale(tuning.adaptiveRoomProbeDistance()))
             );
         }
         return LateReverbTracer.trace(

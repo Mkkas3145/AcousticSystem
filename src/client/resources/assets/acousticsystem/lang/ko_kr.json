@@ -81,7 +81,7 @@
   "acousticsystem.options.late_reverb_cutoff": "잔향 에너지 종료값",
   "acousticsystem.options.late_reverb_cutoff.tooltip": "경로 에너지가 이 값보다 작아지면 해당 잔향 추적을 끝냅니다.",
   "acousticsystem.options.room_probe_distance": "공간 탐색 거리 (블록)",
-  "acousticsystem.options.room_probe_distance.tooltip": "벽과 출구를 찾기 위해 청취 위치에서 탐색하는 최대 거리입니다.",
+  "acousticsystem.options.room_probe_distance.tooltip": "청취 위치 주변을 정밀 탐색하는 거리입니다. 경계를 벗어난 방향은 희소 탐색으로 더 멀리 이어집니다.",
   "acousticsystem.options.room_opening_contrast": "출구 깊이 대비",
   "acousticsystem.options.room_opening_contrast.tooltip": "주변 표면보다 얼마나 깊어야 출구로 인식할지 정합니다.",
   "acousticsystem.options.room_opening_area": "출구 흡음 면적 배율",
