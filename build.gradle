@@ -3,11 +3,27 @@ plugins {
 	id 'maven-publish'
 }
 
+def minecraftProfiles = [
+		'26.1.2': [fabricApi: '0.149.1+26.1.2', fabricApiMinimum: '0.149.1'],
+		'26.2'  : [fabricApi: '0.155.2+26.2', fabricApiMinimum: '0.155.2']
+]
+def requestedMinecraftVersion = providers.gradleProperty('target_minecraft_version')
+def targetMinecraftVersion = requestedMinecraftVersion.orElse(minecraft_version).get()
+def targetProfile = minecraftProfiles[targetMinecraftVersion]
+if (targetProfile == null) {
+	throw new GradleException(
+			"Unsupported Minecraft version '${targetMinecraftVersion}'. "
+					+ "Supported versions: ${minecraftProfiles.keySet().join(', ')}"
+	)
+}
+
 version = project.mod_version
 group = project.maven_group
 
 base {
-	archivesName = project.archives_base_name
+	archivesName = requestedMinecraftVersion.isPresent()
+			? "${project.archives_base_name}-${targetMinecraftVersion}"
+			: project.archives_base_name
 }
 
 loom {
@@ -26,9 +42,9 @@ repositories {
 }
 
 dependencies {
-	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	minecraft "com.mojang:minecraft:${targetMinecraftVersion}"
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${targetProfile.fabricApi}"
 	testImplementation "org.junit.jupiter:junit-jupiter:5.11.4"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.11.4"
 }
@@ -42,9 +58,69 @@ sourceSets.test.runtimeClasspath += sourceSets.client.output
 
 processResources {
 	inputs.property "version", project.version
+	inputs.property "minecraft_version", targetMinecraftVersion
+	inputs.property "fabric_api_minimum", targetProfile.fabricApiMinimum
+	inputs.property "java_minimum", 25
 	filesMatching("fabric.mod.json") {
-		expand "version": project.version
+		expand(
+				"version": project.version,
+				"minecraft_version": targetMinecraftVersion,
+				"fabric_api_minimum": targetProfile.fabricApiMinimum,
+				"java_minimum": 25
+		)
 	}
+}
+
+processClientResources {
+	inputs.property "java_compatibility_level", "JAVA_25"
+	filesMatching("acousticsystem.client.mixins.json") {
+		expand("java_compatibility_level": "JAVA_25")
+	}
+}
+
+def wrapperCommand = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+		? ['cmd', '/c', file('gradlew.bat').absolutePath]
+		: [file('gradlew').absolutePath]
+
+tasks.register('buildMinecraft2612', Exec) {
+	group = 'build'
+	description = 'Builds AcousticSystem for Minecraft 26.1.2.'
+	workingDir projectDir
+	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.1.2']
+}
+
+tasks.register('buildMinecraft262', Exec) {
+	group = 'build'
+	description = 'Builds AcousticSystem for Minecraft 26.2.'
+	workingDir projectDir
+	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.2']
+}
+
+tasks.register('buildMinecraft12111', Exec) {
+	group = 'build'
+	description = 'Builds AcousticSystem for Minecraft 1.21.11.'
+	workingDir projectDir
+	commandLine wrapperCommand + [
+			'-p', file('versions/1.21.11').absolutePath, 'build'
+	]
+}
+
+tasks.named('buildMinecraft2612') {
+	mustRunAfter project.tasks.named('buildMinecraft262')
+}
+
+tasks.named('buildMinecraft12111') {
+	mustRunAfter project.tasks.named('buildMinecraft2612')
+}
+
+tasks.register('buildAllMinecraftVersions') {
+	group = 'build'
+	description = 'Builds and tests every supported Minecraft version.'
+	dependsOn(
+			project.tasks.named('buildMinecraft262'),
+			project.tasks.named('buildMinecraft2612'),
+			project.tasks.named('buildMinecraft12111')
+	)
 }
 
 tasks.withType(JavaCompile).configureEach {

@@ -39,7 +39,7 @@ public final class SoundPhysicsScreen extends OptionsSubScreen {
                         Component.translatable("acousticsystem.options.enabled"),
                         (button, value) -> AcousticQualityConfig.setEnabled(value)
                 );
-        list.addBig(enabled);
+        OptionsListCompat.addBig(list, enabled);
 
         list.addHeader(Component.translatable("acousticsystem.options.quality"));
         CycleButton<QualityPreset> preset = CycleButton.builder(
@@ -54,7 +54,7 @@ public final class SoundPhysicsScreen extends OptionsSubScreen {
                         Component.translatable("acousticsystem.options.preset"),
                         (button, value) -> AcousticQualityConfig.applyPreset(value)
                 );
-        list.addBig(preset);
+        OptionsListCompat.addBig(list, preset);
 
         Button details = Button.builder(
                         Component.translatable("acousticsystem.options.details"),
@@ -64,7 +64,7 @@ public final class SoundPhysicsScreen extends OptionsSubScreen {
                         "acousticsystem.options.details.tooltip"
                 )))
                 .build();
-        list.addBig(details);
+        OptionsListCompat.addBig(list, details);
 
         Button resetAll = Button.builder(
                         Component.translatable("acousticsystem.options.reset_all"),
@@ -77,7 +77,7 @@ public final class SoundPhysicsScreen extends OptionsSubScreen {
                         "acousticsystem.options.reset_all.tooltip"
                 )))
                 .build();
-        list.addBig(resetAll);
+        OptionsListCompat.addBig(list, resetAll);
     }
 
     @Override

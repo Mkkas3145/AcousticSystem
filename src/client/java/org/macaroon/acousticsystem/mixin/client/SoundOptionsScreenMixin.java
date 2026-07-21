@@ -8,6 +8,7 @@ import net.minecraft.client.gui.screens.options.OptionsSubScreen;
 import net.minecraft.client.gui.screens.options.SoundOptionsScreen;
 import net.minecraft.network.chat.Component;
 import org.macaroon.acousticsystem.client.screen.SoundPhysicsScreen;
+import org.macaroon.acousticsystem.client.screen.OptionsListCompat;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -21,7 +22,7 @@ abstract class SoundOptionsScreenMixin extends OptionsSubScreen {
 
     @Inject(method = "addOptions", at = @At("TAIL"))
     private void acousticsystem$addSoundPhysicsButton(CallbackInfo ci) {
-        list.addBig(Button.builder(
+        OptionsListCompat.addBig(list, Button.builder(
                         Component.translatable("acousticsystem.options.title"),
                         button -> minecraft.setScreenAndShow(new SoundPhysicsScreen(
                                 (Screen) (Object) this,

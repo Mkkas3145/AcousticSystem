@@ -60,13 +60,12 @@ class OpenALConvolutionSmokeTest {
 
         int callbackBuffer = AL10.alGenBuffers();
         int callbackSource = AL10.alGenSources();
-        SOFTCallbackBufferType silenceCallback = new SOFTCallbackBufferType() {
-            @Override
-            public int invoke(long userptr, long sampledata, int numbytes) {
-                MemoryUtil.memSet(sampledata, 0, numbytes);
-                return numbytes;
-            }
-        };
+        SOFTCallbackBufferType silenceCallback = SOFTCallbackBufferType.create(
+                (userptr, sampledata, numbytes) -> {
+                    MemoryUtil.memSet(sampledata, 0, numbytes);
+                    return numbytes;
+                }
+        );
         SOFTCallbackBuffer.alBufferCallbackSOFT(
                 callbackBuffer,
                 EXTFloat32.AL_FORMAT_STEREO_FLOAT32,

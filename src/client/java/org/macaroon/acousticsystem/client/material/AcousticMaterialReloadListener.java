@@ -4,10 +4,11 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import net.fabricmc.fabric.api.resource.v1.reloader.SimpleReloadListener;
 import net.minecraft.resources.Identifier;
-import net.minecraft.server.packs.resources.PreparableReloadListener;
 import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+import net.minecraft.server.packs.resources.SimplePreparableReloadListener;
+import net.minecraft.util.profiling.ProfilerFiller;
 import org.macaroon.acousticsystem.AcousticSystem;
 
 import java.io.Reader;
@@ -16,12 +17,12 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
-public final class AcousticMaterialReloadListener extends SimpleReloadListener<AcousticMaterialReloadListener.Prepared> {
+public final class AcousticMaterialReloadListener extends SimplePreparableReloadListener<AcousticMaterialReloadListener.Prepared> {
     private static final Gson GSON = new Gson();
 
     @Override
-    protected Prepared prepare(PreparableReloadListener.SharedState state) {
-        Map<Identifier, Resource> resources = state.resourceManager().listResources(
+    protected Prepared prepare(ResourceManager resourceManager, ProfilerFiller profiler) {
+        Map<Identifier, Resource> resources = resourceManager.listResources(
                 "acoustic_materials",
                 id -> id.getPath().endsWith(".json")
         );
@@ -106,7 +107,7 @@ public final class AcousticMaterialReloadListener extends SimpleReloadListener<A
     }
 
     @Override
-    protected void apply(Prepared prepared, PreparableReloadListener.SharedState state) {
+    protected void apply(Prepared prepared, ResourceManager resourceManager, ProfilerFiller profiler) {
         AcousticMaterialRegistry.replace(
                 prepared.defaultMaterial(),
                 prepared.defaultFluidMaterial(),

@@ -1,0 +1,110 @@
+plugins {
+    id 'net.fabricmc.fabric-loom-remap' version '1.17.16'
+    id 'maven-publish'
+}
+
+def sharedRoot = file('../..')
+def sharedProperties = new Properties()
+file('../../gradle.properties').withInputStream { sharedProperties.load(it) }
+
+version = sharedProperties.getProperty('mod_version')
+group = sharedProperties.getProperty('maven_group')
+
+base {
+    archivesName = "${sharedProperties.getProperty('archives_base_name')}-1.21.11"
+}
+
+loom {
+	splitEnvironmentSourceSets()
+}
+
+sourceSets {
+    main {
+        java.setSrcDirs([file('../../src/main/java')])
+        resources.setSrcDirs([file('../../src/main/resources')])
+    }
+    client {
+        java.setSrcDirs([file('../../src/client/java')])
+        resources.setSrcDirs([file('../../src/client/resources')])
+    }
+    test {
+        java.setSrcDirs([file('../../src/test/java')])
+        resources.setSrcDirs([file('../../src/test/resources')])
+    }
+}
+
+loom {
+    mods {
+        "acousticsystem" {
+            sourceSet sourceSets.main
+            sourceSet sourceSets.client
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.11'
+    mappings loom.officialMojangMappings()
+    modImplementation 'net.fabricmc:fabric-loader:0.19.3'
+    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.141.2+1.21.11'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+sourceSets.test.compileClasspath += sourceSets.client.output
+sourceSets.test.runtimeClasspath += sourceSets.client.output
+
+processResources {
+    inputs.property 'version', project.version
+    inputs.property 'minecraft_version', '1.21.11'
+    inputs.property 'fabric_api_minimum', '0.141.2'
+    inputs.property 'java_minimum', 21
+    filesMatching('fabric.mod.json') {
+        expand(
+                'version': project.version,
+                'minecraft_version': '1.21.11',
+                'fabric_api_minimum': '0.141.2',
+                'java_minimum': 21
+        )
+    }
+}
+
+processClientResources {
+    inputs.property 'java_compatibility_level', 'JAVA_21'
+    filesMatching('acousticsystem.client.mixins.json') {
+        expand('java_compatibility_level': 'JAVA_21')
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.encoding = 'UTF-8'
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    from(file('../../LICENSE')) {
+        rename { "${it}_${project.name}" }
+    }
+}
+
+publishing {
+    publications {
+        create('mavenJava', MavenPublication) {
+            from components.java
+        }
+    }
+}

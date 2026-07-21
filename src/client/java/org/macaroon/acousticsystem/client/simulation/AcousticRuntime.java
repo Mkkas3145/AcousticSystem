@@ -14,6 +14,7 @@ import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
 import org.macaroon.acousticsystem.client.scene.AcousticSceneManager;
+import org.macaroon.acousticsystem.mixin.client.GameRendererAccessor;
 import org.macaroon.acousticsystem.mixin.client.ChannelAccessor;
 
 import java.util.ArrayList;
@@ -185,14 +186,18 @@ public final class AcousticRuntime {
         if (context == null || currentLevel != context.level()) {
             Minecraft minecraft = Minecraft.getInstance();
             if (!minecraft.isSameThread()
-                    || minecraft.level == null
-                    || !minecraft.gameRenderer.mainCamera().isInitialized()) {
+                    || minecraft.level == null) {
+                return;
+            }
+            var mainCamera = ((GameRendererAccessor) minecraft.gameRenderer)
+                    .acousticsystem$mainCamera();
+            if (!mainCamera.isInitialized()) {
                 return;
             }
             if (currentLevel != minecraft.level) {
                 switchLevel(minecraft.level);
             }
-            Vec3 listener = minecraft.gameRenderer.mainCamera().position();
+            Vec3 listener = mainCamera.position();
             Vec3 source = new Vec3(sound.getX(), sound.getY(), sound.getZ());
             AcousticScene initialScene = AcousticSceneManager.captureForImmediateSound(
                     minecraft.level,

@@ -1,8 +1,9 @@
 {
   "required": true,
   "package": "org.macaroon.acousticsystem.mixin.client",
-  "compatibilityLevel": "JAVA_25",
+  "compatibilityLevel": "${java_compatibility_level}",
   "client": [
+    "GameRendererAccessor",
     "ChannelAccessor",
     "ChannelMixin",
     "ClientLevelMixin",

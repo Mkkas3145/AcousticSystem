@@ -1,7 +1,6 @@
 package org.macaroon.acousticsystem.mixin.client;
 
 import com.mojang.blaze3d.audio.Library;
-import com.mojang.blaze3d.audio.DeviceList;
 import org.lwjgl.system.MemoryStack;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
 import org.macaroon.acousticsystem.client.audio.OpenALContextAttributes;
@@ -18,9 +17,6 @@ import java.nio.IntBuffer;
 abstract class LibraryMixin {
     @Inject(method = "init", at = @At("TAIL"))
     private void acousticsystem$initializeEffects(
-            String preferredDevice,
-            DeviceList devices,
-            boolean enableHrtf,
             CallbackInfo ci
     ) {
         SoftwareAcousticMixer.initialize();

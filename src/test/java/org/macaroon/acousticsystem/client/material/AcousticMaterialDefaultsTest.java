@@ -21,7 +21,7 @@ class AcousticMaterialDefaultsTest {
         JsonArray materials = root.getAsJsonArray("materials");
 
         AcousticMaterial stone = materialFor(materials, "#minecraft:mineable/pickaxe");
-        AcousticMaterial concrete = materialFor(materials, "#minecraft:concrete");
+        AcousticMaterial concrete = materialFor(materials, "minecraft:white_concrete");
         AcousticMaterial wood = materialFor(materials, "#minecraft:logs");
         AcousticMaterial sand = materialFor(materials, "#minecraft:sand");
         AcousticMaterial wool = materialFor(materials, "#minecraft:wool");
@@ -116,7 +116,7 @@ class AcousticMaterialDefaultsTest {
                 String path = "/data/minecraft/tags/block/"
                         + selector.substring("#minecraft:".length()) + ".json";
                 try (InputStream stream = AcousticMaterialDefaultsTest.class.getResourceAsStream(path)) {
-                    assertNotNull(stream, () -> "Missing Minecraft 26.2 tag " + selector);
+                    assertNotNull(stream, () -> "Missing Minecraft tag " + selector);
                 }
             }
         }

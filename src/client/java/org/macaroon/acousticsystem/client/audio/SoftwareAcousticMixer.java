@@ -69,21 +69,18 @@ public final class SoftwareAcousticMixer {
             // device requests its first real-time buffer. Otherwise the JVM may compile
             // the all-pass/FDN path on the first cave sound and miss that one deadline.
             AcousticFeedbackField.prewarm();
-            callback = new SOFTCallbackBufferType() {
-                @Override
-                public int invoke(long userptr, long sampledata, int numbytes) {
-                    long started = System.nanoTime();
-                    try {
-                        int written = render(sampledata, numbytes);
-                        recordCallbackDuration(started, numbytes);
-                        return written;
-                    } catch (Throwable failure) {
-                        callbackFailure = failure;
-                        MemoryUtil.memSet(sampledata, 0, numbytes);
-                        return numbytes;
-                    }
+            callback = SOFTCallbackBufferType.create((userptr, sampledata, numbytes) -> {
+                long started = System.nanoTime();
+                try {
+                    int written = render(sampledata, numbytes);
+                    recordCallbackDuration(started, numbytes);
+                    return written;
+                } catch (Throwable failure) {
+                    callbackFailure = failure;
+                    MemoryUtil.memSet(sampledata, 0, numbytes);
+                    return numbytes;
                 }
-            };
+            });
             // Begin a clean transaction: a stale error from another source must not be
             // mistaken for failure of an object which was actually created here.
             AL10.alGetError();

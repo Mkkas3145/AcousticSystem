@@ -32,15 +32,19 @@ abstract class ClientLevelMixin {
 
     @Inject(method = "onChunkLoaded", at = @At("TAIL"))
     private void acousticsystem$invalidateLoadedChunk(ChunkPos pos, CallbackInfo ci) {
-        AcousticSceneManager.markChunkDirty((ClientLevel) (Object) this, pos.x(), pos.z());
+        AcousticSceneManager.markChunkDirty(
+                (ClientLevel) (Object) this,
+                Math.floorDiv(pos.getMinBlockX(), 16),
+                Math.floorDiv(pos.getMinBlockZ(), 16)
+        );
     }
 
     @Inject(method = "unload", at = @At("HEAD"))
     private void acousticsystem$invalidateUnloadedChunk(LevelChunk chunk, CallbackInfo ci) {
         AcousticSceneManager.markChunkDirty(
                 (ClientLevel) (Object) this,
-                chunk.getPos().x(),
-                chunk.getPos().z()
+                Math.floorDiv(chunk.getPos().getMinBlockX(), 16),
+                Math.floorDiv(chunk.getPos().getMinBlockZ(), 16)
         );
     }
 

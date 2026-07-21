@@ -43,7 +43,7 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
                         value -> update(settings -> settings.withDiffraction(value))
                 )
         );
-        list.addBig(toggle(
+        OptionsListCompat.addBig(list, toggle(
                 "reverb", current.reverbEnabled(),
                 value -> update(settings -> settings.withReverb(value))
         ));
@@ -69,14 +69,14 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
                         value -> update(settings -> settings.withLateReverbBounces(value))
                 )
         );
-        list.addBig(slider(
+        OptionsListCompat.addBig(list, slider(
                 "diffraction_paths", 1, 8, 1, current.diffractionMaxPaths(),
                 value -> update(settings -> settings.withDiffractionPaths(value))
         ));
 
         PhysicsSettings physics = current.physics();
         list.addHeader(Component.translatable("acousticsystem.options.distance"));
-        list.addBig(toggle(
+        OptionsListCompat.addBig(list, toggle(
                 "realistic_distance", physics.realisticDistanceAttenuation(),
                 value -> AcousticQualityConfig.updatePhysics(
                         settings -> settings.withRealisticDistance(value)
@@ -89,7 +89,7 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
         );
 
         list.addHeader(Component.translatable("acousticsystem.options.atmosphere"));
-        list.addBig(toggle(
+        OptionsListCompat.addBig(list, toggle(
                 "atmospheric_absorption", physics.atmosphericAbsorptionEnabled(),
                 value -> AcousticQualityConfig.updatePhysics(
                         settings -> settings.withAtmosphericAbsorption(value)
@@ -190,7 +190,7 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
             if (index + 1 < parameters.length) {
                 list.addSmall(first, physicsSlider(parameters[index + 1]));
             } else {
-                list.addBig(first);
+                OptionsListCompat.addBig(list, first);
             }
         }
     }
