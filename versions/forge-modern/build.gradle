@@ -1,7 +1,7 @@
 plugins { id 'dev.architectury.loom' version '1.17.491' }
 
 def profiles = [
-        '1.21.11': [forge: '1.21.11-61.1.9', loader: '61', java: 21]
+        '1.21.11': [forge: '1.21.11-61.1.9', loader: '61', java: 21, resourcePack: 94]
 ]
 def target = providers.gradleProperty('target_minecraft_version').orElse('1.21.11').get()
 def profile = profiles[target]
@@ -49,12 +49,16 @@ dependencies {
 tasks.withType(Test).configureEach { useJUnitPlatform() }
 processResources {
     inputs.properties(version: project.version, loader: profile.loader,
-            minecraft: target, java_level: profile.java)
+            minecraft: target, java_level: profile.java,
+            resource_pack_format: profile.resourcePack)
     filesMatching('META-INF/mods.toml') {
         expand(version: project.version, loader: profile.loader, minecraft: target)
     }
     filesMatching('acousticsystem.client.mixins.json') {
         expand(java_compatibility_level: "JAVA_${profile.java}")
+    }
+    filesMatching('pack.mcmeta') {
+        expand(resource_pack_format: profile.resourcePack)
     }
 }
 tasks.withType(JavaCompile).configureEach {

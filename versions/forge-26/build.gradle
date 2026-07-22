@@ -1,8 +1,8 @@
 plugins { id 'dev.architectury.loom-no-remap' version '1.17.491' }
 
 def profiles = [
-        '26.1.2': [forge: '26.1.2-64.0.12', loader: '64'],
-        '26.2'  : [forge: '26.2-65.0.6', loader: '65']
+        '26.1.2': [forge: '26.1.2-64.0.12', loader: '64', resourcePack: 101],
+        '26.2'  : [forge: '26.2-65.0.6', loader: '65', resourcePack: 107]
 ]
 def target = providers.gradleProperty('target_minecraft_version').orElse('26.2').get()
 def profile = profiles[target]
@@ -45,11 +45,15 @@ dependencies {
 }
 tasks.withType(Test).configureEach { useJUnitPlatform() }
 processResources {
+    inputs.property 'resource_pack_format', profile.resourcePack
     filesMatching('META-INF/mods.toml') {
         expand(version: project.version, loader: profile.loader, minecraft: target)
     }
     filesMatching('acousticsystem.client.mixins.json') {
         expand(java_compatibility_level: 'JAVA_25')
+    }
+    filesMatching('pack.mcmeta') {
+        expand(resource_pack_format: profile.resourcePack)
     }
 }
 tasks.withType(JavaCompile).configureEach {

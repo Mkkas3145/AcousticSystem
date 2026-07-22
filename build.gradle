@@ -4,8 +4,8 @@ plugins {
 }
 
 def minecraftProfiles = [
-		'26.1.2': [fabricApi: '0.149.1+26.1.2', fabricApiMinimum: '0.149.1'],
-		'26.2'  : [fabricApi: '0.155.2+26.2', fabricApiMinimum: '0.155.2']
+		'26.1.2': [fabricApi: '0.149.1+26.1.2', fabricApiMinimum: '0.149.1', resourcePack: 101],
+		'26.2'  : [fabricApi: '0.155.2+26.2', fabricApiMinimum: '0.155.2', resourcePack: 107]
 ]
 def requestedMinecraftVersion = providers.gradleProperty('target_minecraft_version')
 def targetMinecraftVersion = requestedMinecraftVersion.orElse(minecraft_version).get()
@@ -61,6 +61,7 @@ processResources {
 	inputs.property "minecraft_version", targetMinecraftVersion
 	inputs.property "fabric_api_minimum", targetProfile.fabricApiMinimum
 	inputs.property "java_minimum", 25
+	inputs.property "resource_pack_format", targetProfile.resourcePack
 	filesMatching("fabric.mod.json") {
 		expand(
 				"version": project.version,
@@ -68,6 +69,9 @@ processResources {
 				"fabric_api_minimum": targetProfile.fabricApiMinimum,
 				"java_minimum": 25
 		)
+	}
+	filesMatching("pack.mcmeta") {
+		expand("resource_pack_format": targetProfile.resourcePack)
 	}
 }
 

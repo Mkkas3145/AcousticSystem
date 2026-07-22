@@ -44,12 +44,16 @@ dependencies {
 tasks.withType(Test).configureEach { useJUnitPlatform() }
 processResources {
     inputs.properties(version: project.version, minecraft: target,
-            java_level: 21, mixin_config: 'acousticsystem.client.mixins.json')
+            java_level: 21, mixin_config: 'acousticsystem.client.mixins.json',
+            resource_pack_format: 94)
     filesMatching('META-INF/neoforge.mods.toml') {
         expand(version: project.version, minecraft: target)
     }
     filesMatching('acousticsystem.client.mixins.json') {
         expand(java_compatibility_level: 'JAVA_21')
+    }
+    filesMatching('pack.mcmeta') {
+        expand(resource_pack_format: 94)
     }
 }
 tasks.withType(JavaCompile).configureEach { options.release = 21; options.encoding = 'UTF-8' }

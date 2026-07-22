@@ -67,6 +67,7 @@ processResources {
     inputs.property 'minecraft_version', '1.21.11'
     inputs.property 'fabric_api_minimum', '0.141.2'
     inputs.property 'java_minimum', 21
+    inputs.property 'resource_pack_format', 94
     filesMatching('fabric.mod.json') {
         expand(
                 'version': project.version,
@@ -74,6 +75,9 @@ processResources {
                 'fabric_api_minimum': '0.141.2',
                 'java_minimum': 21
         )
+    }
+    filesMatching('pack.mcmeta') {
+        expand('resource_pack_format': 94)
     }
 }
 
