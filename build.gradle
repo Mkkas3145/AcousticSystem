@@ -82,46 +82,120 @@ def wrapperCommand = System.getProperty('os.name').toLowerCase(Locale.ROOT).cont
 		? ['cmd', '/c', file('gradlew.bat').absolutePath]
 		: [file('gradlew').absolutePath]
 
-tasks.register('buildMinecraft2612', Exec) {
+def registerNestedBuild = { String taskName, String label, String directory, List<String> arguments ->
+	tasks.register(taskName, Exec) {
+		group = 'build'
+		description = "Builds AcousticSystem for ${label}."
+		workingDir projectDir
+		commandLine wrapperCommand + ['-p', file(directory).absolutePath, 'build'] + arguments
+	}
+}
+
+def matrixBuilds = []
+matrixBuilds << registerNestedBuild('buildFabric12111', 'Fabric 1.21.11',
+		'versions/1.21.11', [])
+matrixBuilds << tasks.register('buildFabric2612', Exec) {
 	group = 'build'
-	description = 'Builds AcousticSystem for Minecraft 26.1.2.'
+	description = 'Builds AcousticSystem for Fabric 26.1.2.'
 	workingDir projectDir
 	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.1.2']
+	doLast {
+		copy {
+			from layout.buildDirectory.file("libs/AcousticSystem-26.1.2-${project.version}.jar")
+			into layout.buildDirectory.dir('staged-jars/26.1.2')
+		}
+	}
 }
-
-tasks.register('buildMinecraft262', Exec) {
+matrixBuilds << tasks.register('buildFabric262', Exec) {
 	group = 'build'
-	description = 'Builds AcousticSystem for Minecraft 26.2.'
+	description = 'Builds AcousticSystem for Fabric 26.2.'
 	workingDir projectDir
 	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.2']
+	doLast {
+		copy {
+			from layout.buildDirectory.file("libs/AcousticSystem-26.2-${project.version}.jar")
+			into layout.buildDirectory.dir('staged-jars/26.2')
+		}
+	}
 }
 
-tasks.register('buildMinecraft12111', Exec) {
+matrixBuilds << registerNestedBuild('buildForge12111', 'Forge 1.21.11',
+		'versions/forge-modern', [])
+['26.1.2', '26.2'].each { target ->
+	matrixBuilds << registerNestedBuild(
+			"buildForge${target.replace('.', '')}", "Forge ${target}",
+			'versions/forge-26', ["-Ptarget_minecraft_version=${target}"]
+	)
+}
+
+matrixBuilds << registerNestedBuild('buildNeoForge12111', 'NeoForge 1.21.11',
+		'versions/neoforge-modern', [])
+['26.1.2', '26.2'].each { target ->
+	matrixBuilds << registerNestedBuild(
+			"buildNeoForge${target.replace('.', '')}", "NeoForge ${target}",
+			'versions/neoforge-26', ["-Ptarget_minecraft_version=${target}"]
+	)
+}
+
+for (int index = 1; index < matrixBuilds.size(); index++) {
+	def currentBuild = matrixBuilds[index]
+	def previousBuild = matrixBuilds[index - 1]
+	currentBuild.configure {
+		mustRunAfter previousBuild
+	}
+}
+
+def releaseArtifacts = [
+		'1.21.11': [
+				[fabric: 'versions/1.21.11/build/libs/AcousticSystem-1.21.11'],
+				[forge: 'versions/forge-modern/build/libs/AcousticSystem-forge-1.21.11'],
+				[neoforge: 'versions/neoforge-modern/build/libs/AcousticSystem-neoforge-1.21.11']
+		],
+		'26.1.2': [
+				[fabric: 'build/staged-jars/26.1.2/AcousticSystem-26.1.2'],
+				[forge: 'versions/forge-26/build/libs/AcousticSystem-forge-26.1.2'],
+				[neoforge: 'versions/neoforge-26/build/libs/AcousticSystem-neoforge-26.1.2']
+		],
+		'26.2': [
+				[fabric: 'build/staged-jars/26.2/AcousticSystem-26.2'],
+				[forge: 'versions/forge-26/build/libs/AcousticSystem-forge-26.2'],
+				[neoforge: 'versions/neoforge-26/build/libs/AcousticSystem-neoforge-26.2']
+		]
+]
+
+def collectAllModJars = tasks.register('collectAllModJars') {
 	group = 'build'
-	description = 'Builds AcousticSystem for Minecraft 1.21.11.'
-	workingDir projectDir
-	commandLine wrapperCommand + [
-			'-p', file('versions/1.21.11').absolutePath, 'build'
-	]
-}
-
-tasks.named('buildMinecraft2612') {
-	mustRunAfter project.tasks.named('buildMinecraft262')
-}
-
-tasks.named('buildMinecraft12111') {
-	mustRunAfter project.tasks.named('buildMinecraft2612')
+	description = 'Collects the 16 loader artifacts into build/libs/<minecraft-version>.'
+	dependsOn(matrixBuilds)
+	doLast {
+		releaseArtifacts.each { minecraftTarget, artifacts ->
+			artifacts.each { artifact ->
+				def loader = artifact.keySet().first()
+				def sourceBase = artifact[loader]
+				def sourceJar = file("${sourceBase}-${project.version}.jar")
+				if (!sourceJar.isFile()) {
+					throw new GradleException("Missing built artifact: ${sourceJar}")
+				}
+				copy {
+					from sourceJar
+					into layout.buildDirectory.dir("libs/${minecraftTarget}")
+					rename { "AcousticSystem-${loader}-${minecraftTarget}-${project.version}.jar" }
+				}
+			}
+		}
+	}
 }
 
 tasks.register('buildAllMinecraftVersions') {
 	group = 'build'
-	description = 'Builds and tests every supported Minecraft version.'
-	dependsOn(
-			project.tasks.named('buildMinecraft262'),
-			project.tasks.named('buildMinecraft2612'),
-			project.tasks.named('buildMinecraft12111')
-	)
+	description = 'Builds, tests and collects all 9 supported Minecraft/loader combinations.'
+	dependsOn(collectAllModJars)
 }
+
+// Keep the original Fabric-only task names working for existing local scripts.
+tasks.register('buildMinecraft12111') { dependsOn tasks.named('buildFabric12111') }
+tasks.register('buildMinecraft2612') { dependsOn tasks.named('buildFabric2612') }
+tasks.register('buildMinecraft262') { dependsOn tasks.named('buildFabric262') }
 
 tasks.withType(JavaCompile).configureEach {
 	options.release = 25

@@ -11,16 +11,18 @@ import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects;
 import org.macaroon.acousticsystem.client.audio.OpenALAcousticEffects.TailFieldRequest;
 import org.macaroon.acousticsystem.client.config.AcousticQualityConfig;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
-import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.scene.AcousticScene;
 import org.macaroon.acousticsystem.client.scene.AcousticSceneManager;
 import org.macaroon.acousticsystem.mixin.client.GameRendererAccessor;
 import org.macaroon.acousticsystem.mixin.client.ChannelAccessor;
+import org.macaroon.acousticsystem.mixin.client.CameraAccessor;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
@@ -48,7 +50,7 @@ public final class AcousticRuntime {
     // of them and scales physical parallelism from the machine instead of imposing a
     // two-sound ceiling, while reserving cores for Minecraft and the audio thread.
     private static final int ONSET_WORKER_COUNT = Math.max(
-            2,
+            1,
             (Runtime.getRuntime().availableProcessors() - 2) / 2
     );
     private static final AtomicInteger ONSET_THREAD_SEQUENCE = new AtomicInteger();
@@ -78,6 +80,7 @@ public final class AcousticRuntime {
     // occurrence. Keeping only the newest cell entry caused rapid repeated sounds to
     // invalidate every earlier completion before it reached its own channel.
     private static final Map<SoundInstance, PreparedResult> PREPARED_SOUNDS = new ConcurrentHashMap<>();
+    private static final Map<SoundInstance, RealtimeState> REALTIME_STATES = new ConcurrentHashMap<>();
     private static volatile long generation;
     private static long lastDebugLogNanoseconds;
 
@@ -138,14 +141,6 @@ public final class AcousticRuntime {
 
         publishCompletedBatch(level, listener);
         long now = System.nanoTime();
-        // There is no fixed update clock. A completed snapshot is consumed immediately
-        // and the next immutable-world calculation is launched on the next available
-        // client observation. Static scenes are still re-evaluated continuously, while
-        // slow machines naturally apply back-pressure by keeping one batch in flight.
-        if (pendingBatch != null) {
-            return;
-        }
-
         List<TailFieldRequest> tailFields = OpenALAcousticEffects.tailFieldRequests();
         List<Vec3> sourcePositions = new ArrayList<>(
                 positionalSounds.size() + tailFields.size()
@@ -154,23 +149,36 @@ public final class AcousticRuntime {
         tailFields.stream().map(TailFieldRequest::position).forEach(sourcePositions::add);
         AcousticScene scene = AcousticSceneManager.capture(level, listener, sourcePositions);
         prePlayContext = new PrePlayContext(level, scene, listener, generation);
+        submitRealtimeUpdates(
+                scene, listener, positionalSounds, generation, now
+        );
         PREPARED_RESULTS.entrySet().removeIf(entry -> {
-            boolean expired = entry.getValue().generation() != generation
-                    || now - entry.getValue().computedNanoseconds()
+            PreparedResult prepared = entry.getValue();
+            boolean wrongGeneration = prepared.generation() != generation;
+            boolean completedAndExpired = prepared.computation().isDone()
+                    && now - prepared.computedNanoseconds()
                     > PREPARED_RESULT_RETENTION_NANOSECONDS;
-            if (expired) {
+            if (wrongGeneration) {
                 entry.getValue().computation().cancel(false);
             }
-            return expired;
+            return wrongGeneration || completedAndExpired;
         });
-        PREPARED_SOUNDS.entrySet().removeIf(entry ->
-                entry.getValue().generation() != generation
-                        || now - entry.getValue().computedNanoseconds()
-                        > PREPARED_RESULT_RETENTION_NANOSECONDS
-        );
+        PREPARED_SOUNDS.entrySet().removeIf(entry -> {
+            PreparedResult prepared = entry.getValue();
+            return prepared.generation() != generation
+                    || (prepared.computation().isDone()
+                    && now - prepared.computedNanoseconds()
+                    > PREPARED_RESULT_RETENTION_NANOSECONDS);
+        });
+        // The precise batch is deliberately back-pressured, but the latest-state
+        // transport line above is not. Movement and block edits therefore no longer
+        // wait behind a room probe or a large group of unrelated sounds.
+        if (pendingBatch != null) {
+            return;
+        }
         submitBatch(
                 level, scene, listener, positionalSounds, tailFields,
-                generation, channelAccess
+                generation, channelAccess, now
         );
     }
 
@@ -197,7 +205,7 @@ public final class AcousticRuntime {
             if (currentLevel != minecraft.level) {
                 switchLevel(minecraft.level);
             }
-            Vec3 listener = mainCamera.position();
+            Vec3 listener = ((CameraAccessor) (Object) mainCamera).acousticsystem$getPosition();
             Vec3 source = new Vec3(sound.getX(), sound.getY(), sound.getZ());
             AcousticScene initialScene = AcousticSceneManager.captureForImmediateSound(
                     minecraft.level,
@@ -223,7 +231,8 @@ public final class AcousticRuntime {
                 && isListenerResultCurrent(existing.listener(), context.listener())
                 && !existing.computation().isCancelled()
                 && !existing.computation().isCompletedExceptionally()
-                && now - existing.computedNanoseconds() <= PREPARED_RESULT_RETENTION_NANOSECONDS) {
+                && (!existing.computation().isDone()
+                || now - existing.computedNanoseconds() <= PREPARED_RESULT_RETENTION_NANOSECONDS)) {
             PREPARED_SOUNDS.put(sound, existing);
             return;
         }
@@ -246,7 +255,7 @@ public final class AcousticRuntime {
                             preparedContext.listener(),
                             sourceRoomProbe,
                             roomProbe,
-                            AcousticTracer.TraceQuality.BASIC
+                            AcousticTracer.TraceQuality.FULL
                     );
                 },
                 ONSET_WORKERS
@@ -275,10 +284,8 @@ public final class AcousticRuntime {
         }
 
         PreparedResult prepared = PREPARED_RESULTS.get(SourceCell.from(sourcePosition));
-        long now = System.nanoTime();
         if (prepared != null
-                && prepared.generation() == context.generation()
-                && now - prepared.computedNanoseconds() <= PREPARED_RESULT_RETENTION_NANOSECONDS) {
+                && prepared.generation() == context.generation()) {
             try {
                 AcousticResult result = prepared.computation().getNow(prepared.immediate());
                 OpenALAcousticEffects.prepareListenerRoomForOnset(result.reverbRoom());
@@ -353,6 +360,7 @@ public final class AcousticRuntime {
         ROOM_PROBE_CACHE.clear();
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
+        REALTIME_STATES.clear();
         AcousticSceneManager.clear();
     }
 
@@ -369,6 +377,7 @@ public final class AcousticRuntime {
         ROOM_PROBE_CACHE.clear();
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
+        REALTIME_STATES.clear();
     }
 
     private static void switchLevel(ClientLevel level) {
@@ -384,7 +393,95 @@ public final class AcousticRuntime {
         ROOM_PROBE_CACHE.clear();
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
+        REALTIME_STATES.clear();
         AcousticSceneManager.clear();
+    }
+
+    /**
+     * Coalesced latest-state transport. Each voice owns at most one running calculation
+     * and one replacement request, so high FPS cannot create an audio-work backlog.
+     * It runs the same requested physical trace quality as the continuous batch; there
+     * is no millisecond cutoff or fixed low-quality mode. A slower machine skips stale
+     * intermediate positions but never skips the newest position.
+     */
+    private static void submitRealtimeUpdates(
+            AcousticScene scene,
+            Vec3 listener,
+            List<SoundRequest> sounds,
+            long expectedGeneration,
+            long sequence
+    ) {
+        Set<SoundInstance> active = new HashSet<>(sounds.size());
+        for (SoundRequest sound : sounds) {
+            active.add(sound.sound());
+            RealtimeState state = REALTIME_STATES.computeIfAbsent(
+                    sound.sound(), ignored -> new RealtimeState()
+            );
+            RealtimeKey key = RealtimeKey.from(scene, listener, sound.source());
+            if (state.offer(new RealtimeRequest(
+                    key, scene, listener, sound, expectedGeneration, sequence
+            ))) {
+                ONSET_WORKERS.execute(() -> drainRealtime(sound.sound(), state));
+            }
+        }
+        REALTIME_STATES.entrySet().removeIf(entry ->
+                !active.contains(entry.getKey()) && entry.getValue().idle()
+        );
+    }
+
+    private static void drainRealtime(SoundInstance sound, RealtimeState state) {
+        while (true) {
+            RealtimeRequest request = state.take();
+            if (request == null) {
+                if (state.idle()) {
+                    REALTIME_STATES.remove(sound, state);
+                }
+                return;
+            }
+            SoundRequest source = request.sound();
+            ChannelAccess.ChannelHandle handle = source.handle();
+            if (handle == null || handle.isStopped()
+                    || request.generation() != generation) {
+                continue;
+            }
+            RoomProbe listenerProbe = realtimeRoomProbe(
+                    request.scene(), request.listener(), request.generation()
+            );
+            RoomProbe sourceProbe = cachedSourceRoomProbe(
+                    request.scene(), source.source(), request.generation(),
+                    request.sequence()
+            );
+            AcousticResult result = AcousticTracer.trace(
+                    request.scene(), source.source(), request.listener(),
+                    sourceProbe, listenerProbe, source.quality()
+            );
+            if (request.generation() != generation || handle.isStopped()) {
+                continue;
+            }
+            handle.execute(channel -> {
+                if (request.generation() == generation) {
+                    apply(channel, result, request.sequence());
+                }
+            });
+        }
+    }
+
+    private static RoomProbe realtimeRoomProbe(
+            AcousticScene scene,
+            Vec3 listener,
+            long expectedGeneration
+    ) {
+        CachedRoomProbe cached = ROOM_PROBE_CACHE.get(ProbeCell.from(listener));
+        if (cached != null
+                && cached.generation() == expectedGeneration
+                && cached.sceneRevision() == scene.revision()) {
+            return cached.probe();
+        }
+        ProbeSnapshot recent = latestProbe;
+        if (recent != null && recent.generation() == expectedGeneration) {
+            return recent.roomProbe();
+        }
+        return new RoomProbe(RoomAcoustics.OUTDOORS, List.of(), List.of());
     }
 
     private static void submitBatch(
@@ -394,9 +491,9 @@ public final class AcousticRuntime {
             List<SoundRequest> sounds,
             List<TailFieldRequest> tailFields,
             long batchGeneration,
-            ChannelAccess channelAccess
+            ChannelAccess channelAccess,
+            long submittedNanoseconds
     ) {
-        long submittedNanoseconds = System.nanoTime();
         CompletableFuture<RoomProbe> roomFuture = CompletableFuture.supplyAsync(
                 () -> cachedRoomProbe(scene, listener, batchGeneration, submittedNanoseconds),
                 WORKERS
@@ -465,6 +562,7 @@ public final class AcousticRuntime {
                                 request,
                                 result,
                                 batchGeneration,
+                                scene.revision(),
                                 listener,
                                 submittedNanoseconds
                             );
@@ -493,11 +591,6 @@ public final class AcousticRuntime {
             long submittedNanoseconds
     ) {
         if (batchGeneration != generation) {
-            return;
-        }
-        long ageMilliseconds = (System.nanoTime() - submittedNanoseconds) / 1_000_000L;
-        if (ageMilliseconds
-                > AcousticMaterialRegistry.tuning().maxResultAgeMilliseconds()) {
             return;
         }
         channelAccess.executeOnChannels(ignored ->
@@ -538,18 +631,12 @@ public final class AcousticRuntime {
                 );
                 lastDebugLogNanoseconds = System.nanoTime();
             }
-            AcousticTuning tuning = AcousticMaterialRegistry.tuning();
-            long ageMilliseconds = (System.nanoTime() - batch.submittedNanoseconds()) / 1_000_000L;
-            if (ageMilliseconds > tuning.maxResultAgeMilliseconds()) {
-                return;
-            }
-
             // Source results are delivered individually by their worker partition as
             // soon as they finish. The completed batch only commits the listener probe
             // and opens the next continuously sampled generation; it must not apply the
             // same coefficients a second time.
         } catch (CompletionException exception) {
-            AcousticSystem.LOGGER.warn("Asynchronous acoustic batch failed; retrying on the next client tick", exception.getCause());
+            AcousticSystem.LOGGER.warn("Asynchronous acoustic batch failed; retrying on the next client update", exception.getCause());
         }
     }
 
@@ -557,6 +644,7 @@ public final class AcousticRuntime {
             SoundRequest request,
             AcousticResult result,
             long batchGeneration,
+            long sceneRevision,
             Vec3 computedListener,
             long submittedNanoseconds
     ) {
@@ -567,12 +655,8 @@ public final class AcousticRuntime {
         PrePlayContext context = prePlayContext;
         if (context == null
                 || context.generation() != batchGeneration
+                || context.scene().revision() != sceneRevision
                 || !isListenerResultCurrent(computedListener, context.listener())) {
-            return;
-        }
-        AcousticTuning tuning = AcousticMaterialRegistry.tuning();
-        long ageMilliseconds = (System.nanoTime() - submittedNanoseconds) / 1_000_000L;
-        if (ageMilliseconds > tuning.maxResultAgeMilliseconds()) {
             return;
         }
         // Completed traces form an ordered stream of physical snapshots. A fixed
@@ -595,11 +679,6 @@ public final class AcousticRuntime {
         }
         Vec3 observedListener = latestObservedListener;
         if (observedListener == null) {
-            return;
-        }
-        long ageMilliseconds = (System.nanoTime() - sequence) / 1_000_000L;
-        if (ageMilliseconds
-                > AcousticMaterialRegistry.tuning().maxResultAgeMilliseconds()) {
             return;
         }
         // The room field belongs to the listener, not to a voice. ChannelHandle.execute
@@ -801,6 +880,72 @@ public final class AcousticRuntime {
                     Math.round(position.y * SCALE),
                     Math.round(position.z * SCALE)
             );
+        }
+    }
+
+    private record RealtimeKey(
+            long sceneRevision,
+            long listenerX,
+            long listenerY,
+            long listenerZ,
+            long sourceX,
+            long sourceY,
+            long sourceZ
+    ) {
+        private static RealtimeKey from(
+                AcousticScene scene, Vec3 listener, Vec3 source
+        ) {
+            return new RealtimeKey(
+                    scene.revision(),
+                    Double.doubleToLongBits(listener.x),
+                    Double.doubleToLongBits(listener.y),
+                    Double.doubleToLongBits(listener.z),
+                    Double.doubleToLongBits(source.x),
+                    Double.doubleToLongBits(source.y),
+                    Double.doubleToLongBits(source.z)
+            );
+        }
+    }
+
+    private record RealtimeRequest(
+            RealtimeKey key,
+            AcousticScene scene,
+            Vec3 listener,
+            SoundRequest sound,
+            long generation,
+            long sequence
+    ) {
+    }
+
+    private static final class RealtimeState {
+        private RealtimeKey mostRecentKey;
+        private RealtimeRequest pending;
+        private boolean running;
+
+        private synchronized boolean offer(RealtimeRequest request) {
+            if (request.key().equals(mostRecentKey)) {
+                return false;
+            }
+            mostRecentKey = request.key();
+            pending = request;
+            if (running) {
+                return false;
+            }
+            running = true;
+            return true;
+        }
+
+        private synchronized RealtimeRequest take() {
+            RealtimeRequest next = pending;
+            pending = null;
+            if (next == null) {
+                running = false;
+            }
+            return next;
+        }
+
+        private synchronized boolean idle() {
+            return !running && pending == null;
         }
     }
 

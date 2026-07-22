@@ -9,9 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AcousticRuntimeTest {
     @Test
-    void onsetParallelismScalesWithTheMachineInsteadOfStoppingAtTwo() {
+    void onsetParallelismScalesWithTheMachineWithoutForcingTwoWorkersOnSmallCpus() {
         int expected = Math.max(
-                2,
+                1,
                 (Runtime.getRuntime().availableProcessors() - 2) / 2
         );
         assertEquals(expected, AcousticRuntime.onsetWorkerCount());

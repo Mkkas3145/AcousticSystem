@@ -71,8 +71,11 @@ public final class AcousticScene implements BlockGetter {
         return section == null ? EMPTY_FLUID : section.fluid(pos.getX(), pos.getY(), pos.getZ());
     }
 
-    @Override
     public int getMinY() {
+        return minY;
+    }
+
+    public int getMinBuildHeight() {
         return minY;
     }
 

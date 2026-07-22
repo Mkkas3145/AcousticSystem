@@ -1,0 +1,68 @@
+plugins { id 'dev.architectury.loom' version '1.17.491' }
+
+def profiles = [
+        '1.21.11': [forge: '1.21.11-61.1.9', loader: '61', java: 21]
+]
+def target = providers.gradleProperty('target_minecraft_version').orElse('1.21.11').get()
+def profile = profiles[target]
+if (profile == null) throw new GradleException("Unsupported Forge target: ${target}")
+def sharedProperties = new Properties()
+file('../../gradle.properties').withInputStream { sharedProperties.load(it) }
+version = sharedProperties.getProperty('mod_version')
+group = sharedProperties.getProperty('maven_group')
+base { archivesName = "${sharedProperties.getProperty('archives_base_name')}-forge-${target}" }
+
+loom {
+    silentMojangMappingsLicense()
+    forge { mixinConfig 'acousticsystem.client.mixins.json' }
+}
+sourceSets {
+    main {
+        java.setSrcDirs([file('../../src/main/java'), file('../../src/client/java')])
+        java.exclude('org/macaroon/acousticsystem/fabric/**')
+        resources.setSrcDirs([
+                file('../../src/main/resources'), file('../../src/client/resources'),
+                file('../forge-modern-shared/src/main/resources')
+        ])
+        resources.exclude('fabric.mod.json')
+    }
+    test {
+        java.setSrcDirs([file('../../src/test/java')])
+        resources.setSrcDirs([file('../../src/test/resources')])
+        java.exclude(
+                'org/macaroon/acousticsystem/client/simulation/ActualWorldAcousticDiagnosticTest.java',
+                'org/macaroon/acousticsystem/client/simulation/AcousticTracerDiffractionIntegrationTest.java',
+                'org/macaroon/acousticsystem/client/simulation/AcousticTracerFluidIntegrationTest.java',
+                'org/macaroon/acousticsystem/client/simulation/LateReverbTracerIntegrationTest.java'
+        )
+    }
+}
+compileJava.source(fileTree('../forge-26-shared/src/main/java'))
+repositories { mavenCentral() }
+dependencies {
+    minecraft "com.mojang:minecraft:${target}"
+    mappings loom.officialMojangMappings()
+    forge "net.minecraftforge:forge:${profile.forge}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+tasks.withType(Test).configureEach { useJUnitPlatform() }
+processResources {
+    inputs.properties(version: project.version, loader: profile.loader,
+            minecraft: target, java_level: profile.java)
+    filesMatching('META-INF/mods.toml') {
+        expand(version: project.version, loader: profile.loader, minecraft: target)
+    }
+    filesMatching('acousticsystem.client.mixins.json') {
+        expand(java_compatibility_level: "JAVA_${profile.java}")
+    }
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release = profile.java
+    options.encoding = 'UTF-8'
+}
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.toVersion(profile.java)
+    targetCompatibility = JavaVersion.toVersion(profile.java)
+}

@@ -267,8 +267,11 @@ class LateReverbTracerIntegrationTest {
             return Fluids.EMPTY.defaultFluidState();
         }
 
-        @Override
         public int getMinY() {
+            return -64;
+        }
+
+        public int getMinBuildHeight() {
             return -64;
         }
 

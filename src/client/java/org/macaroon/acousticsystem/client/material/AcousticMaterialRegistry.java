@@ -1,9 +1,6 @@
 package org.macaroon.acousticsystem.client.material;
 
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.Identifier;
-import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluid;
@@ -107,22 +104,23 @@ public final class AcousticMaterialRegistry {
 
     public static final class Rule {
         private final String selector;
-        private final Identifier id;
-        private final TagKey<Block> tag;
+        private final String id;
+        private final boolean tag;
         private final AcousticMaterial material;
 
         public Rule(String selector, AcousticMaterial material) {
             this.selector = selector;
-            this.id = Identifier.parse(selector.startsWith("#") ? selector.substring(1) : selector);
-            this.tag = selector.startsWith("#") ? TagKey.create(Registries.BLOCK, id) : null;
+            this.id = selector.startsWith("#") ? selector.substring(1) : selector;
+            this.tag = selector.startsWith("#");
             this.material = material;
         }
 
         boolean matches(BlockState state) {
-            if (tag != null) {
-                return state.is(tag);
+            if (tag) {
+                return state.getBlock().builtInRegistryHolder().tags()
+                        .anyMatch(value -> value.location().toString().equals(id));
             }
-            return BuiltInRegistries.BLOCK.getKey(state.getBlock()).equals(id);
+            return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString().equals(id);
         }
 
         AcousticMaterial material() {
@@ -137,22 +135,23 @@ public final class AcousticMaterialRegistry {
 
     public static final class FluidRule {
         private final String selector;
-        private final Identifier id;
-        private final TagKey<Fluid> tag;
+        private final String id;
+        private final boolean tag;
         private final AcousticMaterial material;
 
         public FluidRule(String selector, AcousticMaterial material) {
             this.selector = selector;
-            this.id = Identifier.parse(selector.startsWith("#") ? selector.substring(1) : selector);
-            this.tag = selector.startsWith("#") ? TagKey.create(Registries.FLUID, id) : null;
+            this.id = selector.startsWith("#") ? selector.substring(1) : selector;
+            this.tag = selector.startsWith("#");
             this.material = material;
         }
 
         boolean matches(FluidState state) {
-            if (tag != null) {
-                return state.is(tag);
+            if (tag) {
+                return state.getType().builtInRegistryHolder().tags()
+                        .anyMatch(value -> value.location().toString().equals(id));
             }
-            return BuiltInRegistries.FLUID.getKey(state.getType()).equals(id);
+            return BuiltInRegistries.FLUID.getKey(state.getType()).toString().equals(id);
         }
 
         AcousticMaterial material() {

@@ -4,6 +4,7 @@
   "compatibilityLevel": "${java_compatibility_level}",
   "client": [
     "GameRendererAccessor",
+    "CameraAccessor",
     "ChannelAccessor",
     "ChannelMixin",
     "ClientLevelMixin",

@@ -6,6 +6,11 @@ import org.macaroon.acousticsystem.client.simulation.EarlyReflection;
 import org.junit.jupiter.api.Test;
 import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -57,6 +62,32 @@ class AcousticFeedbackFieldTest {
         assertTrue(earlyEnergy > 1.0E-8, "The delay network must emit the impulse");
         assertTrue(lateEnergy > 0.0, "RT60 energy must remain continuous in the tail");
         assertTrue(lateEnergy < earlyEnergy, "A passive room field must decay");
+    }
+
+    @Test
+    void callbackCannotObserveAPartiallyConstructedDelayNetwork() throws Exception {
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            for (int attempt = 0; attempt < 256; attempt++) {
+                AcousticFeedbackField field = new AcousticFeedbackField();
+                CountDownLatch start = new CountDownLatch(1);
+                Future<?> configure = workers.submit(() -> {
+                    await(start);
+                    field.configure(ROOM, 0.4F);
+                });
+                Future<?> render = workers.submit(() -> {
+                    await(start);
+                    for (int sample = 0; sample < 128; sample++) {
+                        field.process(sample == 0 ? 1.0F : 0.0F, 0.8F);
+                    }
+                });
+                start.countDown();
+                configure.get();
+                render.get();
+            }
+        } finally {
+            workers.shutdownNow();
+        }
     }
 
     @Test
@@ -184,6 +215,15 @@ class AcousticFeedbackFieldTest {
 
     private static float unpackLeft(long packed) {
         return Float.intBitsToFloat((int) (packed >>> 32));
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+        }
     }
 
     private static float unpackRight(long packed) {

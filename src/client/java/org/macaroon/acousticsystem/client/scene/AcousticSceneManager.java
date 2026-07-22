@@ -129,7 +129,7 @@ public final class AcousticSceneManager {
         });
         AcousticScene scene = new AcousticScene(
                 sceneSections,
-                level.getMinY(),
+                level.getSectionYFromSectionIndex(0) * 16,
                 level.getHeight(),
                 revision
         );
@@ -177,8 +177,9 @@ public final class AcousticSceneManager {
         if (currentLevel != level) {
             return;
         }
-        int minimumSectionY = Math.floorDiv(level.getMinY(), 16);
-        int maximumSectionY = Math.floorDiv(level.getMinY() + level.getHeight() - 1, 16);
+        int minimumY = level.getSectionYFromSectionIndex(0) * 16;
+        int minimumSectionY = Math.floorDiv(minimumY, 16);
+        int maximumSectionY = Math.floorDiv(minimumY + level.getHeight() - 1, 16);
         for (int sectionY = minimumSectionY; sectionY <= maximumSectionY; sectionY++) {
             DIRTY_SECTIONS.add(new SectionKey(chunkX, sectionY, chunkZ));
         }
@@ -227,8 +228,9 @@ public final class AcousticSceneManager {
             }
         }
 
-        int minimumSectionY = Math.floorDiv(level.getMinY(), 16);
-        int maximumSectionY = Math.floorDiv(level.getMinY() + level.getHeight() - 1, 16);
+        int minimumY = level.getSectionYFromSectionIndex(0) * 16;
+        int minimumSectionY = Math.floorDiv(minimumY, 16);
+        int maximumSectionY = Math.floorDiv(minimumY + level.getHeight() - 1, 16);
         required.removeIf(key -> key.y() < minimumSectionY || key.y() > maximumSectionY);
         return required;
     }
@@ -258,8 +260,9 @@ public final class AcousticSceneManager {
         Set<SectionKey> sections = new HashSet<>();
         int elevationSamples = Math.max(4, (int) Math.round(Math.sqrt(rayCount / 4.0)));
         int azimuthSamples = Math.max(8, (int) Math.ceil(rayCount / (double) elevationSamples));
-        int minimumSectionY = Math.floorDiv(level.getMinY(), 16);
-        int maximumSectionY = Math.floorDiv(level.getMinY() + level.getHeight() - 1, 16);
+        int minimumY = level.getSectionYFromSectionIndex(0) * 16;
+        int minimumSectionY = Math.floorDiv(minimumY, 16);
+        int maximumSectionY = Math.floorDiv(minimumY + level.getHeight() - 1, 16);
         Map<SectionKey, Boolean> emptySections = new HashMap<>();
         for (int row = 0; row < elevationSamples; row++) {
             double y = -1.0 + (row + 0.5) * 2.0 / elevationSamples;
@@ -367,6 +370,6 @@ public final class AcousticSceneManager {
 
     private static AcousticSection captureSection(ClientLevel level, SectionKey key) {
         int sectionIndex = level.getSectionIndexFromSectionY(key.y());
-        return new AcousticSection(level.getChunk(key.x(), key.z()).getSection(sectionIndex).copy());
+        return new AcousticSection(level.getChunk(key.x(), key.z()).getSection(sectionIndex));
     }
 }

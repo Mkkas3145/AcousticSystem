@@ -4,7 +4,6 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import net.minecraft.resources.Identifier;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraft.server.packs.resources.SimplePreparableReloadListener;
@@ -22,20 +21,22 @@ public final class AcousticMaterialReloadListener extends SimplePreparableReload
 
     @Override
     protected Prepared prepare(ResourceManager resourceManager, ProfilerFiller profiler) {
-        Map<Identifier, Resource> resources = resourceManager.listResources(
+        var resources = resourceManager.listResources(
                 "acoustic_materials",
-                id -> id.getPath().endsWith(".json")
+                id -> id.toString().endsWith(".json")
         );
-        List<Map.Entry<Identifier, Resource>> ordered = new ArrayList<>(resources.entrySet());
-        ordered.sort(Map.Entry.comparingByKey(Comparator.comparing(Identifier::toString)));
+        List<NamedResource> ordered = resources.entrySet().stream()
+                .map(entry -> new NamedResource(entry.getKey().toString(), entry.getValue()))
+                .sorted(Comparator.comparing(NamedResource::id))
+                .toList();
 
         AcousticMaterial defaultMaterial = AcousticMaterial.DEFAULT;
         AcousticMaterial defaultFluidMaterial = AcousticMaterial.DEFAULT_FLUID;
         AcousticTuning tuning = AcousticTuning.DEFAULT;
         List<AcousticMaterialRegistry.Rule> rules = new ArrayList<>();
         List<AcousticMaterialRegistry.FluidRule> fluidRules = new ArrayList<>();
-        for (Map.Entry<Identifier, Resource> entry : ordered) {
-            try (Reader reader = entry.getValue().openAsReader()) {
+        for (NamedResource entry : ordered) {
+            try (Reader reader = entry.resource().openAsReader()) {
                 JsonObject root = GSON.fromJson(reader, JsonObject.class);
                 AcousticMaterial fileDefault = defaultMaterial;
                 AcousticMaterial fileFluidDefault = defaultFluidMaterial;
@@ -100,7 +101,7 @@ public final class AcousticMaterialReloadListener extends SimplePreparableReload
                 fluidRules.addAll(fileFluidRules);
             } catch (Exception exception) {
                 AcousticSystem.LOGGER.error("Failed to load acoustic material file {} from pack {}",
-                        entry.getKey(), entry.getValue().sourcePackId(), exception);
+                        entry.id(), entry.resource().sourcePackId(), exception);
             }
         }
         return new Prepared(defaultMaterial, defaultFluidMaterial, tuning, rules, fluidRules);
@@ -124,7 +125,7 @@ public final class AcousticMaterialReloadListener extends SimplePreparableReload
 
     private static void validateSelector(String selector) {
         String id = selector.startsWith("#") ? selector.substring(1) : selector;
-        if (Identifier.tryParse(id) == null) {
+        if (!id.matches("[a-z0-9_.-]+:[a-z0-9/._-]+")) {
             throw new IllegalArgumentException("Invalid block or tag identifier: " + selector);
         }
     }
@@ -136,5 +137,8 @@ public final class AcousticMaterialReloadListener extends SimplePreparableReload
             List<AcousticMaterialRegistry.Rule> rules,
             List<AcousticMaterialRegistry.FluidRule> fluidRules
     ) {
+    }
+
+    private record NamedResource(String id, Resource resource) {
     }
 }

@@ -41,6 +41,12 @@ final class AcousticFeedbackField {
 
     private float[][] lines;
     private float[][] diffuserLines;
+    /**
+     * Publishes the complete delay network to the real-time callback. The control
+     * thread owns construction and coefficient initialization; the callback must not
+     * infer readiness from either array because the two allocations are independent.
+     */
+    private volatile boolean ready;
     private final float[] junction = new float[LINE_COUNT];
     private final float[] lowState = new float[LINE_COUNT];
     private final float[] highLowState = new float[LINE_COUNT];
@@ -92,11 +98,12 @@ final class AcousticFeedbackField {
     void configure(RoomAcoustics room, float inputGain) {
         RoomAcoustics next = room == null ? RoomAcoustics.OUTDOORS : room;
         if ((inputGain <= 1.0E-7F || next.gain() <= 1.0E-7F)
-                && lines == null) {
+                && !ready) {
             targetRoom = next;
             return;
         }
-        if (lines == null) {
+        boolean initialize = !ready;
+        if (initialize) {
             lines = new float[LINE_COUNT][CAPACITY];
             diffuserLines = new float[DIFFUSER_COUNT][DIFFUSER_CAPACITY];
             roomGain = next.gain();
@@ -173,12 +180,17 @@ final class AcousticFeedbackField {
             }
         }
         // Volatile publication comes last so the audio callback cannot combine the
-        // new room record with a partially written set of line coefficients.
+        // new room record with a partially written set of line coefficients. On the
+        // first configuration, ready is the final release-store for both buffer arrays
+        // and every scalar/target array initialized above.
         targetRoom = next;
+        if (initialize) {
+            ready = true;
+        }
     }
 
     long process(float input, float transportHighFrequency) {
-        if (lines == null) {
+        if (!ready) {
             return 0L;
         }
         decimationInput += input;
@@ -211,7 +223,7 @@ final class AcousticFeedbackField {
     }
 
     boolean hasPendingEnergy() {
-        return lines != null && remainingOutputFrames > 0;
+        return ready && remainingOutputFrames > 0;
     }
 
     private void processInternal(float input, float transportHighFrequency) {

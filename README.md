@@ -1,6 +1,6 @@
 # AcousticSystem
 
-Minecraft 1.21.11, 26.1.2와 26.2용 Fabric 사운드 모드입니다.
+Minecraft 1.21.11, 26.1.2와 26.2용 사운드 모드입니다.
 
 ## 기능
 
@@ -14,14 +14,13 @@ Minecraft 1.21.11, 26.1.2와 26.2용 Fabric 사운드 모드입니다.
 ## 요구 사항
 
 - Minecraft 1.21.11, 26.1.2 또는 26.2
-- Fabric Loader 0.19.3 이상
-- Minecraft 버전에 맞는 Fabric API
+- Fabric, Forge 또는 NeoForge
+- Fabric은 Minecraft 버전에 맞는 Fabric API 필요
 - Minecraft 1.21.11: Java 21 이상
 - Minecraft 26.1.2 및 26.2: Java 25 이상
 
 ## 빌드
 
-- 26.2: `./gradlew build`
-- 26.1.2: `./gradlew buildMinecraft2612`
-- 1.21.11: `./gradlew buildMinecraft12111`
-- 모두 빌드: `./gradlew buildAllMinecraftVersions`
+- 현재 Fabric 버전: `./gradlew build`
+- 전체 9개 조합: `./gradlew buildAllMinecraftVersions`
+- 로더와 버전별 작업은 `./gradlew tasks --group build`에서 확인할 수 있습니다.

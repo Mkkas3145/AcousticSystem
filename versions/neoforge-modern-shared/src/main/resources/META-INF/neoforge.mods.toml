@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+
+[[mods]]
+modId="acousticsystem"
+version="${version}"
+displayName="AcousticSystem"
+description='''Real-time sound occlusion, diffraction, reflection, reverb and fluid acoustics.'''
+displayTest="IGNORE_ALL_VERSION"
+
+[[mixins]]
+config="acousticsystem.client.mixins.json"
+
+[[dependencies.acousticsystem]]
+modId="neoforge"
+type="required"
+versionRange="[1,)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.acousticsystem]]
+modId="minecraft"
+type="required"
+versionRange="[${minecraft}]"
+ordering="NONE"
+side="CLIENT"

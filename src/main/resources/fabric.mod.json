@@ -9,8 +9,8 @@
   "license": "All-Rights-Reserved",
   "environment": "client",
   "entrypoints": {
-    "main": ["org.macaroon.acousticsystem.AcousticSystem"],
-    "client": ["org.macaroon.acousticsystem.client.AcousticSystemClient"]
+    "main": ["org.macaroon.acousticsystem.fabric.FabricAcousticSystem"],
+    "client": ["org.macaroon.acousticsystem.fabric.FabricAcousticSystemClient"]
   },
   "mixins": [
     {

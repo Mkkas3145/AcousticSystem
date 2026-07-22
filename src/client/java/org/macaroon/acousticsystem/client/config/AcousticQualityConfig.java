@@ -2,7 +2,6 @@ package org.macaroon.acousticsystem.client.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import net.fabricmc.loader.api.FabricLoader;
 import org.macaroon.acousticsystem.AcousticSystem;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 
@@ -22,11 +21,13 @@ public final class AcousticQualityConfig {
     private static final int CURRENT_CONFIG_VERSION = 2;
     private static volatile Settings settings = Settings.fromPreset(QualityPreset.HIGH);
     private static volatile long revision;
+    private static Path configDirectory = Path.of("config");
 
     private AcousticQualityConfig() {
     }
 
-    public static void load() {
+    public static void load(Path directory) {
+        configDirectory = directory.toAbsolutePath().normalize();
         Path path = configPath();
         if (!Files.isRegularFile(path)) {
             save();
@@ -162,7 +163,7 @@ public final class AcousticQualityConfig {
     }
 
     private static Path configPath() {
-        return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
+        return configDirectory.resolve(FILE_NAME);
     }
 
     public enum QualityPreset {
@@ -443,8 +444,8 @@ public final class AcousticQualityConfig {
                     safePreset, customized, enabled,
                     reflectionsEnabled, diffractionEnabled, reverbEnabled,
                     safeRoomRays, safeSourceRays, clampStep(lateReverbRayCount, 24, 512, 8),
-                    Math.clamp(lateReverbMaxBounces, 2, 16),
-                    Math.clamp(diffractionMaxPaths, 1, 8),
+                    clamp(lateReverbMaxBounces, 2, 16),
+                    clamp(diffractionMaxPaths, 1, 8),
                     (physics == null ? PhysicsSettings.DEFAULT : physics).validated()
             );
         }
@@ -520,9 +521,13 @@ public final class AcousticQualityConfig {
         }
 
         private static int clampStep(int value, int minimum, int maximum, int step) {
-            int clamped = Math.clamp(value, minimum, maximum);
+            int clamped = clamp(value, minimum, maximum);
             return minimum + Math.round((clamped - minimum) / (float) step) * step;
         }
+    }
+
+    private static int clamp(int value, int minimum, int maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 
     private static final class StoredSettings {

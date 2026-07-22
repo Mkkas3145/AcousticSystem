@@ -41,6 +41,13 @@ public final class AcousticTracer {
     private static final Vec3 POSITIVE_Y_NORMAL = new Vec3(0.0, 1.0, 0.0);
     private static final Vec3 NEGATIVE_Z_NORMAL = new Vec3(0.0, 0.0, -1.0);
     private static final Vec3 POSITIVE_Z_NORMAL = new Vec3(0.0, 0.0, 1.0);
+
+    private static AABB fluidBounds(FluidState state, BlockGetter level, BlockPos position) {
+        VoxelShape shape = state.getShape(level, position);
+        return shape.isEmpty()
+                ? new AABB(position)
+                : shape.bounds().move(position);
+    }
     // EAX exposes one aggregate early-reflection cluster. The tracer still examines all
     // sampled image paths and retains the strongest independent contributions; stopping
     // at the first four valid planes made an echo appear or disappear when candidate
@@ -1021,8 +1028,8 @@ public final class AcousticTracer {
 
         float[] power = new float[AcousticBands.COUNT];
         List<DirectionalArrivalField.Arrival> directionalArrivals = new ArrayList<>();
-        double bestDistance = evaluated.getFirst().pathDistance();
-        double bestAirDistance = evaluated.getFirst().airDistance();
+        double bestDistance = evaluated.get(0).pathDistance();
+        double bestAirDistance = evaluated.get(0).airDistance();
         // The air-cell solution is a topology-stable estimate of the same first-arrival
         // field, not another independent wave. Keep it as an energy floor rather than
         // power-summing it with edge paths. Its single A* arrival is deliberately not
@@ -1520,21 +1527,21 @@ public final class AcousticTracer {
         List<Vec3> adapted = new ArrayList<>(cachedPoints);
         if (airEndpointConnectorClear(level, source, firstInterior)) {
             adapted.set(0, source);
-        } else if (firstCollisionBounds(level, source, cachedPoints.getFirst()) == null) {
-            adapted.addFirst(source);
+        } else if (firstCollisionBounds(level, source, cachedPoints.get(0)) == null) {
+            adapted.add(0, source);
         } else {
             return null;
         }
         List<Vec3> arrivalSamples = new ArrayList<>(cached.arrivalSamples());
         if (airEndpointConnectorClear(level, listener, lastInterior)) {
             adapted.set(adapted.size() - 1, listener);
-        } else if (firstCollisionBounds(level, cachedPoints.getLast(), listener) == null) {
+        } else if (firstCollisionBounds(level, cachedPoints.get(cachedPoints.size() - 1), listener) == null) {
             // Incremental graph repair: an adjacent listener cell can remain connected
             // through the previous endpoint even when the newly drawn shortcut clips a
             // corner. Keeping that one valid edge avoids a full A* restart at every
             // voxel boundary and preserves the same arrival lobe while moving.
             adapted.add(listener);
-            arrivalSamples.add(cachedPoints.getLast());
+            arrivalSamples.add(cachedPoints.get(cachedPoints.size() - 1));
         } else {
             return null;
         }
@@ -1622,7 +1629,7 @@ public final class AcousticTracer {
                     if (adapted == null) {
                         continue;
                     }
-                    double endpointDistance = candidate.points().getLast()
+                    double endpointDistance = candidate.points().get(candidate.points().size() - 1)
                             .distanceToSqr(listener);
                     if (endpointDistance < bestEndpointDistance) {
                         bestEndpointDistance = endpointDistance;
@@ -2453,7 +2460,7 @@ public final class AcousticTracer {
 
         float[] bands = new float[AcousticBands.COUNT];
         AcousticMaterial firstMaterial = AcousticMaterialRegistry.find(
-                level.getBlockState(path.getFirst())
+                level.getBlockState(path.get(0))
         );
         AcousticMaterial previousMaterial = null;
         for (int band = 0; band < bands.length; band++) {
@@ -2485,7 +2492,7 @@ public final class AcousticTracer {
             previousMaterial = material;
         }
         AcousticMaterial finalMaterial = AcousticMaterialRegistry.find(
-                level.getBlockState(path.getLast())
+                level.getBlockState(path.get(path.size() - 1))
         );
         double structuralDistance = path.size() * tuning.metersPerBlock();
         double radiatedAirDistance = radiationPoint.distanceTo(listener);
@@ -2972,7 +2979,7 @@ public final class AcousticTracer {
         walkBlocks(from, to, (pos, endpoint) -> {
             FluidState fluidState = level.getFluidState(pos);
             if (!fluidState.isEmpty()) {
-                AABB fluidBounds = fluidState.getAABB(level, pos);
+                AABB fluidBounds = fluidBounds(fluidState, level, pos);
                 SegmentInterval interval = fluidBounds == null ? null : intersectSegment(fluidBounds, from, to);
                 if (interval != null && interval.end() - interval.start() > 1.0E-7) {
                     scratch.fluidSegments.add(new FluidSegment(
@@ -3020,17 +3027,21 @@ public final class AcousticTracer {
             for (int band = 0; band < bands.length; band++) {
                 bands[band] *= material.transmissionGain(band, pathLengthMeters);
             }
-            for (float band : bands) {
-                if (band > 0.001F) {
-                    return true;
-                }
-            }
-            return false;
+            // Keep walking after the first strongly insulating block. Stopping at an
+            // arbitrary amplitude floor made every additional wall disappear from the
+            // physical path, so one layer and a thick sealed shell produced the same
+            // transmission. Float underflow already provides the only numerical floor
+            // needed for a genuinely inaudible path.
+            return true;
         });
+        MediumSample startMedium = sampleMedium(level, from);
+        MediumSample endMedium = sampleMedium(level, to);
         FluidStats fluidStats = applyFluidSegments(
                 bands,
                 scratch.fluidSegments,
-                from.distanceTo(to)
+                from.distanceTo(to),
+                startMedium.weight(),
+                endMedium.weight()
         );
         // Atmospheric loss belongs to a transport segment, just like solid and fluid
         // loss. Applying it here keeps direct, bent, reflected and graph paths on the
@@ -3142,7 +3153,7 @@ public final class AcousticTracer {
         if (startState.isEmpty()) {
             return null;
         }
-        AABB startBounds = startState.getAABB(level, startPosition);
+        AABB startBounds = fluidBounds(startState, level, startPosition);
         if (startBounds == null || !startBounds.contains(from)) {
             return null;
         }
@@ -3158,7 +3169,7 @@ public final class AcousticTracer {
                 }
                 return false;
             }
-            AABB bounds = state.getAABB(level, position);
+            AABB bounds = fluidBounds(state, level, position);
             SegmentInterval interval = bounds == null ? null : intersectSegment(bounds, from, to);
             if (interval == null || interval.start() > contiguousEnd[0] + 1.0E-6) {
                 return false;
@@ -3254,7 +3265,7 @@ public final class AcousticTracer {
             }
             result[0] = new SurfaceHit(
                     hit.getLocation(),
-                    hit.getDirection().getUnitVec3(),
+                    new Vec3(hit.getDirection().getStepX(), hit.getDirection().getStepY(), hit.getDirection().getStepZ()),
                     shape.bounds().move(pos),
                     from.distanceTo(hit.getLocation()),
                     AcousticMaterialRegistry.find(state)
@@ -3507,7 +3518,7 @@ public final class AcousticTracer {
         if (fluidState.isEmpty()) {
             return new MediumSample(MediumProfile.AIR, null, 0.0F);
         }
-        AABB bounds = fluidState.getAABB(level, pos);
+        AABB bounds = fluidBounds(fluidState, level, pos);
         if (bounds == null || !bounds.contains(point)) {
             return new MediumSample(MediumProfile.AIR, null, 0.0F);
         }
@@ -3636,7 +3647,13 @@ public final class AcousticTracer {
         boolean visit(BlockPos pos, boolean endpoint);
     }
 
-    private static FluidStats applyFluidSegments(float[] bands, List<FluidSegment> segments, double rayDistance) {
+    private static FluidStats applyFluidSegments(
+            float[] bands,
+            List<FluidSegment> segments,
+            double rayDistance,
+            float startMediumWeight,
+            float endMediumWeight
+    ) {
         if (segments.isEmpty() || rayDistance <= 1.0E-7) {
             double airMeters = AcousticMaterialRegistry.tuning().meters(rayDistance);
             return new FluidStats(
@@ -3656,7 +3673,7 @@ public final class AcousticTracer {
         List<FluidSegment> merged = new ArrayList<>(segments.size());
         for (FluidSegment segment : segments) {
             if (!merged.isEmpty()) {
-                FluidSegment previous = merged.getLast();
+                FluidSegment previous = merged.get(merged.size() - 1);
                 if (previous.type().isSame(segment.type()) && segment.start() <= previous.end() + 1.0E-6) {
                     merged.set(merged.size() - 1, new FluidSegment(
                             previous.type(),
@@ -3695,14 +3712,20 @@ public final class AcousticTracer {
             // invent an air/fluid boundary at the emitter or listener.
             if (segment.start() > 1.0E-5
                     && (index == 0 || merged.get(index - 1).end() < segment.start() - 1.0E-6)) {
-                applyFluidBoundary(bands, null, segment);
+                float coverage = segment.end() >= 1.0 - 1.0E-5
+                        ? endMediumWeight
+                        : 1.0F;
+                applyFluidBoundary(bands, null, segment, coverage);
             }
             if (segment.end() < 1.0 - 1.0E-5) {
                 FluidSegment next = index + 1 < merged.size()
                         && merged.get(index + 1).start() <= segment.end() + 1.0E-6
                         ? merged.get(index + 1)
                         : null;
-                applyFluidBoundary(bands, segment, next);
+                float coverage = segment.start() <= 1.0E-5
+                        ? startMediumWeight
+                        : 1.0F;
+                applyFluidBoundary(bands, segment, next, coverage);
             }
         }
         float airDistance = Math.max(0.0F, (float) rayDistance - totalDistance);
@@ -3722,11 +3745,11 @@ public final class AcousticTracer {
                 airDistance,
                 travelTime,
                 totalDistance <= 1.0E-6F ? 0.0F : scatteringDistance / totalDistance,
-                merged.getFirst().start() <= 1.0E-5
-                        ? merged.getFirst().material()
+                merged.get(0).start() <= 1.0E-5
+                        ? merged.get(0).material()
                         : null,
-                merged.getLast().end() >= 1.0 - 1.0E-5
-                        ? merged.getLast().material()
+                merged.get(merged.size() - 1).end() >= 1.0 - 1.0E-5
+                        ? merged.get(merged.size() - 1).material()
                         : null
         );
     }
@@ -3736,10 +3759,20 @@ public final class AcousticTracer {
             FluidSegment first,
             FluidSegment second
     ) {
+        applyFluidBoundary(bands, first, second, 1.0F);
+    }
+
+    private static void applyFluidBoundary(
+            float[] bands,
+            FluidSegment first,
+            FluidSegment second,
+            float coverage
+    ) {
         applyFluidBoundary(
                 bands,
                 first == null ? null : first.material(),
-                second == null ? null : second.material()
+                second == null ? null : second.material(),
+                coverage
         );
     }
 
@@ -3748,6 +3781,19 @@ public final class AcousticTracer {
             AcousticMaterial first,
             AcousticMaterial second
     ) {
+        applyFluidBoundary(bands, first, second, 1.0F);
+    }
+
+    private static void applyFluidBoundary(
+            float[] bands,
+            AcousticMaterial first,
+            AcousticMaterial second,
+            float coverage
+    ) {
+        float submergedFraction = Mth.clamp(coverage, 0.0F, 1.0F);
+        if (submergedFraction <= 1.0E-6F) {
+            return;
+        }
         MediumProfile firstProfile = first == null ? MediumProfile.AIR : first.medium();
         MediumProfile secondProfile = second == null ? MediumProfile.AIR : second.medium();
         if (firstProfile == secondProfile
@@ -3768,7 +3814,15 @@ public final class AcousticTracer {
             float firstSurface = first == null ? 1.0F : first.boundaryTransmission(band);
             float secondSurface = second == null ? 1.0F : second.boundaryTransmission(band);
             float surfaceCoherence = (float) Math.sqrt(firstSurface * secondSurface);
-            bands[band] *= physicalTransmission * surfaceCoherence;
+            float submergedAmplitude = physicalTransmission * surfaceCoherence;
+            // A source or ear intersecting the surface radiates through its air-exposed
+            // and submerged fractions in parallel. Sum those incoherent areas as power
+            // so an infinitesimal contact approaches the dry response continuously,
+            // while a fully submerged endpoint retains the exact interface solution.
+            bands[band] *= (float) Math.sqrt(
+                    (1.0F - submergedFraction)
+                            + submergedFraction * submergedAmplitude * submergedAmplitude
+            );
         }
     }
 
@@ -3912,9 +3966,9 @@ public final class AcousticTracer {
 
         intervals.sort(Comparator.comparingDouble(ShapeInterval::start));
         double totalNormalizedLength = 0.0;
-        double mergedStart = intervals.getFirst().start();
-        double mergedEnd = intervals.getFirst().end();
-        AABB firstBounds = intervals.getFirst().bounds();
+        double mergedStart = intervals.get(0).start();
+        double mergedEnd = intervals.get(0).end();
+        AABB firstBounds = intervals.get(0).bounds();
         for (int index = 1; index < intervals.size(); index++) {
             ShapeInterval interval = intervals.get(index);
             if (interval.start() <= mergedEnd + 1.0E-7) {

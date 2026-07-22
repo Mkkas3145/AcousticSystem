@@ -6,8 +6,6 @@ import org.lwjgl.openal.AL10;
 import org.lwjgl.openal.AL11;
 import org.lwjgl.openal.EXTBFormat;
 import org.lwjgl.openal.EXTFloat32;
-import org.lwjgl.openal.SOFTCallbackBuffer;
-import org.lwjgl.openal.SOFTCallbackBufferType;
 import org.lwjgl.openal.SOFTBformatEx;
 import org.lwjgl.system.MemoryUtil;
 import org.macaroon.acousticsystem.AcousticSystem;
@@ -17,6 +15,8 @@ import org.macaroon.acousticsystem.client.simulation.RoomAcoustics;
 
 import javax.sound.sampled.AudioFormat;
 import java.nio.ByteBuffer;
+import java.lang.reflect.Proxy;
+import java.lang.reflect.InvocationHandler;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -45,7 +45,7 @@ public final class SoftwareAcousticMixer {
     private static boolean ambisonicOutput;
     private static int outputChannels = STEREO_CHANNELS;
     private static int bytesPerFrame = Float.BYTES * STEREO_CHANNELS;
-    private static SOFTCallbackBufferType callback;
+    private static Object callback;
     private static volatile Throwable callbackFailure;
     private static volatile boolean callbackFailureReported;
     private static volatile long callbackOverruns;
@@ -61,43 +61,51 @@ public final class SoftwareAcousticMixer {
 
     public static void initialize() {
         synchronized (LOCK) {
-            if (initialized || AL.getCapabilities() == null
-                    || !AL.getCapabilities().AL_SOFT_callback_buffer) {
+            if (initialized) {
                 return;
+            }
+            if (AL.getCapabilities() == null) {
+                throw new IllegalStateException(
+                        "Software acoustic mixer requires an active OpenAL context"
+                );
+            }
+            if (!hasCapability("AL_SOFT_callback_buffer")) {
+                throw new IllegalStateException(
+                        "Software acoustic mixer requires AL_SOFT_callback_buffer; "
+                                + "the EFX fallback is intentionally disabled"
+                );
             }
             // Compile and initialize the complete late-field loop before the native
             // device requests its first real-time buffer. Otherwise the JVM may compile
             // the all-pass/FDN path on the first cave sound and miss that one deadline.
             AcousticFeedbackField.prewarm();
-            callback = SOFTCallbackBufferType.create((userptr, sampledata, numbytes) -> {
-                long started = System.nanoTime();
-                try {
-                    int written = render(sampledata, numbytes);
-                    recordCallbackDuration(started, numbytes);
-                    return written;
-                } catch (Throwable failure) {
-                    callbackFailure = failure;
-                    MemoryUtil.memSet(sampledata, 0, numbytes);
-                    return numbytes;
-                }
-            });
+            callback = createCallback();
+            if (callback == null) {
+                throw new IllegalStateException(
+                        "Could not create the required OpenAL software-mixer callback"
+                );
+            }
             // Begin a clean transaction: a stale error from another source must not be
             // mistaken for failure of an object which was actually created here.
             AL10.alGetError();
             outputBuffer = AL10.alGenBuffers();
             if (outputBuffer == 0 || AL10.alGetError() != AL10.AL_NO_ERROR) {
                 cleanupOutputObjects();
-                return;
+                throw new IllegalStateException(
+                        "Could not allocate the software-mixer OpenAL buffer"
+                );
             }
             outputSource = AL10.alGenSources();
             if (outputSource == 0 || AL10.alGetError() != AL10.AL_NO_ERROR) {
                 cleanupOutputObjects();
-                return;
+                throw new IllegalStateException(
+                        "Could not allocate the software-mixer OpenAL source"
+                );
             }
             ambisonicOutput = AL.getCapabilities().AL_EXT_BFORMAT;
             outputChannels = ambisonicOutput ? AMBISONIC_CHANNELS : STEREO_CHANNELS;
             bytesPerFrame = Float.BYTES * outputChannels;
-            if (ambisonicOutput && AL.getCapabilities().AL_SOFT_bformat_ex) {
+            if (ambisonicOutput && hasCapability("AL_SOFT_bformat_ex")) {
                 AL11.alBufferi(
                         outputBuffer,
                         SOFTBformatEx.AL_AMBISONIC_LAYOUT_SOFT,
@@ -109,15 +117,11 @@ public final class SoftwareAcousticMixer {
                         SOFTBformatEx.AL_FUMA_SOFT
                 );
             }
-            SOFTCallbackBuffer.alBufferCallbackSOFT(
-                    outputBuffer,
+            registerCallback(outputBuffer,
                     ambisonicOutput
                             ? EXTBFormat.AL_FORMAT_BFORMAT3D_FLOAT32
                             : EXTFloat32.AL_FORMAT_STEREO_FLOAT32,
-                    OUTPUT_RATE,
-                    callback,
-                    1L
-            );
+                    callback);
             AL10.alSourcei(outputSource, AL10.AL_SOURCE_RELATIVE, AL10.AL_TRUE);
             AL10.alSourcei(outputSource, AL10.AL_LOOPING, AL10.AL_FALSE);
             AL10.alSourcef(outputSource, AL10.AL_GAIN, 1.0F);
@@ -125,12 +129,11 @@ public final class SoftwareAcousticMixer {
             AL10.alSourcePlay(outputSource);
             int error = AL10.alGetError();
             if (error != AL10.AL_NO_ERROR) {
-                AcousticSystem.LOGGER.error(
-                        "Could not initialize the software acoustic mixer: OpenAL error {}",
-                        error
-                );
                 cleanupOutputObjects();
-                return;
+                throw new IllegalStateException(
+                        "Could not initialize the software acoustic mixer: OpenAL error "
+                                + error
+                );
             }
             initialized = true;
             callbackFailure = null;
@@ -319,12 +322,18 @@ public final class SoftwareAcousticMixer {
 
     private static void reportCallbackHealth() {
         Throwable failure = callbackFailure;
-        if (failure != null && !callbackFailureReported) {
-            callbackFailureReported = true;
-            AcousticSystem.LOGGER.error(
-                    "Software acoustic callback failed; emitting silence for the wet path",
-                    failure
-            );
+        if (failure != null) {
+            // A real-time callback may be queried by dozens of source updates before
+            // the device asks for its next buffer. Report that failure once, rather
+            // than turning one DSP fault into an unbounded per-source log/exception
+            // storm. A later successful callback clears this latch below.
+            if (!callbackFailureReported) {
+                callbackFailureReported = true;
+                throw new IllegalStateException(
+                        "Required software acoustic callback failed", failure
+                );
+            }
+            return;
         }
         long now = System.nanoTime();
         long overruns = callbackOverruns;
@@ -435,7 +444,11 @@ public final class SoftwareAcousticMixer {
             outputBuffer = 0;
         }
         if (callback != null) {
-            callback.free();
+            try {
+                callback.getClass().getMethod("free").invoke(callback);
+            } catch (ReflectiveOperationException ignored) {
+                // The callback object is owned only by this mixer and may already be closed.
+            }
             callback = null;
         }
         ambisonicOutput = false;
@@ -446,6 +459,105 @@ public final class SoftwareAcousticMixer {
 
     private static float clamp(float value, float minimum, float maximum) {
         return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private static boolean hasCapability(String field) {
+        try {
+            return AL.getCapabilities().getClass().getField(field)
+                    .getBoolean(AL.getCapabilities());
+        } catch (ReflectiveOperationException ignored) {
+            return AL10.alIsExtensionPresent(field);
+        }
+    }
+
+    private static Object createCallback() {
+        try {
+            Class<?> callbackInterface = Class.forName(
+                    "org.lwjgl.openal.SOFTCallbackBufferTypeI"
+            );
+            Object delegate = Proxy.newProxyInstance(
+                    SoftwareAcousticMixer.class.getClassLoader(),
+                    new Class<?>[]{callbackInterface},
+                    (proxy, method, arguments) -> {
+                        if (!method.getName().equals("invoke")) {
+                            if (method.isDefault()) {
+                                return InvocationHandler.invokeDefault(
+                                        proxy, method, arguments
+                                );
+                            }
+                            return switch (method.getName()) {
+                                case "toString" -> "AcousticSystem callback";
+                                case "hashCode" -> System.identityHashCode(proxy);
+                                case "equals" -> proxy == arguments[0];
+                                default -> null;
+                            };
+                        }
+                        long sampleData = (long) arguments[1];
+                        int numBytes = (int) arguments[2];
+                        int written = renderCallback(sampleData, numBytes);
+                        // LWJGL 3.3.2 generated this callback with a pointer-sized
+                        // return even though ALsizei is 32-bit. Newer bindings use
+                        // int. Box exactly what the loaded interface declares.
+                        if (method.getReturnType() == long.class) {
+                            return Long.valueOf(written);
+                        }
+                        return Integer.valueOf(written);
+                    }
+            );
+            Class<?> callbackType = Class.forName(
+                    "org.lwjgl.openal.SOFTCallbackBufferType"
+            );
+            return callbackType.getMethod("create", callbackInterface)
+                    .invoke(null, delegate);
+        } catch (ReflectiveOperationException failure) {
+            throw new IllegalStateException(
+                    "No compatible AL_SOFT_callback_buffer binding is available",
+                    failure
+            );
+        }
+    }
+
+    private static void registerCallback(int buffer, int format, Object callback) {
+        try {
+            Class<?> callbackInterface = Class.forName(
+                    "org.lwjgl.openal.SOFTCallbackBufferTypeI"
+            );
+            Class.forName("org.lwjgl.openal.SOFTCallbackBuffer")
+                    .getMethod(
+                            "alBufferCallbackSOFT",
+                            int.class, int.class, int.class,
+                            callbackInterface, long.class
+                    )
+                    .invoke(null, buffer, format, OUTPUT_RATE, callback, 1L);
+        } catch (ReflectiveOperationException failure) {
+            throw new IllegalStateException(
+                    "Could not register the required OpenAL callback buffer",
+                    failure
+            );
+        }
+    }
+
+    static int renderCallback(long sampleData, int numBytes) {
+        long started = System.nanoTime();
+        try {
+            int written = render(sampleData, numBytes);
+            recordCallbackDuration(started, numBytes);
+            // The mixer stays on the mandatory software path. A transient callback
+            // fault therefore recovers by completing a later software buffer, not by
+            // silently changing to the EFX implementation.
+            if (callbackFailure != null) {
+                callbackFailure = null;
+                callbackFailureReported = false;
+            }
+            return written;
+        } catch (Throwable failure) {
+            if (callbackFailure == null) {
+                callbackFailure = failure;
+                callbackFailureReported = false;
+            }
+            MemoryUtil.memSet(sampleData, 0, numBytes);
+            return numBytes;
+        }
     }
 
     private static Vec3 normalizedOrZero(Vec3 direction) {

@@ -1,0 +1,67 @@
+plugins { id 'dev.architectury.loom-no-remap' version '1.17.491' }
+
+def profiles = [
+        '26.1.2': [neo: '26.1.2.84'],
+        '26.2'  : [neo: '26.2.0.28-beta']
+]
+def target = providers.gradleProperty('target_minecraft_version').orElse('26.2').get()
+def profile = profiles[target]
+if (profile == null) throw new GradleException("Unsupported NeoForge target: ${target}")
+def sharedProperties = new Properties()
+file('../../gradle.properties').withInputStream { sharedProperties.load(it) }
+version = sharedProperties.getProperty('mod_version')
+group = sharedProperties.getProperty('maven_group')
+base { archivesName = "${sharedProperties.getProperty('archives_base_name')}-neoforge-${target}" }
+
+sourceSets {
+    main {
+        java.setSrcDirs([file('../../src/main/java'), file('../../src/client/java')])
+        java.exclude('org/macaroon/acousticsystem/fabric/**')
+        resources.setSrcDirs([
+                file('../../src/main/resources'), file('../../src/client/resources'),
+                file('../neoforge-modern-shared/src/main/resources')
+        ])
+        resources.exclude('fabric.mod.json')
+    }
+    test {
+        java.setSrcDirs([file('../../src/test/java')])
+        resources.setSrcDirs([file('../../src/test/resources')])
+        java.exclude(
+                'org/macaroon/acousticsystem/client/simulation/ActualWorldAcousticDiagnosticTest.java',
+                'org/macaroon/acousticsystem/client/simulation/AcousticTracerDiffractionIntegrationTest.java',
+                'org/macaroon/acousticsystem/client/simulation/AcousticTracerFluidIntegrationTest.java',
+                'org/macaroon/acousticsystem/client/simulation/LateReverbTracerIntegrationTest.java'
+        )
+    }
+}
+compileJava.source(fileTree('../neoforge-modern-shared/src/main/java'))
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.neoforged.net/releases/' }
+}
+dependencies {
+    minecraft "com.mojang:minecraft:${target}"
+    neoForge "net.neoforged:neoforge:${profile.neo}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+tasks.withType(Test).configureEach { useJUnitPlatform() }
+processResources {
+    inputs.properties(version: project.version, minecraft: target,
+            java_level: 25, mixin_config: 'acousticsystem.client.mixins.json')
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand(version: project.version, minecraft: target)
+    }
+    filesMatching('acousticsystem.client.mixins.json') {
+        expand(java_compatibility_level: 'JAVA_25')
+    }
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+    options.encoding = 'UTF-8'
+}
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}

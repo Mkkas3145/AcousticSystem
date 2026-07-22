@@ -39,8 +39,8 @@ class SoftwareAcousticMixerOpenALTest {
         long context = ALC10.alcCreateContext(device, attributes);
         assertTrue(context != 0L);
         assertTrue(ALC10.alcMakeContextCurrent(context));
-        var alCapabilities = AL.createCapabilities(alcCapabilities);
-        assertTrue(alCapabilities.AL_SOFT_callback_buffer);
+        AL.createCapabilities(alcCapabilities);
+        assertTrue(AL10.alIsExtensionPresent("AL_SOFT_callback_buffer"));
         AL10.alEnable(EXTSourceDistanceModel.AL_SOURCE_DISTANCE_MODEL);
 
         List<Integer> sources = new ArrayList<>();

@@ -54,7 +54,7 @@ abstract class SoundEngineMixin {
         if (level == null || !camera.isInitialized()) {
             return;
         }
-        Vec3 listener = camera.position();
+        Vec3 listener = ((CameraAccessor) (Object) camera).acousticsystem$getPosition();
         AcousticRuntime.tick(level, listener, instanceToChannel, channelAccess);
     }
 }

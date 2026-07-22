@@ -116,6 +116,13 @@ class AcousticMaterialDefaultsTest {
                 String path = "/data/minecraft/tags/block/"
                         + selector.substring("#minecraft:".length()) + ".json";
                 try (InputStream stream = AcousticMaterialDefaultsTest.class.getResourceAsStream(path)) {
+                    if (stream != null) {
+                        continue;
+                    }
+                }
+                String legacyPath = "/data/minecraft/tags/blocks/"
+                        + selector.substring("#minecraft:".length()) + ".json";
+                try (InputStream stream = AcousticMaterialDefaultsTest.class.getResourceAsStream(legacyPath)) {
                     assertNotNull(stream, () -> "Missing Minecraft tag " + selector);
                 }
             }

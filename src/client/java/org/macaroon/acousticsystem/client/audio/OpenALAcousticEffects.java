@@ -111,11 +111,18 @@ public final class OpenALAcousticEffects {
     /** Builds the reusable EFX buses while Minecraft is initializing its audio library. */
     public static void initialize() {
         if (!ensureSupport()) {
-            return;
+            throw new IllegalStateException(
+                    "Required OpenAL direct-filter support is unavailable"
+            );
+        }
+        if (!SoftwareAcousticMixer.available()) {
+            throw new IllegalStateException(
+                    "Software acoustic mixer did not initialize; EFX fallback is disabled"
+            );
         }
         if (SoftwareAcousticMixer.available()) {
             AcousticSystem.LOGGER.info(
-                    "OpenAL is retaining only positional direct filtering; reflected fields use the software mixer"
+                    "OpenAL is retaining only positional direct filtering; reflected fields use the required software mixer"
             );
             return;
         }

@@ -254,11 +254,11 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
 
         private int selectedValue() {
             int steps = Math.round((float) ((maximum - minimum) * value / step));
-            return Math.clamp(minimum + steps * step, minimum, maximum);
+            return Math.max(minimum, Math.min(maximum, minimum + steps * step));
         }
 
         private static double normalize(int value, int minimum, int maximum) {
-            return (Math.clamp(value, minimum, maximum) - minimum) / (double) (maximum - minimum);
+            return (Math.max(minimum, Math.min(maximum, value)) - minimum) / (double) (maximum - minimum);
         }
     }
 
@@ -310,11 +310,11 @@ public final class SoundPhysicsDetailsScreen extends OptionsSubScreen {
 
         private float selectedValue() {
             long steps = Math.round((maximum - minimum) * value / step);
-            return Math.clamp(minimum + steps * step, minimum, maximum);
+            return Math.max(minimum, Math.min(maximum, minimum + steps * step));
         }
 
         private static double normalize(float value, float minimum, float maximum) {
-            return (Math.clamp(value, minimum, maximum) - minimum) / (maximum - minimum);
+            return (Math.max(minimum, Math.min(maximum, value)) - minimum) / (maximum - minimum);
         }
     }
 }

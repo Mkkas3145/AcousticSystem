@@ -221,6 +221,84 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void everyLayerOfASealedWallContributesTransmissionLoss() {
+        SolidGeometry oneLayer = position -> position.getX() == 0
+                && Math.abs(position.getY()) <= 8
+                && Math.abs(position.getZ()) <= 8;
+        SolidGeometry threeLayers = position -> position.getX() >= 0
+                && position.getX() <= 2
+                && Math.abs(position.getY()) <= 8
+                && Math.abs(position.getZ()) <= 8;
+        Vec3 source = new Vec3(-4.5, 0.5, 0.5);
+        Vec3 listener = new Vec3(6.5, 0.5, 0.5);
+
+        AcousticResult thin = AcousticTracer.traceImmediate(
+                new TestWorld(oneLayer), source, listener, OUTDOOR_PROBE
+        );
+        AcousticResult thick = AcousticTracer.traceImmediate(
+                new TestWorld(threeLayers), source, listener, OUTDOOR_PROBE
+        );
+
+        assertTrue(
+                thick.directGain() < thin.directGain() * 0.10F,
+                () -> "Every crossed metre of a sealed wall must accumulate material loss: thin="
+                        + thin + ", thick=" + thick
+        );
+    }
+
+    @Test
+    void aThickSealedShellAttenuatesTheCompleteArrivalField() {
+        SolidGeometry thinShell = position -> {
+            int radius = Math.max(
+                    Math.abs(position.getX()),
+                    Math.max(Math.abs(position.getY()), Math.abs(position.getZ()))
+            );
+            return radius == 2;
+        };
+        SolidGeometry thickShell = position -> {
+            int radius = Math.max(
+                    Math.abs(position.getX()),
+                    Math.max(Math.abs(position.getY()), Math.abs(position.getZ()))
+            );
+            return radius >= 2 && radius <= 4;
+        };
+        Vec3 source = new Vec3(0.5, 0.5, 0.5);
+        Vec3 listener = new Vec3(8.5, 0.5, 0.5);
+        TestWorld thinWorld = new TestWorld(thinShell);
+        TestWorld thickWorld = new TestWorld(thickShell);
+
+        AcousticResult thin = AcousticTracer.trace(
+                thinWorld,
+                source,
+                listener,
+                AcousticTracer.probeRoom(thinWorld, source),
+                OUTDOOR_PROBE,
+                AcousticTracer.TraceQuality.FULL
+        );
+        AcousticResult thick = AcousticTracer.trace(
+                thickWorld,
+                source,
+                listener,
+                AcousticTracer.probeRoom(thickWorld, source),
+                OUTDOOR_PROBE,
+                AcousticTracer.TraceQuality.FULL
+        );
+        float thinArrival = thin.directGain()
+                + thin.diffractionContribution()
+                + thin.earlyReflection().gain();
+        float thickArrival = thick.directGain()
+                + thick.diffractionContribution()
+                + thick.earlyReflection().gain();
+
+        assertTrue(
+                thickArrival < thinArrival * 0.10F,
+                () -> "A sealed shell must accumulate thickness across direct, diffracted, "
+                        + "structural and reflected arrivals: thin=" + thin
+                        + ", thick=" + thick
+        );
+    }
+
+    @Test
     void diagonalIncidenceCannotIncreaseTransmissionThroughTheSameWall() {
         TestWorld world = new TestWorld(position -> position.getX() == 0
                 && position.getY() >= -16 && position.getY() <= 16
@@ -2320,8 +2398,11 @@ class AcousticTracerDiffractionIntegrationTest {
             return Fluids.EMPTY.defaultFluidState();
         }
 
-        @Override
         public int getMinY() {
+            return -64;
+        }
+
+        public int getMinBuildHeight() {
             return -64;
         }
 

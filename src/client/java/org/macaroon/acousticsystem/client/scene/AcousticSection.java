@@ -7,19 +7,28 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.material.FluidState;
 
 final class AcousticSection {
-    private final LevelChunkSection section;
+    private final BlockState[] blocks = new BlockState[16 * 16 * 16];
+    private final FluidState[] fluids = new FluidState[16 * 16 * 16];
     private final byte[] fullCubeClassification = new byte[16 * 16 * 16];
 
     AcousticSection(LevelChunkSection section) {
-        this.section = section;
+        for (int y = 0; y < 16; y++) {
+            for (int z = 0; z < 16; z++) {
+                for (int x = 0; x < 16; x++) {
+                    int index = index(x, y, z);
+                    blocks[index] = section.getBlockState(x, y, z);
+                    fluids[index] = section.getFluidState(x, y, z);
+                }
+            }
+        }
     }
 
     BlockState block(int x, int y, int z) {
-        return section.getBlockState(x & 15, y & 15, z & 15);
+        return blocks[index(x, y, z)];
     }
 
     FluidState fluid(int x, int y, int z) {
-        return section.getFluidState(x & 15, y & 15, z & 15);
+        return fluids[index(x, y, z)];
     }
 
     boolean isCollisionShapeFullBlock(BlockGetter level, BlockPos pos, BlockState state) {
@@ -36,5 +45,9 @@ final class AcousticSection {
         // byte stores are atomic and the immutable scene always yields the same answer.
         fullCubeClassification[index] = (byte) (fullCube ? 1 : 2);
         return fullCube;
+    }
+
+    private static int index(int x, int y, int z) {
+        return (x & 15) | (z & 15) << 4 | (y & 15) << 8;
     }
 }
