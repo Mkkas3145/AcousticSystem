@@ -2,7 +2,7 @@
 
 <img src="src/main/resources/assets/acousticsystem/icon.png" width="128" height="128" alt="AcousticSystem logo"/>
 
-# AcousticSystem
+# Sound Acoustic Physics
 
 **Real-time acoustic physics for Minecraft worlds**
 
