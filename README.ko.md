@@ -2,7 +2,7 @@
 
 <img src="src/main/resources/assets/acousticsystem/icon.png" width="128" height="128" alt="AcousticSystem 로고"/>
 
-# AcousticSystem
+# Sound Acoustic Physics
 
 **블록과 공간에 따라 소리가 달라지는 Minecraft 음향 물리 모드**
 
