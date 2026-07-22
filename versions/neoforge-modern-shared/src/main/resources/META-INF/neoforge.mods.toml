@@ -6,6 +6,7 @@ license="MIT"
 modId="acousticsystem"
 version="${version}"
 displayName="AcousticSystem"
+logoFile="assets/acousticsystem/icon.png"
 description='''Real-time sound occlusion, diffraction, reflection, reverb and fluid acoustics.'''
 displayTest="IGNORE_ALL_VERSION"
 
