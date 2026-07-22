@@ -72,7 +72,7 @@ Early reflections use image-source candidates from nearby surfaces. Each candida
 
 The late field is measured with multi-bounce Monte Carlo ray tracing. Rays lose energy at every material hit and escape through real openings. Opening loss is included with a Sabine-style room-energy model, while a 0.5 ms energy histogram records the arrival field. Backward Schroeder energy integration and decay-curve regression estimate RT60 for each frequency band from that traced response.
 
-The measured field is rendered by an eight-delay-line Feedback Delay Network (FDN) running at 24 kHz. The network uses mutually incommensurate delays, an energy-preserving normalized Hadamard feedback matrix, and four Schroeder all-pass diffusers to build a dense tail without turning it into a repeated echo. Low, middle, and high feedback losses are derived separately from the measured RT60 ratios, and the coefficients morph continuously when the listener moves or the room changes.
+The measured field is rendered by an eight-delay-line Feedback Delay Network (FDN) running at 24 kHz. The network uses mutually incommensurate delays, an energy-preserving normalized Hadamard feedback matrix, and four Schroeder all-pass diffusers to build a dense tail without turning it into a repeated echo. For a delay line with round-trip time `τ`, its feedback gain is calculated as `g = 10^(-3τ / RT60)`, making the energy fall by 60 dB over the measured decay time. One-pole filters split the feedback at 250 Hz and 4 kHz so the low, middle, and high decay rates can be calculated independently from the traced RT60 spectrum.
 
 ### Fluids and medium boundaries
 
