@@ -33,6 +33,7 @@ sourceSets {
                 'org/macaroon/acousticsystem/client/simulation/ActualWorldAcousticDiagnosticTest.java',
                 'org/macaroon/acousticsystem/client/simulation/AcousticTracerDiffractionIntegrationTest.java',
                 'org/macaroon/acousticsystem/client/simulation/AcousticTracerFluidIntegrationTest.java',
+                'org/macaroon/acousticsystem/client/scene/AcousticSceneManagerFluidBoundaryTest.java',
                 'org/macaroon/acousticsystem/client/simulation/LateReverbTracerIntegrationTest.java'
         )
     }

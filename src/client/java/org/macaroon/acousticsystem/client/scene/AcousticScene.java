@@ -21,8 +21,15 @@ public final class AcousticScene implements BlockGetter {
     private final int minY;
     private final int height;
     private final long revision;
+    private final Map<Long, FluidState> displacedFluids;
 
-    AcousticScene(Map<SectionKey, AcousticSection> sections, int minY, int height, long revision) {
+    AcousticScene(
+            Map<SectionKey, AcousticSection> sections,
+            int minY,
+            int height,
+            long revision,
+            Map<Long, FluidState> displacedFluids
+    ) {
         int tableSize = 1;
         while (tableSize < Math.max(2, sections.size() * 2)) {
             tableSize <<= 1;
@@ -43,6 +50,7 @@ public final class AcousticScene implements BlockGetter {
         this.minY = minY;
         this.height = height;
         this.revision = revision;
+        this.displacedFluids = Map.copyOf(displacedFluids);
     }
 
     public long revision() {
@@ -68,7 +76,13 @@ public final class AcousticScene implements BlockGetter {
     @Override
     public FluidState getFluidState(BlockPos pos) {
         AcousticSection section = section(pos.getX(), pos.getY(), pos.getZ());
-        return section == null ? EMPTY_FLUID : section.fluid(pos.getX(), pos.getY(), pos.getZ());
+        FluidState captured = section == null
+                ? EMPTY_FLUID
+                : section.fluid(pos.getX(), pos.getY(), pos.getZ());
+        if (!captured.isEmpty()) {
+            return captured;
+        }
+        return displacedFluids.getOrDefault(pos.asLong(), EMPTY_FLUID);
     }
 
     public int getMinY() {

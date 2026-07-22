@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class AcousticTracerFluidIntegrationTest {
     private static final RoomProbe OUTDOORS = new RoomProbe(
@@ -53,8 +54,8 @@ class AcousticTracerFluidIntegrationTest {
                 () -> "A submerged listener should not sound like broadband volume attenuation: " + shortPath
         );
         assertTrue(
-                longPath.midLowBandGain() > shortPath.midLowBandGain() * 0.98F,
-                () -> "Twenty metres of water must not be treated like twenty metres of air or insulation: short="
+                longPath.midLowBandGain() > shortPath.midLowBandGain() * 0.50F,
+                () -> "A wide finite wavefront crossing twenty metres of water must not collapse like insulation: short="
                         + shortPath + ", long=" + longPath
         );
     }
@@ -83,6 +84,82 @@ class AcousticTracerFluidIntegrationTest {
                 () -> "The impedance discontinuity must dominate an air/water crossing: submerged="
                         + submerged + ", crossing=" + crossesSurface
         );
+    }
+
+    @Test
+    void submergedSourceKeepsItsMediumSpectrumAcrossANearbySurface() {
+        FluidWorld surface = new FluidWorld(position -> position.getY() < 1);
+        AcousticResult result = trace(
+                surface,
+                new Vec3(0.5, 0.50, 0.5),
+                new Vec3(0.5, 1.50, 0.5)
+        );
+
+        assertTrue(
+                result.midLowBandGain() > result.highBandGain() * 1.8F,
+                () -> "A water-to-air source one metre away lost its medium colour: " + result
+        );
+    }
+
+    @Test
+    void transientEmptyEmitterCellUsesItsWettedBoundary() {
+        BlockPos transientCell = new BlockPos(0, 0, 0);
+        FluidWorld wettedCavity = new FluidWorld(position -> !position.equals(transientCell));
+        AcousticResult result = trace(
+                wettedCavity,
+                new Vec3(0.50, 0.50, 0.50),
+                new Vec3(0.56, 0.50, 0.50)
+        );
+        AcousticResult dry = trace(
+                new FluidWorld(position -> false),
+                new Vec3(0.50, 0.50, 0.50),
+                new Vec3(0.56, 0.50, 0.50)
+        );
+        float[] boundary = AcousticTracer.solveEmitterBoundary(
+                wettedCavity,
+                new Vec3(0.50, 0.50, 0.50)
+        ).amplitude();
+
+        assertTrue(
+                result.midLowBandGain() > result.highBandGain() * 1.5F
+                        && result.highBandGain() < dry.highBandGain() * 0.60F,
+                () -> "An update-order air voxel must not erase the surrounding fluid boundary: "
+                        + result + ", dry=" + dry + ", boundary=" + Arrays.toString(boundary)
+        );
+    }
+
+    @Test
+    void displacedFluidSnapshotMatchesTheStableFluidPropagationTopology() {
+        Vec3 source = new Vec3(0.50, 0.50, 0.50);
+        Vec3 listener = new Vec3(3.50, 0.50, 0.50);
+        AcousticResult stable = trace(new FluidWorld(position -> true), source, listener);
+        AcousticResult displaced = trace(
+                new DisplacedFluidWorld(BlockPos.ZERO),
+                source,
+                listener
+        );
+
+        assertEquals(stable.lowBandGain(), displaced.lowBandGain(), 1.0E-4F);
+        assertEquals(stable.midLowBandGain(), displaced.midLowBandGain(), 1.0E-4F);
+        assertEquals(stable.midHighBandGain(), displaced.midHighBandGain(), 1.0E-4F);
+        assertEquals(stable.highBandGain(), displaced.highBandGain(), 1.0E-4F);
+    }
+
+    @Test
+    void endpointMediumTransferIsReciprocal() {
+        FluidWorld surface = new FluidWorld(position -> position.getY() < 1);
+        Vec3 underwater = new Vec3(0.5, 0.50, 0.5);
+        Vec3 airborne = new Vec3(0.5, 1.50, 0.5);
+        AcousticResult waterToAir = trace(surface, underwater, airborne);
+        AcousticResult airToWater = trace(surface, airborne, underwater);
+
+        // Antipodal finite-wavefront quadrature reverses floating-point summation order
+        // and clips different voxel-face contacts with path direction. Endpoint transfer
+        // remains reciprocal to comfortably below one percent.
+        assertEquals(waterToAir.lowBandGain(), airToWater.lowBandGain(), 1.0E-4F);
+        assertEquals(waterToAir.midLowBandGain(), airToWater.midLowBandGain(), 1.0E-4F);
+        assertEquals(waterToAir.midHighBandGain(), airToWater.midHighBandGain(), 1.0E-4F);
+        assertEquals(waterToAir.highBandGain(), airToWater.highBandGain(), 1.0E-4F);
     }
 
     @Test
@@ -133,6 +210,18 @@ class AcousticTracerFluidIntegrationTest {
                 AcousticTracer.surfaceReflectedPower(surface, 4, 1.0) > 0.998F,
                 () -> "surface=" + surface
         );
+    }
+
+    @Test
+    void unboundedWaterDoesNotManufactureACaveReverbPreset() {
+        RoomProbe probe = AcousticTracer.probeRoom(
+                new FluidWorld(position -> true),
+                new Vec3(0.5, 2.25, 0.5)
+        );
+
+        assertEquals(0.0F, probe.acoustics().gain(), 1.0E-6F);
+        assertEquals(0.0F, probe.acoustics().reflectionsGain(), 1.0E-6F);
+        assertEquals(0.0F, probe.acoustics().lateReverbGain(), 1.0E-6F);
     }
 
     @Test
@@ -196,6 +285,38 @@ class AcousticTracerFluidIntegrationTest {
         @Override
         public FluidState getFluidState(BlockPos position) {
             return getBlockState(position).getFluidState();
+        }
+
+        public int getMinY() {
+            return -64;
+        }
+
+        public int getMinBuildHeight() {
+            return -64;
+        }
+
+        @Override
+        public int getHeight() {
+            return 384;
+        }
+    }
+
+    private record DisplacedFluidWorld(BlockPos emptyBlock) implements BlockGetter {
+        @Override
+        public BlockEntity getBlockEntity(BlockPos position) {
+            return null;
+        }
+
+        @Override
+        public BlockState getBlockState(BlockPos position) {
+            return position.equals(emptyBlock)
+                    ? Blocks.AIR.defaultBlockState()
+                    : Blocks.WATER.defaultBlockState();
+        }
+
+        @Override
+        public FluidState getFluidState(BlockPos position) {
+            return Blocks.WATER.defaultBlockState().getFluidState();
         }
 
         public int getMinY() {

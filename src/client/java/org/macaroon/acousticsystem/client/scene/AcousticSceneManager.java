@@ -3,6 +3,10 @@ package org.macaroon.acousticsystem.client.scene;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
@@ -19,7 +23,13 @@ public final class AcousticSceneManager {
     private static final Map<SectionKey, AcousticSection> SECTION_CACHE = new HashMap<>();
     private static final Map<SectionKey, Long> LAST_USED_CAPTURE = new HashMap<>();
     private static final Set<SectionKey> DIRTY_SECTIONS = new HashSet<>();
+    private static final Map<Long, FluidState> DISPLACED_FLUIDS = new HashMap<>();
     private static final long UNUSED_CAPTURE_RETENTION = 400L;
+    private static final int[][] FACE_NEIGHBORS = {
+            {1, 0, 0}, {-1, 0, 0},
+            {0, 1, 0}, {0, -1, 0},
+            {0, 0, 1}, {0, 0, -1}
+    };
 
     private static ClientLevel currentLevel;
     private static long revision;
@@ -70,6 +80,7 @@ public final class AcousticSceneManager {
             SECTION_CACHE.clear();
             LAST_USED_CAPTURE.clear();
             DIRTY_SECTIONS.clear();
+            DISPLACED_FLUIDS.clear();
             lastRequiredSections = Set.of();
             lastScene = null;
             clearSparseProbe();
@@ -131,7 +142,8 @@ public final class AcousticSceneManager {
                 sceneSections,
                 level.getSectionYFromSectionIndex(0) * 16,
                 level.getHeight(),
-                revision
+                revision,
+                DISPLACED_FLUIDS
         );
         lastRequiredSections = Set.copyOf(required);
         lastScene = scene;
@@ -162,11 +174,90 @@ public final class AcousticSceneManager {
         if (localZ == 15) DIRTY_SECTIONS.add(new SectionKey(sectionX, sectionY, sectionZ + 1));
     }
 
+    /**
+     * Records the pressure medium displaced by a solid-to-empty transition. The entry
+     * has no timer: it exists exactly while the current empty cell remains bounded on
+     * every face by full fluid or a closed solid. This repairs client update ordering
+     * without turning a real opening or partially wetted source into water.
+     */
+    public static void markDirty(
+            ClientLevel level,
+            BlockPos pos,
+            BlockState oldState,
+            BlockState newState
+    ) {
+        if (currentLevel != level) {
+            currentLevel = level;
+            SECTION_CACHE.clear();
+            LAST_USED_CAPTURE.clear();
+            DIRTY_SECTIONS.clear();
+            DISPLACED_FLUIDS.clear();
+            lastRequiredSections = Set.of();
+            lastScene = null;
+            clearSparseProbe();
+            revision++;
+        }
+
+        long packed = pos.asLong();
+        boolean oldOccupied = !oldState.getCollisionShape(level, pos).isEmpty();
+        boolean newOpen = newState.getCollisionShape(level, pos).isEmpty()
+                && newState.getFluidState().isEmpty();
+        if (oldOccupied && newOpen) {
+            FluidState displaced = enclosedFluidBoundary(level, pos);
+            if (displaced.isEmpty()) {
+                DISPLACED_FLUIDS.remove(packed);
+            } else {
+                DISPLACED_FLUIDS.put(packed, displaced);
+            }
+        } else {
+            DISPLACED_FLUIDS.remove(packed);
+        }
+
+        // A changed neighbour can open or close an existing pressure boundary. Refresh
+        // only the six affected cells; no tick polling or expiry window is involved.
+        for (int[] offset : FACE_NEIGHBORS) {
+            BlockPos neighbour = pos.offset(offset[0], offset[1], offset[2]);
+            long neighbourKey = neighbour.asLong();
+            if (!DISPLACED_FLUIDS.containsKey(neighbourKey)) {
+                continue;
+            }
+            FluidState displaced = enclosedFluidBoundary(level, neighbour);
+            if (displaced.isEmpty()) {
+                DISPLACED_FLUIDS.remove(neighbourKey);
+            } else {
+                DISPLACED_FLUIDS.put(neighbourKey, displaced);
+            }
+        }
+        markDirty(level, pos);
+    }
+
+    static FluidState enclosedFluidBoundary(BlockGetter level, BlockPos position) {
+        FluidState selected = Fluids.EMPTY.defaultFluidState();
+        int selectedAmount = -1;
+        for (int[] offset : FACE_NEIGHBORS) {
+            BlockPos neighbour = position.offset(offset[0], offset[1], offset[2]);
+            FluidState fluid = level.getFluidState(neighbour);
+            if (!fluid.isEmpty() && fluid.getAmount() >= 8) {
+                if (fluid.getAmount() > selectedAmount) {
+                    selected = fluid;
+                    selectedAmount = fluid.getAmount();
+                }
+                continue;
+            }
+            BlockState state = level.getBlockState(neighbour);
+            if (!state.isCollisionShapeFullBlock(level, neighbour)) {
+                return Fluids.EMPTY.defaultFluidState();
+            }
+        }
+        return selected;
+    }
+
     public static void clear() {
         currentLevel = null;
         SECTION_CACHE.clear();
         LAST_USED_CAPTURE.clear();
         DIRTY_SECTIONS.clear();
+        DISPLACED_FLUIDS.clear();
         lastRequiredSections = Set.of();
         lastScene = null;
         clearSparseProbe();

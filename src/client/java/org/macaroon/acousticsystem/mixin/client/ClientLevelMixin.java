@@ -26,7 +26,12 @@ abstract class ClientLevelMixin {
             CallbackInfo ci
     ) {
         if (oldState != newState) {
-            AcousticSceneManager.markDirty((ClientLevel) (Object) this, pos);
+            AcousticSceneManager.markDirty(
+                    (ClientLevel) (Object) this,
+                    pos,
+                    oldState,
+                    newState
+            );
         }
     }
 

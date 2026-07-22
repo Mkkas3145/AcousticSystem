@@ -43,10 +43,23 @@ public final class AcousticTracer {
     private static final Vec3 POSITIVE_Z_NORMAL = new Vec3(0.0, 0.0, 1.0);
 
     private static AABB fluidBounds(FluidState state, BlockGetter level, BlockPos position) {
-        VoxelShape shape = state.getShape(level, position);
-        return shape.isEmpty()
-                ? new AABB(position)
-                : shape.bounds().move(position);
+        if (state.isEmpty()) {
+            return null;
+        }
+        // FluidState#getShape follows Minecraft's lowered visual surface. Using it as
+        // an acoustic volume leaves a thin air slit above every full water voxel, so a
+        // vertical ray in continuous water encounters a fake reflecting interface once
+        // per block. Acoustic occupancy follows conserved fluid amount instead: source
+        // and falling cells are full, while flowing levels retain a continuous height.
+        double height = Mth.clamp(state.getAmount() / 8.0, 0.0, 1.0);
+        return new AABB(
+                position.getX(),
+                position.getY(),
+                position.getZ(),
+                position.getX() + 1.0,
+                position.getY() + height,
+                position.getZ() + 1.0
+        );
     }
     // EAX exposes one aggregate early-reflection cluster. The tracer still examines all
     // sampled image paths and retains the strongest independent contributions; stopping
@@ -126,7 +139,6 @@ public final class AcousticTracer {
             RoomAcoustics room
     ) {
         MediumSample listenerMedium = sampleMedium(level, listener);
-        float mediumSend = listenerMedium.profile().reverbSend() * listenerMedium.weight();
         return new ImmediateContext(
                 level,
                 listener,
@@ -134,12 +146,6 @@ public final class AcousticTracer {
                 mixedMediumPair(listenerMedium, 2),
                 mixedMediumPair(listenerMedium, 4),
                 mixedMediumPair(listenerMedium, 6),
-                mediumSend,
-                mix(
-                        1.0F,
-                        listenerMedium.profile().reverbHighFrequencyGain(),
-                        listenerMedium.weight()
-                ),
                 room
         );
     }
@@ -183,6 +189,7 @@ public final class AcousticTracer {
         if (cachedTrace != null) {
             return cachedTrace;
         }
+        EmitterMediumTransfer sourceMedium = solveEmitterBoundary(level, source);
         MediumSample listenerMedium = sampleMedium(level, listener);
         AcousticTuning tuning = AcousticMaterialRegistry.tuning();
         Vec3 delta = listener.subtract(source);
@@ -233,7 +240,9 @@ public final class AcousticTracer {
                 level, source, listener, tuning
         );
         float[] directSpectrum = directWavefront.bands().clone();
+        applyEmitterMediumResponse(directSpectrum, sourceMedium);
         applyMediumResponse(directSpectrum, listenerMedium);
+        applyEmitterMediumResponse(diffractionSpectrum, sourceMedium);
         applyMediumResponse(diffractionSpectrum, listenerMedium);
         diffractionContribution = weightedEnergy(diffractionSpectrum);
         float[] structuralSpectrum = structuralPath == null
@@ -298,7 +307,6 @@ public final class AcousticTracer {
         // through the dry voice makes a blocked source sound clean and centered behind
         // the wall. It is sent to the source-specific EAX early-reflection cluster below
         // with its calculated delay and arrival direction instead.
-        float arrivalEnergy = Mth.clamp(weightedEnergy(fieldSpectrum), 0.0F, 1.0F);
         float lowEnergy = geometricSpectrum[0] * 0.24F + geometricSpectrum[1] * 0.26F
                 + geometricSpectrum[2] * 0.27F + geometricSpectrum[3] * 0.23F;
         float highEnergy = geometricSpectrum[4] * 0.28F + geometricSpectrum[5] * 0.27F
@@ -317,27 +325,13 @@ public final class AcousticTracer {
         Vec3 apparentPosition = listener.add(
                 apparentDirection.scale(Math.max(1.0, directDistance))
         );
-        float mediumReverb = listenerMedium.profile().reverbSend() * listenerMedium.weight();
-        float mediumReverbHighFrequency = mix(
-                1.0F,
-                listenerMedium.profile().reverbHighFrequencyGain(),
-                listenerMedium.weight()
-        );
         RoomAcoustics listenerRoom = listenerRoomProbe.acoustics();
         // The late field is driven by the energy which physically reaches the listener
         // region through any path. There is deliberately no same-room/different-room
         // classification: closing a door, moving past an edge, or adding absorption only
         // changes the path spectra and therefore changes the send continuously.
         float pathCoupling = Mth.clamp(weightedEnergy(fieldSpectrum), 0.0F, 1.0F);
-        float mediumDiffuseCoupling = mediumReverb * arrivalEnergy;
-        float reflectedSend = Mth.clamp(
-                (float) Math.sqrt(
-                        pathCoupling * pathCoupling
-                                + mediumDiffuseCoupling * mediumDiffuseCoupling
-                ),
-                0.0F,
-                1.0F
-        );
+        float reflectedSend = pathCoupling;
         // The listener probe supplies this voice's receiving-field boundary. DSP state
         // is still private to the playback occurrence; only the immutable geometric
         // measurement is reused, so another source cannot reset or redirect this tail.
@@ -366,10 +360,7 @@ public final class AcousticTracer {
                         0.0F,
                         0.95F
                 ),
-                Math.min(
-                        fieldHighFrequencyGain,
-                        mediumReverbHighFrequency
-                ),
+                fieldHighFrequencyGain,
                 new EarlyReflection(
                         reflections.gain(),
                         reflections.lowFrequencyGain(),
@@ -574,10 +565,10 @@ public final class AcousticTracer {
         }
 
         if (returnedWeight < 1.0E-4) {
-            RoomAcoustics acoustics = applyTuning(
-                    applyMediumRoom(RoomAcoustics.OUTDOORS, listenerMedium),
-                    tuning
-            );
+            // With no returning boundary energy, water is still an open field rather
+            // than a synthetic enclosed room. Medium propagation is handled by the
+            // path solver, not by replacing outdoors with a canned reverb preset.
+            RoomAcoustics acoustics = applyTuning(RoomAcoustics.OUTDOORS, tuning);
             return new RoomProbe(acoustics, RoomImpulseResponse.SILENT, List.of(), List.of());
         }
 
@@ -668,7 +659,10 @@ public final class AcousticTracer {
                 0.0F,
                 Mth.clamp(airAbsorption(6, tuning.meters(meanDistance)), 0.892F, 1.0F)
         );
-        acoustics = applyMediumRoom(acoustics, listenerMedium);
+        // LateReverbTracer already used the fluid sound speed and per-band propagation
+        // loss. Applying a second medium preset here used to shorten the measured
+        // delays again and overwrite the traced decay/diffusion, producing a cave-like
+        // underwater tail.
         acoustics = applyTuning(acoustics, tuning);
         List<RoomProbe.OpeningSample> openings = new ArrayList<>();
         for (int ray = 0; ray < hits.length; ray++) {
@@ -2680,6 +2674,8 @@ public final class AcousticTracer {
             boolean allowDiffractedLegs,
             double firstArrivalTimeSeconds
     ) {
+        EmitterMediumTransfer sourceMedium = solveEmitterBoundary(level, source);
+        MediumSample listenerMedium = sampleMedium(level, listener);
         List<RoomProbe.SurfaceSample> candidates = reflectionCandidates(
                 source, listener, sourceRoomProbe
         );
@@ -2763,8 +2759,8 @@ public final class AcousticTracer {
             }
             Transmission sourceLeg = traceTransmission(level, source, pathPoint);
             Transmission listenerLeg = traceTransmission(level, pathPoint, listener);
-            float[] sourceBands = sourceLeg.bands();
-            float[] listenerBands = listenerLeg.bands();
+            float[] sourceBands = sourceLeg.bands().clone();
+            float[] listenerBands = listenerLeg.bands().clone();
             // A first-order reflection can remain audible even when either of its legs
             // bends around the same screen that blocks the geometric direct ray. Trace a
             // bounded number of the nearest (therefore strongest) diffraction-reflection
@@ -2789,6 +2785,12 @@ public final class AcousticTracer {
                 );
                 remainingDiffractedLegs--;
             }
+            // Acoustic transfer is reciprocal: an air-calibrated source coupled into
+            // water must acquire the same endpoint spectrum as the inverse path where
+            // the listener's ear is submerged. Applying these at the physical endpoints
+            // (and not at the image point) avoids double-filtering a reflected leg.
+            applyEmitterMediumResponse(sourceBands, sourceMedium);
+            applyMediumResponse(listenerBands, listenerMedium);
             double pathDistance = source.distanceTo(reflectionPoint) + reflectionPoint.distanceTo(listener);
             float distanceGain = (float) (directDistance / Math.max(pathDistance, directDistance));
             float[] pathBands = new float[AcousticBands.COUNT];
@@ -3512,6 +3514,171 @@ public final class AcousticTracer {
         }
     }
 
+    private static void applyEmitterMediumResponse(
+            float[] bands,
+            EmitterMediumTransfer transfer
+    ) {
+        for (int band = 0; band < bands.length; band++) {
+            bands[band] *= transfer.amplitude()[band];
+        }
+    }
+
+    /**
+     * Integrates near-field pressure energy on a finite voxel control surface.
+     * Minecraft may expose an empty centre cell during the update which starts an
+     * immersed block sound; a point sample would mistake that for a one-cubic-metre
+     * bubble. The physical radiator is the block boundary, so its outward flux is what
+     * determines coupling to air and fluid.
+     */
+    static EmitterMediumTransfer solveEmitterBoundary(
+            BlockGetter level,
+            Vec3 source
+    ) {
+        MediumSample local = sampleMedium(level, source);
+        if (local.weight() > 1.0E-6F) {
+            float[] amplitude = new float[AcousticBands.COUNT];
+            for (int band = 0; band < amplitude.length; band++) {
+                amplitude[band] = mix(
+                        1.0F,
+                        local.profile().gain(band),
+                        local.weight()
+                );
+            }
+            return new EmitterMediumTransfer(amplitude);
+        }
+
+        BlockPos cell = BlockPos.containing(source);
+        float[] pressureEnergy = new float[AcousticBands.COUNT];
+        double totalRadiationAdmittance = 0.0;
+        final double patchSize = 0.5;
+        final double outsideOffset = 1.0E-4;
+
+        // Four exact-solid-angle patches per face are enough to resolve partial fluid
+        // contact while keeping this boundary solve far cheaper than one propagation
+        // ray bundle. Solid patches belong to the structure-borne solver and are not
+        // counted as imaginary air apertures.
+        for (int axis = 0; axis < 3; axis++) {
+            for (int side = 0; side < 2; side++) {
+                double plane = coordinate(cell, axis) + side;
+                double distance = Math.max(
+                        Math.abs(plane - coordinate(source, axis)),
+                        1.0E-7
+                );
+                int firstTangent = (axis + 1) % 3;
+                int secondTangent = (axis + 2) % 3;
+                for (int firstPatch = 0; firstPatch < 2; firstPatch++) {
+                    for (int secondPatch = 0; secondPatch < 2; secondPatch++) {
+                        double firstMin = coordinate(cell, firstTangent)
+                                + firstPatch * patchSize
+                                - coordinate(source, firstTangent);
+                        double firstMax = firstMin + patchSize;
+                        double secondMin = coordinate(cell, secondTangent)
+                                + secondPatch * patchSize
+                                - coordinate(source, secondTangent);
+                        double secondMax = secondMin + patchSize;
+                        double solidAngle = rectangleSolidAngle(
+                                distance,
+                                firstMin,
+                                firstMax,
+                                secondMin,
+                                secondMax
+                        );
+                        if (solidAngle <= 1.0E-12) {
+                            continue;
+                        }
+
+                        double[] point = {source.x, source.y, source.z};
+                        point[axis] = plane + (side == 0 ? -outsideOffset : outsideOffset);
+                        point[firstTangent] = coordinate(cell, firstTangent)
+                                + (firstPatch + 0.5) * patchSize;
+                        point[secondTangent] = coordinate(cell, secondTangent)
+                                + (secondPatch + 0.5) * patchSize;
+                        Vec3 boundaryPoint = new Vec3(point[0], point[1], point[2]);
+                        if (pointInsideCollision(level, boundaryPoint)) {
+                            continue;
+                        }
+
+                        MediumSample boundaryMedium = sampleBoundaryMedium(level, boundaryPoint);
+                        // Pressure and normal particle velocity are continuous at an
+                        // open fluid boundary. For the pressure-calibrated Minecraft
+                        // sample, u_n = p / Z and the outward intensity is p*u_n;
+                        // therefore each patch is weighted by its acoustic admittance.
+                        // This also prevents a tiny wetted corner from acting like a
+                        // wholly submerged source merely because water has a large Z.
+                        double patchAdmittance = solidAngle
+                                / boundaryMedium.profile().acousticImpedanceRayl();
+                        totalRadiationAdmittance += patchAdmittance;
+                        for (int band = 0; band < pressureEnergy.length; band++) {
+                            float pressure = mix(
+                                    1.0F,
+                                    boundaryMedium.profile().gain(band),
+                                    boundaryMedium.weight()
+                            );
+                            pressureEnergy[band] += (float) (
+                                    patchAdmittance * pressure * pressure
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if (totalRadiationAdmittance <= 1.0E-12) {
+            return EmitterMediumTransfer.AIR;
+        }
+        float[] amplitude = new float[AcousticBands.COUNT];
+        for (int band = 0; band < amplitude.length; band++) {
+            amplitude[band] = Mth.clamp(
+                    (float) Math.sqrt(
+                            pressureEnergy[band] / totalRadiationAdmittance
+                    ),
+                    0.0F,
+                    1.0F
+            );
+        }
+        return new EmitterMediumTransfer(amplitude);
+    }
+
+    private static double rectangleSolidAngle(
+            double distance,
+            double firstMin,
+            double firstMax,
+            double secondMin,
+            double secondMax
+    ) {
+        return Math.abs(
+                solidAnglePrimitive(firstMax, secondMax, distance)
+                        - solidAnglePrimitive(firstMin, secondMax, distance)
+                        - solidAnglePrimitive(firstMax, secondMin, distance)
+                        + solidAnglePrimitive(firstMin, secondMin, distance)
+        );
+    }
+
+    private static double solidAnglePrimitive(double first, double second, double distance) {
+        return Math.atan2(
+                first * second,
+                distance * Math.sqrt(
+                        distance * distance + first * first + second * second
+                )
+        );
+    }
+
+    private static double coordinate(BlockPos position, int axis) {
+        return switch (axis) {
+            case 0 -> position.getX();
+            case 1 -> position.getY();
+            default -> position.getZ();
+        };
+    }
+
+    private static double coordinate(Vec3 position, int axis) {
+        return switch (axis) {
+            case 0 -> position.x;
+            case 1 -> position.y;
+            default -> position.z;
+        };
+    }
+
     private static MediumSample sampleMedium(BlockGetter level, Vec3 point) {
         BlockPos pos = new BlockPos(Mth.floor(point.x), Mth.floor(point.y), Mth.floor(point.z));
         FluidState fluidState = level.getFluidState(pos);
@@ -3529,36 +3696,6 @@ public final class AcousticTracer {
                 profile,
                 material,
                 Mth.clamp(depth / profile.transitionDepth(), 0.0F, 1.0F)
-        );
-    }
-
-    private static RoomAcoustics applyMediumRoom(RoomAcoustics base, MediumSample medium) {
-        MediumProfile profile = medium.profile();
-        float weight = medium.weight();
-        float propagationTimeScale = mix(
-                1.0F,
-                MediumProfile.AIR.soundSpeedMetersPerSecond()
-                        / profile.soundSpeedMetersPerSecond(),
-                weight
-        );
-        return new RoomAcoustics(
-                mix(base.density(), profile.density(), weight),
-                mix(base.diffusion(), profile.diffusion(), weight),
-                mix(base.gain(), profile.roomGain(), weight),
-                mix(base.gainHighFrequency(), profile.roomGainHighFrequency(), weight),
-                mix(base.gainLowFrequency(), profile.roomGainLowFrequency(), weight),
-                mix(base.decayTime(), profile.decayTime(), weight) * propagationTimeScale,
-                mix(base.decayHighFrequencyRatio(), profile.decayHighFrequencyRatio(), weight),
-                mix(base.decayLowFrequencyRatio(), profile.decayLowFrequencyRatio(), weight),
-                mix(base.reflectionsGain(), profile.reflectionsGain(), weight),
-                mix(base.reflectionsDelay(), profile.reflectionsDelay(), weight) * propagationTimeScale,
-                base.reflectionsPan().scale(1.0F - weight),
-                mix(base.lateReverbGain(), profile.lateReverbGain(), weight),
-                mix(base.lateReverbDelay(), profile.lateReverbDelay(), weight) * propagationTimeScale,
-                base.lateReverbPan().scale(1.0F - weight),
-                mix(base.modulationTime(), profile.modulationTime(), weight),
-                mix(base.modulationDepth(), profile.modulationDepth(), weight),
-                mix(base.airAbsorptionGainHighFrequency(), profile.airAbsorptionGainHighFrequency(), weight)
         );
     }
 
@@ -3598,6 +3735,24 @@ public final class AcousticTracer {
         return AtmosphericAbsorption.amplitudeGain(
                 cache.nepersPerMeter()[band], distance
         );
+    }
+
+    private static MediumSample sampleBoundaryMedium(BlockGetter level, Vec3 point) {
+        BlockPos pos = BlockPos.containing(point);
+        FluidState fluidState = level.getFluidState(pos);
+        if (fluidState.isEmpty()) {
+            return new MediumSample(MediumProfile.AIR, null, 0.0F);
+        }
+        // FluidState's visual/collision shape deliberately leaves a small gap above a
+        // full source block. That gap is a rendering convention, not an acoustic air
+        // aperture. Boundary wetting follows conserved fluid amount; flowing levels
+        // still expose the corresponding unfilled part of a vertical face.
+        float fill = Mth.clamp(fluidState.getAmount() / 8.0F, 0.0F, 1.0F);
+        if (point.y - pos.getY() > fill + 1.0E-6) {
+            return new MediumSample(MediumProfile.AIR, null, 0.0F);
+        }
+        AcousticMaterial material = AcousticMaterialRegistry.findFluid(fluidState);
+        return new MediumSample(material.medium(), material, 1.0F);
     }
 
     static float sphericalSpreadingGain(double distanceMeters, AcousticTuning tuning) {
@@ -4485,6 +4640,12 @@ public final class AcousticTracer {
     ) {
     }
 
+    record EmitterMediumTransfer(float[] amplitude) {
+        private static final EmitterMediumTransfer AIR = new EmitterMediumTransfer(
+                unityBands()
+        );
+    }
+
     public enum TraceQuality {
         FULL,
         MEDIUM,
@@ -4498,8 +4659,6 @@ public final class AcousticTracer {
             float midLowBandGain,
             float midHighBandGain,
             float highBandGain,
-            float mediumReverbSend,
-            float reverbHighFrequencyGain,
             RoomAcoustics room
     ) {
         public AcousticResult resultFor(Vec3 source) {
@@ -4521,17 +4680,28 @@ public final class AcousticTracer {
                     default -> highBandGain;
                 };
             }
+            // The listener endpoint response is precomputed above; sample the source
+            // endpoint from the same immutable scene so a short water-to-air sound is
+            // already coloured on its first callback buffer.
+            applyEmitterMediumResponse(transmission, solveEmitterBoundary(level, source));
             float[] airborne = transmission.clone();
             StructuralPath structuralPath = traceStructuralPath(
                     level, source, listener, tuning
             );
             if (structuralPath != null) {
                 for (int band = 0; band < transmission.length; band++) {
+                    float listenerResponse = switch (band / 2) {
+                        case 0 -> lowBandGain;
+                        case 1 -> midLowBandGain;
+                        case 2 -> midHighBandGain;
+                        default -> highBandGain;
+                    };
+                    float structuralAmplitude = structuralPath.bands()[band]
+                            * listenerResponse;
                     transmission[band] = Mth.clamp(
                             (float) Math.sqrt(
                                     transmission[band] * transmission[band]
-                                            + structuralPath.bands()[band]
-                                            * structuralPath.bands()[band]
+                                            + structuralAmplitude * structuralAmplitude
                             ),
                             0.0F,
                             1.0F
@@ -4539,12 +4709,8 @@ public final class AcousticTracer {
                 }
             }
             float pathCoupling = Mth.clamp(weightedEnergy(transmission), 0.0F, 1.0F);
-            float mediumDiffuseCoupling = mediumReverbSend * pathCoupling;
             float initialReverbSend = Mth.clamp(
-                    (float) Math.sqrt(
-                            pathCoupling * pathCoupling
-                                    + mediumDiffuseCoupling * mediumDiffuseCoupling
-                    ) * tuning.reverbSendScale(),
+                    pathCoupling * tuning.reverbSendScale(),
                     0.0F,
                     0.95F
             );
@@ -4583,10 +4749,7 @@ public final class AcousticTracer {
                     pairEnergy(transmission, 4),
                     pairEnergy(transmission, 6),
                     initialReverbSend,
-                    Math.min(
-                            Mth.clamp(high / Math.max(low, 0.01F), 0.05F, 1.0F),
-                            reverbHighFrequencyGain
-                    ),
+                    Mth.clamp(high / Math.max(low, 0.01F), 0.05F, 1.0F),
                     EarlyReflection.SILENT,
                     0.0F,
                     distance,
