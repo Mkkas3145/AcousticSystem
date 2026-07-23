@@ -2102,6 +2102,26 @@ public final class AcousticTracer {
         DenseAirSearchScratch scratch = DENSE_AIR_SEARCH.get();
         boolean singleSeed = startKeys.size() == 1 && goalKeys.size() == 1;
         scratch.begin(scene.cellCapacity(), !singleSeed);
+        try {
+            return searchDenseAirGraphInitialized(
+                    scene, source, listener, startKeys, goalKeys,
+                    candidateBudget, scratch, singleSeed
+            );
+        } finally {
+            scratch.end();
+        }
+    }
+
+    private static DenseAirSearchResult searchDenseAirGraphInitialized(
+            AcousticScene scene,
+            Vec3 source,
+            Vec3 listener,
+            List<AirCellKey> startKeys,
+            List<AirCellKey> goalKeys,
+            int candidateBudget,
+            DenseAirSearchScratch scratch,
+            boolean singleSeed
+    ) {
         DenseEndpointHeuristic goalHeuristic = DenseEndpointHeuristic.from(
                 goalKeys, listener
         );
@@ -2431,6 +2451,15 @@ public final class AcousticTracer {
                 result.expanded(),
                 System.nanoTime() - started
         );
+    }
+
+    static DenseAirSearchStorageMetrics measureDenseAirSearchStorage(
+            int sceneCellCapacity
+    ) {
+        DenseAirSearchScratch scratch = DENSE_AIR_SEARCH.get();
+        scratch.begin(sceneCellCapacity, false);
+        scratch.end();
+        return scratch.storageMetrics(sceneCellCapacity);
     }
 
     private static PropagationGraphPath buildAirPropagationPath(
@@ -5994,6 +6023,14 @@ public final class AcousticTracer {
     ) {
     }
 
+    record DenseAirSearchStorageMetrics(
+            int sceneCellCapacity,
+            int sectionTableSlots,
+            int retainedPages,
+            long estimatedStateBytes
+    ) {
+    }
+
     private record DenseEndpointHeuristic(
             int[] xs,
             int[] ys,
@@ -6035,70 +6072,155 @@ public final class AcousticTracer {
         }
     }
 
-    /** Reused dense arrays replace four primitive hash tables in scene-backed A*. */
+    /**
+     * Paged search state indexed by the scene's stable dense cell ids. A scene can
+     * contain millions of cells, while one bounded A* touches only a small fraction.
+     * Allocating six arrays for the complete scene on every propagation worker used to
+     * multiply a large snapshot by the worker count and exhaust the client heap.
+     */
     private static final class DenseAirSearchScratch {
-        private double[] forwardDistances = new double[0];
-        private double[] backwardDistances = new double[0];
-        private int[] forwardPrevious = new int[0];
-        private int[] backwardPrevious = new int[0];
-        private int[] forwardStamps = new int[0];
-        private int[] backwardStamps = new int[0];
-        private int stamp = 1;
+        private static final int PAGE_SHIFT = 12;
+        private static final int PAGE_MASK = (1 << PAGE_SHIFT) - 1;
+        private static final int MAX_RETAINED_PAGES = 8;
+
+        private DenseAirSearchPage[] pagesBySection = new DenseAirSearchPage[0];
+        private DenseAirSearchPage[] retainedPages =
+                new DenseAirSearchPage[MAX_RETAINED_PAGES];
+        private int retainedPageCount;
+        private int[] touchedSections = new int[32];
+        private int touchedSectionCount;
+        private int stamp;
         private final IntAirGraphHeap forwardFrontier = new IntAirGraphHeap(1024);
         private final IntAirGraphHeap backwardFrontier = new IntAirGraphHeap(1024);
         private final IntBucketFrontier forwardBuckets = new IntBucketFrontier();
         private final IntBucketFrontier backwardBuckets = new IntBucketFrontier();
 
         private void begin(int capacity, boolean prepareHeaps) {
-            if (forwardDistances.length < capacity) {
-                forwardDistances = new double[capacity];
-                backwardDistances = new double[capacity];
-                forwardPrevious = new int[capacity];
-                backwardPrevious = new int[capacity];
-                forwardStamps = new int[capacity];
-                backwardStamps = new int[capacity];
-                stamp = 1;
-            } else if (++stamp == 0) {
-                Arrays.fill(forwardStamps, 0);
-                Arrays.fill(backwardStamps, 0);
+            end();
+            int sectionCapacity = (capacity + PAGE_MASK) >>> PAGE_SHIFT;
+            if (pagesBySection.length < sectionCapacity) {
+                pagesBySection = Arrays.copyOf(pagesBySection, sectionCapacity);
+            } else if (pagesBySection.length > Math.max(256, sectionCapacity * 4)) {
+                pagesBySection = new DenseAirSearchPage[sectionCapacity];
+            }
+            if (++stamp == 0) {
+                for (int index = 0; index < retainedPageCount; index++) {
+                    retainedPages[index].clearStamps();
+                }
                 stamp = 1;
             }
             if (prepareHeaps) {
-                forwardFrontier.begin(capacity);
-                backwardFrontier.begin(capacity);
+                forwardFrontier.begin();
+                backwardFrontier.begin();
             }
             forwardBuckets.clear();
             backwardBuckets.clear();
         }
 
+        private void end() {
+            for (int index = 0; index < touchedSectionCount; index++) {
+                int section = touchedSections[index];
+                DenseAirSearchPage page = pagesBySection[section];
+                pagesBySection[section] = null;
+                if (page != null && retainedPageCount < MAX_RETAINED_PAGES) {
+                    retainedPages[retainedPageCount++] = page;
+                }
+            }
+            touchedSectionCount = 0;
+        }
+
+        private DenseAirSearchPage pageForWrite(int cell) {
+            int section = cell >>> PAGE_SHIFT;
+            DenseAirSearchPage page = pagesBySection[section];
+            if (page != null) {
+                return page;
+            }
+            if (retainedPageCount > 0) {
+                page = retainedPages[--retainedPageCount];
+                retainedPages[retainedPageCount] = null;
+            } else {
+                page = new DenseAirSearchPage();
+            }
+            pagesBySection[section] = page;
+            if (touchedSectionCount == touchedSections.length) {
+                touchedSections = Arrays.copyOf(
+                        touchedSections, touchedSections.length << 1
+                );
+            }
+            touchedSections[touchedSectionCount++] = section;
+            return page;
+        }
+
+        private DenseAirSearchPage page(int cell) {
+            int section = cell >>> PAGE_SHIFT;
+            return section < pagesBySection.length
+                    ? pagesBySection[section] : null;
+        }
+
         private double forwardDistance(int cell) {
-            return forwardStamps[cell] == stamp
-                    ? forwardDistances[cell] : Double.POSITIVE_INFINITY;
+            DenseAirSearchPage page = page(cell);
+            int local = cell & PAGE_MASK;
+            return page != null && page.forwardStamps[local] == stamp
+                    ? page.forwardDistances[local] : Double.POSITIVE_INFINITY;
         }
 
         private double backwardDistance(int cell) {
-            return backwardStamps[cell] == stamp
-                    ? backwardDistances[cell] : Double.POSITIVE_INFINITY;
+            DenseAirSearchPage page = page(cell);
+            int local = cell & PAGE_MASK;
+            return page != null && page.backwardStamps[local] == stamp
+                    ? page.backwardDistances[local] : Double.POSITIVE_INFINITY;
         }
 
         private void setForward(int cell, double distance, int previous) {
-            forwardStamps[cell] = stamp;
-            forwardDistances[cell] = distance;
-            forwardPrevious[cell] = previous;
+            DenseAirSearchPage page = pageForWrite(cell);
+            int local = cell & PAGE_MASK;
+            page.forwardStamps[local] = stamp;
+            page.forwardDistances[local] = distance;
+            page.forwardPrevious[local] = previous;
         }
 
         private void setBackward(int cell, double distance, int previous) {
-            backwardStamps[cell] = stamp;
-            backwardDistances[cell] = distance;
-            backwardPrevious[cell] = previous;
+            DenseAirSearchPage page = pageForWrite(cell);
+            int local = cell & PAGE_MASK;
+            page.backwardStamps[local] = stamp;
+            page.backwardDistances[local] = distance;
+            page.backwardPrevious[local] = previous;
         }
 
         private int forwardPrevious(int cell) {
-            return forwardPrevious[cell];
+            return page(cell).forwardPrevious[cell & PAGE_MASK];
         }
 
         private int backwardPrevious(int cell) {
-            return backwardPrevious[cell];
+            return page(cell).backwardPrevious[cell & PAGE_MASK];
+        }
+
+        private DenseAirSearchStorageMetrics storageMetrics(int sceneCellCapacity) {
+            long pageBytes = 2L * Double.BYTES * 4096
+                    + 4L * Integer.BYTES * 4096;
+            long estimated = (long) pagesBySection.length * Long.BYTES
+                    + (long) touchedSections.length * Integer.BYTES
+                    + (long) retainedPageCount * pageBytes;
+            return new DenseAirSearchStorageMetrics(
+                    sceneCellCapacity,
+                    pagesBySection.length,
+                    retainedPageCount,
+                    estimated
+            );
+        }
+    }
+
+    private static final class DenseAirSearchPage {
+        private final double[] forwardDistances = new double[4096];
+        private final double[] backwardDistances = new double[4096];
+        private final int[] forwardPrevious = new int[4096];
+        private final int[] backwardPrevious = new int[4096];
+        private final int[] forwardStamps = new int[4096];
+        private final int[] backwardStamps = new int[4096];
+
+        private void clearStamps() {
+            Arrays.fill(forwardStamps, 0);
+            Arrays.fill(backwardStamps, 0);
         }
     }
 
@@ -6199,7 +6321,6 @@ public final class AcousticTracer {
         private int[] cells;
         private double[] distances;
         private double[] priorities;
-        private int[] positions = new int[0];
         private int size;
         private double lastDistance;
 
@@ -6210,12 +6331,8 @@ public final class AcousticTracer {
             priorities = new double[capacity];
         }
 
-        private void begin(int cellCapacity) {
+        private void begin() {
             size = 0;
-            if (positions.length < cellCapacity) {
-                positions = new int[cellCapacity];
-            }
-            Arrays.fill(positions, 0, cellCapacity, -1);
         }
 
         private boolean isEmpty() {
@@ -6231,21 +6348,6 @@ public final class AcousticTracer {
         }
 
         private void add(int cell, double distance, double priority) {
-            int existing = positions[cell];
-            if (existing >= 0) {
-                double oldPriority = priorities[existing];
-                double oldDistance = distances[existing];
-                distances[existing] = distance;
-                priorities[existing] = priority;
-                if (AirGraphHeap.comesBefore(
-                        priority, distance, oldPriority, oldDistance
-                )) {
-                    siftUp(existing, cell, distance, priority);
-                } else {
-                    siftDown(existing, cell, distance, priority);
-                }
-                return;
-            }
             ensureCapacity(size + 1);
             int index = size++;
             siftUp(index, cell, distance, priority);
@@ -6268,19 +6370,16 @@ public final class AcousticTracer {
                 cells[index] = cells[parent];
                 distances[index] = distances[parent];
                 priorities[index] = priorities[parent];
-                positions[cells[index]] = index;
                 index = parent;
             }
             cells[index] = cell;
             distances[index] = distance;
             priorities[index] = priority;
-            positions[cell] = index;
         }
 
         private int poll() {
             int result = cells[0];
             lastDistance = distances[0];
-            positions[result] = -1;
             int last = --size;
             if (last == 0) {
                 return result;
@@ -6308,48 +6407,12 @@ public final class AcousticTracer {
                 cells[index] = cells[child];
                 distances[index] = distances[child];
                 priorities[index] = priorities[child];
-                positions[cells[index]] = index;
                 index = child;
             }
             cells[index] = movedCell;
             distances[index] = movedDistance;
             priorities[index] = movedPriority;
-            positions[movedCell] = index;
             return result;
-        }
-
-        private void siftDown(
-                int index,
-                int cell,
-                double distance,
-                double priority
-        ) {
-            int half = size >>> 1;
-            while (index < half) {
-                int child = (index << 1) + 1;
-                int right = child + 1;
-                if (right < size && AirGraphHeap.comesBefore(
-                        priorities[right], distances[right],
-                        priorities[child], distances[child]
-                )) {
-                    child = right;
-                }
-                if (!AirGraphHeap.comesBefore(
-                        priorities[child], distances[child],
-                        priority, distance
-                )) {
-                    break;
-                }
-                cells[index] = cells[child];
-                distances[index] = distances[child];
-                priorities[index] = priorities[child];
-                positions[cells[index]] = index;
-                index = child;
-            }
-            cells[index] = cell;
-            distances[index] = distance;
-            priorities[index] = priority;
-            positions[cell] = index;
         }
 
         private void ensureCapacity(int required) {

@@ -1298,6 +1298,45 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void denseSearchStorageDoesNotScaleWithEveryCellInTheScene() throws Exception {
+        int workerCount = 12;
+        int twoMillionCells = 2 * 1024 * 1024;
+        ExecutorService workers = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch ready = new CountDownLatch(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<AcousticTracer.DenseAirSearchStorageMetrics>> results =
+                new ArrayList<>(workerCount);
+        try {
+            for (int worker = 0; worker < workerCount; worker++) {
+                results.add(workers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return AcousticTracer.measureDenseAirSearchStorage(
+                            twoMillionCells
+                    );
+                }));
+            }
+            ready.await();
+            start.countDown();
+            long retainedBytes = 0L;
+            for (Future<AcousticTracer.DenseAirSearchStorageMetrics> result : results) {
+                AcousticTracer.DenseAirSearchStorageMetrics storage = result.get();
+                assertTrue(storage.retainedPages() <= 8, () -> "storage=" + storage);
+                retainedBytes += storage.estimatedStateBytes();
+            }
+            long measuredRetainedBytes = retainedBytes;
+            assertTrue(
+                    measuredRetainedBytes < 4L * 1024 * 1024,
+                    () -> "Propagation workers retained scene-sized dense arrays: "
+                            + measuredRetainedBytes
+            );
+        } finally {
+            start.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
     @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
     void coldScenePortalTraceP95RemainsBelowThreeMilliseconds() {
         Vec3 source = new Vec3(10.5, 8.5, 10.5);

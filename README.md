@@ -6,7 +6,7 @@
 
 **Real-time acoustic physics for Minecraft worlds**
 
-[![Version](https://img.shields.io/badge/Version-1.16.2-f2b632?style=for-the-badge)](https://github.com/Mkkas3145/AcousticSystem/releases)
+[![Version](https://img.shields.io/badge/Version-1.16.3-f2b632?style=for-the-badge)](https://github.com/Mkkas3145/AcousticSystem/releases)
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11%20%7C%2026.1.2%20%7C%2026.2-62b47a?style=for-the-badge)](#compatibility)
 [![Loaders](https://img.shields.io/badge/Loaders-Fabric%20%7C%20Forge%20%7C%20NeoForge-4c78a8?style=for-the-badge)](#compatibility)
 [![한국어](https://img.shields.io/badge/README-한국어-0a66c2?style=for-the-badge)](README.ko.md)
