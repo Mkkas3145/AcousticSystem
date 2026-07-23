@@ -102,7 +102,10 @@ matrixBuilds << tasks.register('buildFabric2612', Exec) {
 	group = 'build'
 	description = 'Builds AcousticSystem for Fabric 26.1.2.'
 	workingDir projectDir
-	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.1.2']
+	commandLine wrapperCommand + [
+			'cleanCompileJava', 'cleanCompileClientJava', 'cleanCompileTestJava',
+			'cleanTest', 'build', '-Ptarget_minecraft_version=26.1.2'
+	]
 	doLast {
 		copy {
 			from layout.buildDirectory.file("libs/AcousticSystem-26.1.2-${project.version}.jar")
@@ -114,7 +117,10 @@ matrixBuilds << tasks.register('buildFabric262', Exec) {
 	group = 'build'
 	description = 'Builds AcousticSystem for Fabric 26.2.'
 	workingDir projectDir
-	commandLine wrapperCommand + ['build', '-Ptarget_minecraft_version=26.2']
+	commandLine wrapperCommand + [
+			'cleanCompileJava', 'cleanCompileClientJava', 'cleanCompileTestJava',
+			'cleanTest', 'build', '-Ptarget_minecraft_version=26.2'
+	]
 	doLast {
 		copy {
 			from layout.buildDirectory.file("libs/AcousticSystem-26.2-${project.version}.jar")

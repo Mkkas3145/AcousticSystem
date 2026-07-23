@@ -50,6 +50,9 @@ public final class SoftwareAcousticMixer {
     private static volatile boolean callbackFailureReported;
     private static volatile long callbackOverruns;
     private static volatile long worstCallbackNanoseconds;
+    private static volatile long lateAcousticRenderCount;
+    private static volatile long worstAcousticRenderNanoseconds;
+    private static volatile long latestRenderedAcousticSequence = Long.MIN_VALUE;
     private static volatile long lastHealthReportNanoseconds;
     private static float[] leftScratch = new float[8_192];
     private static float[] rightScratch = new float[8_192];
@@ -140,6 +143,9 @@ public final class SoftwareAcousticMixer {
             callbackFailureReported = false;
             callbackOverruns = 0L;
             worstCallbackNanoseconds = 0L;
+            lateAcousticRenderCount = 0L;
+            worstAcousticRenderNanoseconds = 0L;
+            latestRenderedAcousticSequence = Long.MIN_VALUE;
             lastHealthReportNanoseconds = System.nanoTime();
             AcousticSystem.LOGGER.info(
                     "Software acoustic field mixer enabled without per-sound EFX slots ({})",
@@ -159,6 +165,9 @@ public final class SoftwareAcousticMixer {
             callbackFailureReported = false;
             callbackOverruns = 0L;
             worstCallbackNanoseconds = 0L;
+            lateAcousticRenderCount = 0L;
+            worstAcousticRenderNanoseconds = 0L;
+            latestRenderedAcousticSequence = Long.MIN_VALUE;
         }
     }
 
@@ -275,9 +284,31 @@ public final class SoftwareAcousticMixer {
             float sourceSend,
             float sourceHighFrequency
     ) {
+        apply(
+                source, earlyReflection, earlySend, earlyDirection,
+                propagationDirection, listenerRoom, listenerSend,
+                listenerHighFrequency, sourceRoom, sourceSend,
+                sourceHighFrequency, Long.MIN_VALUE
+        );
+    }
+
+    public static boolean apply(
+            int source,
+            EarlyReflection earlyReflection,
+            float earlySend,
+            Vec3 earlyDirection,
+            Vec3 propagationDirection,
+            RoomAcoustics listenerRoom,
+            float listenerSend,
+            float listenerHighFrequency,
+            RoomAcoustics sourceRoom,
+            float sourceSend,
+            float sourceHighFrequency,
+            long sequence
+    ) {
         Voice voice = current(source);
         if (voice == null) {
-            return;
+            return false;
         }
         voice.updateAcoustics(new VoiceAcoustics(
                 earlyReflection,
@@ -287,24 +318,34 @@ public final class SoftwareAcousticMixer {
                 listenerRoom == null ? RoomAcoustics.OUTDOORS : listenerRoom,
                 clamp(listenerSend, 0.0F, 1.0F),
                 clamp(listenerHighFrequency, 0.0F, 1.0F),
+                1.0F,
                 sourceRoom == null ? RoomAcoustics.OUTDOORS : sourceRoom,
                 clamp(sourceSend, 0.0F, 1.0F),
                 clamp(sourceHighFrequency, 0.0F, 1.0F),
-                controlCoefficient()
+                controlCoefficient(),
+                sequence,
+                System.nanoTime()
         ));
+        return true;
     }
 
     /** Updates only listener-relative directions; feedback and delay state are untouched. */
     public static void updateSpatial(
             int source,
             Vec3 earlyDirection,
-            Vec3 propagationDirection
+            Vec3 propagationDirection,
+            float listenerOutputGain,
+            float listenerSend,
+            float listenerHighFrequency
     ) {
         Voice voice = current(source);
         if (voice != null) {
             voice.updateSpatial(
                     normalizedOrZero(earlyDirection),
-                    AmbisonicDirection.from(propagationDirection)
+                    AmbisonicDirection.from(propagationDirection),
+                    clamp(listenerOutputGain, 0.0F, 1.0F),
+                    clamp(listenerSend, 0.0F, 1.0F),
+                    clamp(listenerHighFrequency, 0.0F, 1.0F)
             );
         }
     }
@@ -337,20 +378,54 @@ public final class SoftwareAcousticMixer {
         }
         long now = System.nanoTime();
         long overruns = callbackOverruns;
-        if (overruns == 0L
-                || now - lastHealthReportNanoseconds < 1_000_000_000L) {
+        long lateRenders = lateAcousticRenderCount;
+        if (overruns == 0L && lateRenders == 0L) {
             return;
         }
-        callbackOverruns = 0L;
-        long worst = worstCallbackNanoseconds;
-        worstCallbackNanoseconds = 0L;
+        if (now - lastHealthReportNanoseconds < 1_000_000_000L) {
+            return;
+        }
+        if (overruns != 0L) {
+            callbackOverruns = 0L;
+            long worst = worstCallbackNanoseconds;
+            worstCallbackNanoseconds = 0L;
+            AcousticSystem.LOGGER.warn(
+                    "Software acoustic mixer missed {} audio deadlines; worst callback={} ms, voices={}",
+                    overruns,
+                    worst / 1_000_000.0,
+                    renderVoices.length
+            );
+        }
+        if (lateRenders != 0L) {
+            lateAcousticRenderCount = 0L;
+            long worst = worstAcousticRenderNanoseconds;
+            worstAcousticRenderNanoseconds = 0L;
+            AcousticSystem.LOGGER.warn(
+                    "Acoustic coefficients reached the audio callback late: updates={}, worst={} ms, latest-sequence={}",
+                    lateRenders,
+                    worst / 1_000_000.0,
+                    latestRenderedAcousticSequence
+            );
+        }
         lastHealthReportNanoseconds = now;
-        AcousticSystem.LOGGER.warn(
-                "Software acoustic mixer missed {} audio deadlines; worst callback={} ms, voices={}",
-                overruns,
-                worst / 1_000_000.0,
-                renderVoices.length
-        );
+    }
+
+    private static void recordAcousticRender(
+            long sequence,
+            long publishedNanoseconds
+    ) {
+        if (sequence == Long.MIN_VALUE) {
+            return;
+        }
+        latestRenderedAcousticSequence = sequence;
+        long elapsed = System.nanoTime() - publishedNanoseconds;
+        if (elapsed <= 25_000_000L) {
+            return;
+        }
+        lateAcousticRenderCount++;
+        if (elapsed > worstAcousticRenderNanoseconds) {
+            worstAcousticRenderNanoseconds = elapsed;
+        }
     }
 
     private static void recordCallbackDuration(long started, int numbytes) {
@@ -688,10 +763,13 @@ public final class SoftwareAcousticMixer {
             RoomAcoustics listenerRoom,
             float listenerSend,
             float listenerHighFrequency,
+            float listenerOutputGain,
             RoomAcoustics sourceRoom,
             float sourceSend,
             float sourceHighFrequency,
-            float controlCoefficient
+            float controlCoefficient,
+            long sequence,
+            long publishedNanoseconds
     ) {
         private static final VoiceAcoustics SILENT = new VoiceAcoustics(
                 EarlyReflection.SILENT,
@@ -701,10 +779,13 @@ public final class SoftwareAcousticMixer {
                 RoomAcoustics.OUTDOORS,
                 0.0F,
                 1.0F,
+                1.0F,
                 RoomAcoustics.OUTDOORS,
                 0.0F,
                 1.0F,
-                1.0F
+                1.0F,
+                Long.MIN_VALUE,
+                0L
         );
     }
 
@@ -727,8 +808,10 @@ public final class SoftwareAcousticMixer {
         private volatile boolean inputEnded;
         private volatile boolean finished;
         private VoiceAcoustics renderedAcoustics;
+        private long renderedAcousticSequence = Long.MIN_VALUE;
         private float renderedListenerSend;
         private float renderedListenerHighFrequency = 1.0F;
+        private float renderedListenerOutputGain = 1.0F;
         private float renderedSourceSend;
         private float renderedSourceHighFrequency = 1.0F;
 
@@ -765,7 +848,10 @@ public final class SoftwareAcousticMixer {
 
         private void updateSpatial(
                 Vec3 earlyDirection,
-                AmbisonicDirection propagationDirection
+                AmbisonicDirection propagationDirection,
+                float listenerOutputGain,
+                float listenerSend,
+                float listenerHighFrequency
         ) {
             VoiceAcoustics current = acoustics;
             acoustics = new VoiceAcoustics(
@@ -774,12 +860,15 @@ public final class SoftwareAcousticMixer {
                     earlyDirection,
                     propagationDirection,
                     current.listenerRoom(),
-                    current.listenerSend(),
-                    current.listenerHighFrequency(),
+                    listenerSend,
+                    listenerHighFrequency,
+                    listenerOutputGain,
                     current.sourceRoom(),
                     current.sourceSend(),
                     current.sourceHighFrequency(),
-                    current.controlCoefficient()
+                    current.controlCoefficient(),
+                    current.sequence(),
+                    current.publishedNanoseconds()
             );
         }
 
@@ -811,6 +900,12 @@ public final class SoftwareAcousticMixer {
             for (int frame = 0; frame < frames; frame++) {
                 VoiceAcoustics current = acoustics;
                 if (current != renderedAcoustics) {
+                    if (current.sequence() != renderedAcousticSequence) {
+                        recordAcousticRender(
+                                current.sequence(), current.publishedNanoseconds()
+                        );
+                        renderedAcousticSequence = current.sequence();
+                    }
                     early.configure(
                             current.early(), current.earlySend(),
                             current.earlyDirection(), current.controlCoefficient()
@@ -819,6 +914,7 @@ public final class SoftwareAcousticMixer {
                         renderedListenerSend = current.listenerSend();
                         renderedListenerHighFrequency =
                                 current.listenerHighFrequency();
+                        renderedListenerOutputGain = current.listenerOutputGain();
                         renderedSourceSend = current.sourceSend();
                         renderedSourceHighFrequency =
                                 current.sourceHighFrequency();
@@ -832,6 +928,9 @@ public final class SoftwareAcousticMixer {
                 renderedListenerHighFrequency += (
                         current.listenerHighFrequency()
                                 - renderedListenerHighFrequency
+                ) * response;
+                renderedListenerOutputGain += (
+                        current.listenerOutputGain() - renderedListenerOutputGain
                 ) * response;
                 renderedSourceSend += (
                         current.sourceSend() - renderedSourceSend
@@ -850,8 +949,10 @@ public final class SoftwareAcousticMixer {
                         input * renderedSourceSend,
                         renderedSourceHighFrequency
                 );
-                float listenerLeft = unpackLeft(listenerOutput);
-                float listenerRight = unpackRight(listenerOutput);
+                float listenerLeft = unpackLeft(listenerOutput)
+                        * renderedListenerOutputGain;
+                float listenerRight = unpackRight(listenerOutput)
+                        * renderedListenerOutputGain;
                 float sourceLeft = unpackLeft(sourceOutput);
                 float sourceRight = unpackRight(sourceOutput);
                 if (ambisonic) {

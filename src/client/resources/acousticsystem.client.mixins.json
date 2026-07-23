@@ -7,6 +7,7 @@
     "GameRendererAccessor",
     "CameraAccessor",
     "ChannelAccessor",
+    "ChannelHandleAccessor",
     "ChannelMixin",
     "ClientLevelMixin",
     "LibraryMixin",

@@ -14,6 +14,7 @@ import net.minecraft.world.phys.Vec3;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
+import org.macaroon.acousticsystem.client.material.MediumProfile;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -145,6 +146,35 @@ class LateReverbTracerIntegrationTest {
 
         assertSame(first.impulseResponse(), second.impulseResponse());
         assertEquals(first.acoustics(), second.acoustics());
+    }
+
+    @Test
+    void parallelRayTracingReducesInTheSameDeterministicOrder() {
+        SolidGeometry room = position ->
+                position.getY() <= 0 || position.getY() >= 9
+                        || position.getX() <= -8 || position.getX() >= 8
+                        || position.getZ() <= -8 || position.getZ() >= 8;
+        TestWorld world = new TestWorld(room);
+        AcousticTracer.SurfaceHit[] firstHits = new AcousticTracer.SurfaceHit[DIRECTIONS.length];
+        for (int ray = 0; ray < DIRECTIONS.length; ray++) {
+            firstHits[ray] = AcousticTracer.firstSurface(
+                    world,
+                    LISTENER,
+                    LISTENER.add(DIRECTIONS[ray].scale(
+                            AcousticTuning.DEFAULT.adaptiveRoomProbeDistance()
+                    ))
+            );
+        }
+        LateReverbTracer.Estimate serial = LateReverbTracer.trace(
+                world, LISTENER, DIRECTIONS, firstHits, AcousticTuning.DEFAULT,
+                MediumProfile.AIR, null, 0.0F, 0.8F, false
+        );
+        LateReverbTracer.Estimate parallel = LateReverbTracer.trace(
+                world, LISTENER, DIRECTIONS, firstHits, AcousticTuning.DEFAULT,
+                MediumProfile.AIR, null, 0.0F, 0.8F, true
+        );
+
+        assertEquals(serial, parallel);
     }
 
     @Test

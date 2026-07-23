@@ -34,7 +34,7 @@ final class LateReverbTracer {
     ) {
         return trace(
                 level, listener, directionGrid, initialHits, tuning,
-                MediumProfile.AIR, null, 0.0F, fallbackDecayTime
+                MediumProfile.AIR, null, 0.0F, fallbackDecayTime, false
         );
     }
 
@@ -48,6 +48,24 @@ final class LateReverbTracer {
             AcousticMaterial mediumMaterial,
             float mediumWeight,
             float fallbackDecayTime
+    ) {
+        return trace(
+                level, listener, directionGrid, initialHits, tuning,
+                medium, mediumMaterial, mediumWeight, fallbackDecayTime, false
+        );
+    }
+
+    static Estimate trace(
+            BlockGetter level,
+            Vec3 listener,
+            Vec3[] directionGrid,
+            AcousticTracer.SurfaceHit[] initialHits,
+            AcousticTuning tuning,
+            MediumProfile medium,
+            AcousticMaterial mediumMaterial,
+            float mediumWeight,
+            float fallbackDecayTime,
+            boolean parallelRays
     ) {
         double soundSpeed = Mth.lerp(
                 mediumWeight,
@@ -72,6 +90,32 @@ final class LateReverbTracer {
         float[] earlyBands = new float[AcousticBands.COUNT];
         float[] lateBands = new float[AcousticBands.COUNT];
 
+        // Common random numbers keep the Monte Carlo field correlated while the
+        // listener moves. Geometry still changes every arrival and energy value, but a
+        // half-block boundary no longer replaces a long cavern tail with unrelated noise.
+        long seed = MONTE_CARLO_SEED;
+        int directionOffset = Math.floorMod((int) seed, directionGrid.length);
+        RayTrace[] rayTraces = new RayTrace[rayCount];
+        if (parallelRays) {
+            AcousticWorkerPool.parallelFor(rayCount, ray ->
+                    rayTraces[ray] = traceRay(
+                            level, listener, directionGrid, initialHits, tuning,
+                            mediumMaterial, mediumWeight, soundSpeed,
+                            maximumSegmentDistance, maxBounces,
+                            directionOffset, seed, ray, rayCount
+                    )
+            );
+        } else {
+            for (int ray = 0; ray < rayCount; ray++) {
+                rayTraces[ray] = traceRay(
+                        level, listener, directionGrid, initialHits, tuning,
+                        mediumMaterial, mediumWeight, soundSpeed,
+                        maximumSegmentDistance, maxBounces,
+                        directionOffset, seed, ray, rayCount
+                );
+            }
+        }
+
         double earlyTimeEnergy = 0.0;
         double earlyWeight = 0.0;
         double lateTimeEnergy = 0.0;
@@ -81,60 +125,18 @@ final class LateReverbTracer {
         double lateDirectionEnergy = 0.0;
         Vec3 lateDirectionSum = Vec3.ZERO;
         int hitEvents = 0;
-        // Common random numbers keep the Monte Carlo field correlated while the
-        // listener moves. Geometry still changes every arrival and energy value, but a
-        // half-block boundary no longer replaces a long cavern tail with unrelated noise.
-        long seed = MONTE_CARLO_SEED;
-        int directionOffset = Math.floorMod((int) seed, directionGrid.length);
-        float[] energy = new float[AcousticBands.COUNT];
-        AcousticTracer.SurfaceHit[] hitHolder = new AcousticTracer.SurfaceHit[1];
-
-        for (int ray = 0; ray < rayCount; ray++) {
-            int directionIndex = (directionOffset + ray * directionGrid.length / rayCount) % directionGrid.length;
-            Vec3 position = listener;
-            Vec3 direction = directionGrid[directionIndex];
-            Arrays.fill(energy, 1.0F);
-            double traveledDistance = 0.0;
-
-            for (int bounce = 0; bounce < maxBounces; bounce++) {
-                AcousticTracer.SurfaceHit hit = bounce == 0
-                        ? initialHits[directionIndex]
-                        : AcousticTracer.firstAcousticSurface(
-                                level,
-                                position,
-                                position.add(direction.scale(maximumSegmentDistance)),
-                                hitHolder
-                        );
-                if (hit == null) {
-                    break;
-                }
-
+        // Reduce in the original ray/bounce order. Parallel completion order therefore
+        // cannot perturb floating-point sums, decay estimates, or apparent direction.
+        for (RayTrace rayTrace : rayTraces) {
+            for (int bounce = 0; bounce < rayTrace.eventCount(); bounce++) {
+                float[] energy = rayTrace.energyByBounce()[bounce];
+                double arrivalTime = rayTrace.arrivalTimes()[bounce];
+                int bin = Math.min(
+                        histogramBins - 1,
+                        (int) (arrivalTime / binSeconds)
+                );
                 hitEvents++;
-                double segmentDistanceMeters = tuning.meters(hit.distance());
-                segmentDistanceSum += segmentDistanceMeters;
-                traveledDistance += segmentDistanceMeters;
-                double arrivalTime = traveledDistance / soundSpeed;
-                AcousticMaterial material = hit.material();
-                for (int band = 0; band < energy.length; band++) {
-                    float propagation = Mth.lerp(
-                            mediumWeight,
-                            AcousticTracer.airAbsorption(band, segmentDistanceMeters),
-                            mediumMaterial == null
-                                    ? 1.0F
-                                    : mediumMaterial.transmissionGain(
-                                            band,
-                                            segmentDistanceMeters
-                                    )
-                    );
-                    float reflectedPower = AcousticTracer.surfaceReflectedPower(
-                            hit,
-                            band,
-                            tuning.metersPerBlock()
-                    );
-                    energy[band] *= propagation * propagation * reflectedPower;
-                }
-
-                int bin = Math.min(histogramBins - 1, (int) (arrivalTime / binSeconds));
+                segmentDistanceSum += rayTrace.segmentDistances()[bounce];
                 for (int band = 0; band < energy.length; band++) {
                     float normalizedEnergy = energy[band] / rayCount;
                     histogram[band][bin] += normalizedEnergy;
@@ -146,54 +148,22 @@ final class LateReverbTracer {
                         lateBands[band] += normalizedEnergy;
                     }
                 }
-                float eventEnergy = weightedEnergy(energy);
+                float eventEnergy = rayTrace.eventEnergy()[bounce];
                 if (bounce == 0) {
                     earlyTimeEnergy += arrivalTime * eventEnergy;
                     earlyWeight += eventEnergy;
                 } else {
                     lateTimeEnergy += arrivalTime * eventEnergy;
                     lateWeight += eventEnergy;
-                    Vec3 arrivalDirection = hit.location().subtract(listener);
-                    if (arrivalDirection.lengthSqr() > 1.0E-8) {
-                        lateDirectionSum = lateDirectionSum.add(arrivalDirection.normalize().scale(eventEnergy));
+                    Vec3 arrivalDirection = rayTrace.arrivalDirections()[bounce];
+                    if (arrivalDirection != null) {
+                        lateDirectionSum = lateDirectionSum.add(
+                                arrivalDirection.scale(eventEnergy)
+                        );
                         lateDirectionEnergy += eventEnergy;
                     }
                 }
-                scatteringEnergy += material.scattering() * eventEnergy;
-
-                if (eventEnergy < tuning.lateReverbEnergyCutoff()) {
-                    break;
-                }
-                if (bounce >= RUSSIAN_ROULETTE_START_BOUNCE
-                        && eventEnergy < RUSSIAN_ROULETTE_REFERENCE_ENERGY) {
-                    float survival = Mth.clamp(
-                            eventEnergy / RUSSIAN_ROULETTE_REFERENCE_ENERGY,
-                            0.10F,
-                            1.0F
-                    );
-                    if (randomUnit(seed, ray, bounce, 0) > survival) {
-                        break;
-                    }
-                    for (int band = 0; band < energy.length; band++) {
-                        energy[band] /= survival;
-                    }
-                }
-
-                Vec3 normal = hit.normal();
-                if (direction.dot(normal) > 0.0) {
-                    normal = normal.scale(-1.0);
-                }
-                float scattering = material.scattering();
-                if (randomUnit(seed, ray, bounce, 1) < scattering) {
-                    direction = cosineHemisphere(
-                            normal,
-                            randomUnit(seed, ray, bounce, 2),
-                            randomUnit(seed, ray, bounce, 3)
-                    );
-                } else {
-                    direction = direction.subtract(normal.scale(2.0 * direction.dot(normal))).normalize();
-                }
-                position = hit.location().add(normal.scale(SURFACE_OFFSET));
+                scatteringEnergy += rayTrace.scattering()[bounce] * eventEnergy;
             }
         }
 
@@ -269,6 +239,143 @@ final class LateReverbTracer {
                 lateDelay,
                 RoomImpulseResponse.SILENT
         );
+    }
+
+    private static RayTrace traceRay(
+            BlockGetter level,
+            Vec3 listener,
+            Vec3[] directionGrid,
+            AcousticTracer.SurfaceHit[] initialHits,
+            AcousticTuning tuning,
+            AcousticMaterial mediumMaterial,
+            float mediumWeight,
+            double soundSpeed,
+            double maximumSegmentDistance,
+            int maxBounces,
+            int directionOffset,
+            long seed,
+            int ray,
+            int rayCount
+    ) {
+        float[][] energyByBounce = new float[maxBounces][AcousticBands.COUNT];
+        double[] arrivalTimes = new double[maxBounces];
+        double[] segmentDistances = new double[maxBounces];
+        float[] eventEnergy = new float[maxBounces];
+        float[] scattering = new float[maxBounces];
+        Vec3[] arrivalDirections = new Vec3[maxBounces];
+        float[] energy = new float[AcousticBands.COUNT];
+        Arrays.fill(energy, 1.0F);
+        AcousticTracer.SurfaceHit[] hitHolder = new AcousticTracer.SurfaceHit[1];
+        int directionIndex = (
+                directionOffset + ray * directionGrid.length / rayCount
+        ) % directionGrid.length;
+        Vec3 position = listener;
+        Vec3 direction = directionGrid[directionIndex];
+        double traveledDistance = 0.0;
+        int events = 0;
+        for (int bounce = 0; bounce < maxBounces; bounce++) {
+            AcousticTracer.SurfaceHit hit = bounce == 0
+                    ? initialHits[directionIndex]
+                    : AcousticTracer.firstAcousticSurface(
+                            level,
+                            position,
+                            position.add(direction.scale(maximumSegmentDistance)),
+                            hitHolder
+                    );
+            if (hit == null) {
+                break;
+            }
+            double segmentDistanceMeters = tuning.meters(hit.distance());
+            traveledDistance += segmentDistanceMeters;
+            double arrivalTime = traveledDistance / soundSpeed;
+            AcousticMaterial material = hit.material();
+            for (int band = 0; band < energy.length; band++) {
+                float propagation = Mth.lerp(
+                        mediumWeight,
+                        AcousticTracer.airAbsorption(band, segmentDistanceMeters),
+                        mediumMaterial == null
+                                ? 1.0F
+                                : mediumMaterial.transmissionGain(
+                                        band, segmentDistanceMeters
+                                )
+                );
+                float reflectedPower = AcousticTracer.surfaceReflectedPower(
+                        hit, band, tuning.metersPerBlock()
+                );
+                energy[band] *= propagation * propagation * reflectedPower;
+            }
+            System.arraycopy(
+                    energy, 0, energyByBounce[bounce], 0, energy.length
+            );
+            arrivalTimes[bounce] = arrivalTime;
+            segmentDistances[bounce] = segmentDistanceMeters;
+            float weighted = weightedEnergy(energy);
+            eventEnergy[bounce] = weighted;
+            scattering[bounce] = material.scattering();
+            if (bounce > 0) {
+                Vec3 arrivalDirection = hit.location().subtract(listener);
+                if (arrivalDirection.lengthSqr() > 1.0E-8) {
+                    arrivalDirections[bounce] = arrivalDirection.normalize();
+                }
+            }
+            events++;
+
+            if (weighted < tuning.lateReverbEnergyCutoff()) {
+                break;
+            }
+            if (bounce >= RUSSIAN_ROULETTE_START_BOUNCE
+                    && weighted < RUSSIAN_ROULETTE_REFERENCE_ENERGY) {
+                float survival = Mth.clamp(
+                        weighted / RUSSIAN_ROULETTE_REFERENCE_ENERGY,
+                        0.10F,
+                        1.0F
+                );
+                if (randomUnit(seed, ray, bounce, 0) > survival) {
+                    break;
+                }
+                for (int band = 0; band < energy.length; band++) {
+                    energy[band] /= survival;
+                }
+            }
+
+            Vec3 normal = hit.normal();
+            if (direction.dot(normal) > 0.0) {
+                normal = normal.scale(-1.0);
+            }
+            float surfaceScattering = material.scattering();
+            if (randomUnit(seed, ray, bounce, 1) < surfaceScattering) {
+                direction = cosineHemisphere(
+                        normal,
+                        randomUnit(seed, ray, bounce, 2),
+                        randomUnit(seed, ray, bounce, 3)
+                );
+            } else {
+                direction = direction.subtract(
+                        normal.scale(2.0 * direction.dot(normal))
+                ).normalize();
+            }
+            position = hit.location().add(normal.scale(SURFACE_OFFSET));
+        }
+        return new RayTrace(
+                energyByBounce,
+                arrivalTimes,
+                segmentDistances,
+                eventEnergy,
+                scattering,
+                arrivalDirections,
+                events
+        );
+    }
+
+    private record RayTrace(
+            float[][] energyByBounce,
+            double[] arrivalTimes,
+            double[] segmentDistances,
+            float[] eventEnergy,
+            float[] scattering,
+            Vec3[] arrivalDirections,
+            int eventCount
+    ) {
     }
 
     private static float temporalDensity(float[][] histogram, float totalEnergy) {

@@ -60,6 +60,7 @@ public final class OpenALAcousticEffects {
     private static long lastListenerRoomUpdateNanoseconds;
     private static long lastListenerRoomSequence = Long.MIN_VALUE;
     private static Vec3 lastDynamicListenerPosition;
+    private static ListenerFieldSnapshot softwareListenerField;
     private static long nextFieldToken;
     private static volatile List<TailFieldRequest> tailFieldRequests = List.of();
     private static DistanceAttenuationSettings appliedDistanceAttenuationSettings;
@@ -209,12 +210,12 @@ public final class OpenALAcousticEffects {
      * generation. Channel handles are independent command producers, so their OpenAL
      * callbacks are not assumed to arrive in submission order.
      */
-    public static void applySequenced(int source, AcousticResult target, long sequence) {
+    public static boolean applySequenced(int source, AcousticResult target, long sequence) {
         // Source callbacks own only source transport. The listener probe is delivered
         // independently once per geometry batch and is the sole owner of the global
         // room field. Letting every voice also commit that field made callback order,
         // rather than listener geometry, decide which reverb bus was active.
-        applyInternal(source, target, false, sequence, true);
+        return applyInternal(source, target, false, sequence, true);
     }
 
     public static void applyBeforePlay(int source, AcousticResult target) {
@@ -222,10 +223,9 @@ public final class OpenALAcousticEffects {
     }
 
     /**
-     * Introduces the first completed physical trace as the next response target. The
-     * path-based onset predictor is already active, so the correction uses the same
-     * real-dt dezippering as continuous movement instead of discontinuously replacing
-     * all OpenAL coefficients.
+     * Introduces a completed result for a source which had already received a valid
+     * onset result. Sources whose first trace is pending do not enter playback at all;
+     * AcousticRuntime starts those from sample zero after applying the result.
      */
     public static void applyOnsetCorrection(int source, AcousticResult target) {
         applyInternal(source, target, false);
@@ -262,7 +262,21 @@ public final class OpenALAcousticEffects {
             long sequence,
             long sceneRevision
     ) {
-        updateListenerRoomInternal(
+        applyListenerRoomSequenced(probe, listener, sequence, sceneRevision);
+    }
+
+    /**
+     * Commits an ordered listener field and reports whether it was accepted. Runtime
+     * transport uses the return value to distinguish an actual DSP publication from
+     * an obsolete completion without inspecting OpenAL-owned state off-thread.
+     */
+    public static boolean applyListenerRoomSequenced(
+            RoomProbe probe,
+            Vec3 listener,
+            long sequence,
+            long sceneRevision
+    ) {
+        return updateListenerRoomInternal(
                 probe.acoustics(),
                 true,
                 sequence,
@@ -327,6 +341,10 @@ public final class OpenALAcousticEffects {
             long now = System.nanoTime();
             ListenerBasis listenerBasis = ListenerBasis.capture();
             boolean softwareMixer = SoftwareAcousticMixer.available();
+            PortalRadiation softwareRadiation = softwareMixer
+                    && softwareListenerField != null
+                    ? softwareListenerField.apertureRadiation(listener, true)
+                    : PortalRadiation.INSIDE;
             for (Map.Entry<Integer, SourceState> entry : SOURCES.entrySet()) {
                 int source = entry.getKey();
                 SourceState state = entry.getValue();
@@ -343,8 +361,16 @@ public final class OpenALAcousticEffects {
                         state.apparentPosition.subtract(listener)
                 );
                 if (softwareMixer) {
+                    float transportedGain = state.propagationGain
+                            * state.audibilityGain;
                     SoftwareAcousticMixer.updateSpatial(
-                            source, earlyDirection, propagationDirection
+                            source, earlyDirection, propagationDirection,
+                            softwareRadiation.outside()
+                                    ? softwareRadiation.transmission()
+                                    : 1.0F,
+                            state.reverbSend * transportedGain,
+                            state.reverbHighFrequency
+                                    * softwareRadiation.highFrequencyGain()
                     );
                 } else if (advancedEaxReverb
                         && (state.earlyReflection.gain() > 1.0E-6F
@@ -446,6 +472,9 @@ public final class OpenALAcousticEffects {
             }
             smoothedListenerRoom = room;
             targetListenerRoom = room;
+            if (measuredField != null) {
+                softwareListenerField = measuredField;
+            }
             lastListenerRoomUpdateNanoseconds = System.nanoTime();
             tailFieldRequests = List.of();
             return true;
@@ -537,7 +566,7 @@ public final class OpenALAcousticEffects {
         applyInternal(source, target, snapToTarget, Long.MIN_VALUE, false);
     }
 
-    private static void applyInternal(
+    private static boolean applyInternal(
             int source,
             AcousticResult target,
             boolean snapToTarget,
@@ -545,7 +574,7 @@ public final class OpenALAcousticEffects {
             boolean ordered
     ) {
         if (!ensureSupport()) {
-            return;
+            return false;
         }
         syncDistanceAttenuationSettings();
 
@@ -556,7 +585,7 @@ public final class OpenALAcousticEffects {
             AL10.alGetError();
             SourceState state = SOURCES.computeIfAbsent(source, OpenALAcousticEffects::createSourceState);
             if (!state.update(target, snapToTarget, sequence, ordered)) {
-                return;
+                return false;
             }
             if (SoftwareAcousticMixer.available()) {
                 RoomAcoustics sourceRoom = state.sourceRoomProbe == null
@@ -583,7 +612,8 @@ public final class OpenALAcousticEffects {
                         state.reverbHighFrequency,
                         sourceRoom,
                         state.sourceRoomSend * transportedGain,
-                        state.sourceRoomHighFrequency
+                        state.sourceRoomHighFrequency,
+                        sequence
                 );
                 applyPositionalDirectPath(source, state);
                 AL10.alSource3f(source, AL10.AL_POSITION,
@@ -591,7 +621,7 @@ public final class OpenALAcousticEffects {
                         (float) state.apparentPosition.y,
                         (float) state.apparentPosition.z);
                 throwOnOpenAlError(source, "software acoustic update");
-                return;
+                return true;
             }
             assignReverbBus(state);
             assignSourceRoomBus(state);
@@ -602,8 +632,10 @@ public final class OpenALAcousticEffects {
                     (float) state.apparentPosition.y,
                     (float) state.apparentPosition.z);
             throwOnOpenAlError(source, "EFX acoustic update");
+            return true;
         } catch (RuntimeException exception) {
             recoverSourceAfterFailure(source, exception);
+            return false;
         }
     }
 
@@ -1786,6 +1818,7 @@ public final class OpenALAcousticEffects {
         lastListenerRoomUpdateNanoseconds = 0L;
         lastListenerRoomSequence = Long.MIN_VALUE;
         lastDynamicListenerPosition = null;
+        softwareListenerField = null;
         nextFieldToken = 0L;
         tailFieldRequests = List.of();
         appliedDistanceAttenuationSettings = null;

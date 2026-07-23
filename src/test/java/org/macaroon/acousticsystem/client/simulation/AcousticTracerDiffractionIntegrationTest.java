@@ -12,16 +12,24 @@ import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.macaroon.acousticsystem.client.material.AcousticMaterialRegistry;
+import org.macaroon.acousticsystem.client.scene.AcousticScene;
+import org.macaroon.acousticsystem.client.scene.AcousticSceneFixtures;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.ArrayDeque;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class AcousticTracerDiffractionIntegrationTest {
     private static final Vec3 SOURCE = new Vec3(-4.5, 2.5, 0.5);
@@ -867,6 +875,191 @@ class AcousticTracerDiffractionIntegrationTest {
     }
 
     @Test
+    void productionSceneDiffractsThroughAnIrregularWildTunnel() {
+        AcousticScene scene = AcousticSceneFixtures
+                .thirtyTwoCubeWithWildIrregularTunnel();
+        Vec3 source = new Vec3(2.5, 8.5, 2.5);
+        Vec3 listener = new Vec3(29.5, 8.5, 28.5);
+        AcousticResult result = AcousticTracer.trace(
+                scene,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(scene, source),
+                AcousticTracer.probeRoom(scene, listener),
+                AcousticTracer.TraceQuality.FULL
+        );
+        assertTrue(
+                result.diffractionContribution() > 1.0E-4F,
+                () -> "The production scene lost the wild tunnel path: " + result
+        );
+        assertTrue(
+                result.propagationDistance() > source.distanceTo(listener),
+                () -> "The bent tunnel was reported as a direct route: " + result
+        );
+    }
+
+    @Test
+    void higherOrderTunnelDirectionComesFromItsFinalVisibleLeg() {
+        AcousticScene scene = AcousticSceneFixtures
+                .thirtyTwoCubeWithWildIrregularTunnel();
+        Vec3 source = new Vec3(2.5, 8.5, 2.5);
+        Vec3 listener = new Vec3(22.5, 8.5, 28.5);
+        AcousticResult result = AcousticTracer.trace(
+                scene,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(scene, source),
+                AcousticTracer.probeRoom(scene, listener),
+                AcousticTracer.TraceQuality.FULL
+        );
+        Vec3 direction = result.apparentPosition().subtract(listener).normalize();
+
+        assertTrue(result.diffractionContribution() > 1.0E-4F);
+        assertTrue(
+                direction.x < -0.80 && Math.abs(direction.z) < 0.45,
+                () -> "The earlier north-south leg pulled the final westward arrival: "
+                        + direction + ", result=" + result
+        );
+    }
+
+    @Test
+    void higherOrderTunnelDirectionStaysContinuousWhileListenerMoves() {
+        AcousticScene scene = AcousticSceneFixtures
+                .thirtyTwoCubeWithWildIrregularTunnel();
+        Vec3 source = new Vec3(2.5, 8.5, 2.5);
+        Vec3 previousDirection = null;
+        for (double x = 22.25; x <= 28.75; x += 0.25) {
+            Vec3 listener = new Vec3(x, 8.5, 28.5);
+            AcousticResult result = AcousticTracer.trace(
+                    scene,
+                    source,
+                    listener,
+                    AcousticTracer.probeSourceRoom(scene, source),
+                    AcousticTracer.probeRoom(scene, listener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+            Vec3 direction = result.apparentPosition().subtract(listener).normalize();
+            assertTrue(
+                    direction.x < -0.75,
+                    () -> "The final tunnel leg pointed away from its bend at "
+                            + listener + ": " + direction
+            );
+            if (previousDirection != null) {
+                Vec3 prior = previousDirection;
+                assertTrue(
+                        prior.dot(direction) > 0.94,
+                        () -> "The diffraction arrival jumped while moving inside one "
+                                + "unchanged final leg: prior=" + prior + ", current="
+                                + direction + ", listener=" + listener
+                );
+            }
+            previousDirection = direction;
+        }
+    }
+
+    @Test
+    void productionSceneUsesTheVisibleOpeningForFirstArrivalDirection() {
+        AcousticScene scene = AcousticSceneFixtures
+                .sixtyFourCubeWithOffsetWallOpening();
+        Vec3 source = new Vec3(10.5, 8.5, 10.5);
+        Vec3 listener = new Vec3(54.5, 8.5, 10.5);
+        AcousticResult result = AcousticTracer.trace(
+                scene,
+                source,
+                listener,
+                AcousticTracer.probeSourceRoom(scene, source),
+                AcousticTracer.probeRoom(scene, listener),
+                AcousticTracer.TraceQuality.FULL
+        );
+        Vec3 actual = result.apparentPosition().subtract(listener).normalize();
+        Vec3 expected = new Vec3(32.5, 8.5, 30.5)
+                .subtract(listener).normalize();
+        assertTrue(result.diffractionContribution() > 1.0E-5F);
+        assertTrue(
+                actual.dot(expected) > 0.4,
+                () -> "First arrival ignored the only open wall region: " + result
+        );
+    }
+
+    @Test
+    void veryComplexProductionMazesNeverLoseTheDiffractionRoute() {
+        long[] seeds = {0x51A7E5L, 0xC0FFEE12L, 0x7A11C0DEL};
+        Vec3 source = new Vec3(1.5, 8.5, 1.5);
+        Vec3 listener = new Vec3(61.5, 8.5, 61.5);
+        for (long seed : seeds) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithWildPerfectMaze(seed);
+            AcousticResult result = AcousticTracer.trace(
+                    scene,
+                    source,
+                    listener,
+                    AcousticTracer.probeSourceRoom(scene, source),
+                    AcousticTracer.probeRoom(scene, listener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+            assertTrue(
+                    result.diffractionContribution() > 0.0F,
+                    () -> "The production maze route disappeared for seed="
+                            + seed + ": " + result
+            );
+            assertTrue(
+                    result.propagationDistance() > source.distanceTo(listener),
+                    () -> "The production maze bypassed its bends for seed="
+                            + seed + ": " + result
+            );
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void veryComplexWildDiffractionSearchP95RemainsBelowFiveMilliseconds() {
+        Vec3 source = new Vec3(1.5, 8.5, 1.5);
+        Vec3 listener = new Vec3(61.5, 8.5, 61.5);
+        for (int warmup = 0; warmup < 8; warmup++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithWildPerfectMaze(0x9000L + warmup);
+            AcousticTracer.trace(
+                    scene, source, listener,
+                    AcousticTracer.probeSourceRoom(scene, source),
+                    AcousticTracer.probeRoom(scene, listener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+        }
+        double[] elapsed = new double[20];
+        double[] sparse = new double[20];
+        double[] air = new double[20];
+        double[] evaluation = new double[20];
+        for (int sample = 0; sample < elapsed.length; sample++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithWildPerfectMaze(0xA000L + sample);
+            AcousticTracer.trace(
+                    scene, source, listener,
+                    AcousticTracer.probeSourceRoom(scene, source),
+                    AcousticTracer.probeRoom(scene, listener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+            AcousticTracer.TraceTiming timing = AcousticTracer.lastTraceTiming();
+            elapsed[sample] = timing.diffractionNanoseconds() / 1_000_000.0;
+            sparse[sample] = timing.diffractionSparseNanoseconds() / 1_000_000.0;
+            air[sample] = timing.diffractionAirNanoseconds() / 1_000_000.0;
+            evaluation[sample] = timing.diffractionEvaluationNanoseconds() / 1_000_000.0;
+            assertTrue(timing.diffractionAirMode() != null);
+        }
+        Arrays.sort(elapsed);
+        Arrays.sort(sparse);
+        Arrays.sort(air);
+        Arrays.sort(evaluation);
+        double percentile95 = elapsed[18];
+        System.out.println("p95VeryComplexWildDiffractionMilliseconds="
+                + percentile95 + ", maximum=" + elapsed[19]
+                + ", sparse=" + sparse[18]
+                + ", air=" + air[18]
+                + ", evaluation=" + evaluation[18]);
+        assertTrue(percentile95 < 5.0, () ->
+                "very complex wild diffraction p95 exceeded 5 ms: " + percentile95);
+    }
+
+    @Test
     void seededNoiseCavesCarrySoundThroughLongIrregularRoutes() {
         long[] seeds = {0x5EEDC0DEL, 0x71A9B43DL, 0xC4A7E123L};
         for (long seed : seeds) {
@@ -1005,13 +1198,19 @@ class AcousticTracerDiffractionIntegrationTest {
 
     @Test
     @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
-    void seededNoiseCaveTraceRemainsBelowTenMilliseconds() {
+    void seededNoiseCaveIncrementalTraceRemainsBelowThreeMilliseconds() {
         NoiseCave cave = new NoiseCave(0x5EEDC0DEL, 64);
         TestWorld world = new TestWorld(cave);
         Vec3 source = cave.pointAt(1.5);
         Vec3 listener = cave.pointAt(cave.length() - 1.5);
+        long sourceProbeStarted = System.nanoTime();
         RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(world, source);
+        double sourceProbeMilliseconds = (System.nanoTime() - sourceProbeStarted) / 1_000_000.0;
+        long listenerProbeStarted = System.nanoTime();
         RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+        double listenerProbeMilliseconds = (System.nanoTime() - listenerProbeStarted) / 1_000_000.0;
+        System.out.println("sourceProbeMilliseconds=" + sourceProbeMilliseconds
+                + ", listenerProbeMilliseconds=" + listenerProbeMilliseconds);
         for (int warmup = 0; warmup < 16; warmup++) {
             Vec3 warmupListener = cave.pointAt(
                     cave.length() - 1.90 + warmup * 0.02
@@ -1045,11 +1244,422 @@ class AcousticTracerDiffractionIntegrationTest {
                 + ", percentile95SeededNoiseCaveTraceMilliseconds=" + percentile95
                 + ", averageSeededNoiseCaveTraceMilliseconds="
                 + totalMilliseconds / 20.0);
-        assertTrue(percentile95 < 10.0, () ->
-                "seeded noise cave p95 trace exceeded 10 ms: " + percentile95
+        assertTrue(percentile95 < 3.0, () ->
+                "seeded noise cave p95 incremental trace exceeded 3 ms: " + percentile95
                         + ", maximum=" + measured);
-        assertTrue(measured < 25.0, () ->
+        assertTrue(measured < 10.0, () ->
                 "seeded noise cave trace produced a non-GC spike: " + measured);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void coldDenseFullSearchP95RemainsBelowThreeMilliseconds() {
+        Vec3 source = new Vec3(10.5, 8.5, 10.5);
+        Vec3 listener = new Vec3(54.5, 8.5, 10.5);
+        AcousticScene topology = AcousticSceneFixtures
+                .sixtyFourCubeWithOffsetWallOpening();
+        assertTrue(topology.isAir(31, 8, 60));
+        assertTrue(topology.isAir(32, 8, 60));
+        assertTrue(topology.isAir(33, 8, 60));
+        assertEquals(
+                topology.airComponentId(10, 8, 10),
+                topology.airComponentId(54, 8, 10)
+        );
+        for (int warmup = 0; warmup < 8; warmup++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithOffsetWallOpening();
+            AcousticTracer.measureDenseAirSearch(scene, source, listener);
+        }
+        double[] elapsed = new double[20];
+        int maximumExpanded = 0;
+        for (int sample = 0; sample < elapsed.length; sample++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithOffsetWallOpening();
+            AcousticTracer.DenseAirSearchMetrics timing =
+                    AcousticTracer.measureDenseAirSearch(
+                            scene, source, listener
+                    );
+            elapsed[sample] = timing.elapsedNanoseconds() / 1_000_000.0;
+            maximumExpanded = Math.max(
+                    maximumExpanded, timing.expanded()
+            );
+            assertTrue(
+                    timing.connected(),
+                    "dense solver did not find the offset wall opening"
+            );
+        }
+        Arrays.sort(elapsed);
+        double percentile95 = elapsed[18];
+        System.out.println("p95DenseFullSearchMilliseconds=" + percentile95
+                + ", maximum=" + elapsed[19]
+                + ", maximumExpanded=" + maximumExpanded);
+        assertTrue(percentile95 < 3.0, () ->
+                "dense full-search p95 exceeded 3 ms: " + percentile95);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void coldScenePortalTraceP95RemainsBelowThreeMilliseconds() {
+        Vec3 source = new Vec3(10.5, 8.5, 10.5);
+        Vec3 listener = new Vec3(54.5, 8.5, 10.5);
+        for (int warmup = 0; warmup < 8; warmup++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithOffsetWallOpening();
+            AcousticTracer.trace(
+                    scene, source, listener,
+                    AcousticTracer.probeSourceRoom(scene, source),
+                    AcousticTracer.probeRoom(scene, listener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+        }
+        double[] total = new double[20];
+        double[] air = new double[20];
+        java.util.Map<String, Integer> modes = new java.util.TreeMap<>();
+        for (int sample = 0; sample < total.length; sample++) {
+            AcousticScene scene = AcousticSceneFixtures
+                    .sixtyFourCubeWithOffsetWallOpening();
+            RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(scene, source);
+            RoomProbe listenerProbe = AcousticTracer.probeRoom(scene, listener);
+            long started = System.nanoTime();
+            AcousticResult result = AcousticTracer.trace(
+                    scene, source, listener, sourceProbe, listenerProbe,
+                    AcousticTracer.TraceQuality.FULL
+            );
+            total[sample] = (System.nanoTime() - started) / 1_000_000.0;
+            AcousticTracer.TraceTiming timing = AcousticTracer.lastTraceTiming();
+            air[sample] = timing.diffractionAirNanoseconds() / 1_000_000.0;
+            modes.merge(timing.diffractionAirMode(), 1, Integer::sum);
+            assertTrue(result.diffractionContribution() > 1.0E-5F);
+        }
+        Arrays.sort(total);
+        Arrays.sort(air);
+        System.out.println("p95ColdPortalTraceMilliseconds=" + total[18]
+                + ", p95ColdPortalAirMilliseconds=" + air[18]
+                + ", maximum=" + total[19] + ", modes=" + modes);
+        assertTrue(total[18] < 3.0, () ->
+                "cold hierarchical portal trace p95 exceeded 3 ms: " + total[18]);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void adjacentSourceCellsRepairTheExistingCaveBackboneBelowThreeMilliseconds() {
+        NoiseCave cave = new NoiseCave(0x5EEDC0DEL, 64);
+        TestWorld world = new TestWorld(cave);
+        Vec3 listener = cave.pointAt(cave.length() - 1.5);
+        RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+        Vec3 initialSource = cave.pointAt(1.5);
+        RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(world, initialSource);
+
+        // Compile and establish one exact interior route. Every measured source below
+        // then enters an adjacent air cell and must repair that route rather than start
+        // another full voxel A*.
+        for (int warmup = 0; warmup < 8; warmup++) {
+            AcousticTracer.trace(
+                    world, initialSource, listener, sourceProbe, listenerProbe,
+                    AcousticTracer.TraceQuality.FULL
+            );
+        }
+        double[] elapsed = new double[12];
+        for (int sample = 0; sample < elapsed.length; sample++) {
+            Vec3 movingSource = cave.pointAt(2.5 + sample * 0.25);
+            long started = System.nanoTime();
+            AcousticResult result = AcousticTracer.trace(
+                    world, movingSource, listener, sourceProbe, listenerProbe,
+                    AcousticTracer.TraceQuality.FULL
+            );
+            elapsed[sample] = (System.nanoTime() - started) / 1_000_000.0;
+            assertTrue(result.diffractionContribution() > 1.0E-4F);
+        }
+        Arrays.sort(elapsed);
+        double percentile95 = elapsed[10];
+        System.out.println("p95AdjacentSourceRepairMilliseconds=" + percentile95);
+        assertTrue(percentile95 < 3.0, () ->
+                "adjacent-source incremental repair exceeded 3 ms: " + percentile95);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void concurrentSourcesShareOneListenerAirFieldBelowThreeMilliseconds() throws Exception {
+        NoiseCave cave = new NoiseCave(0x51A4EDL, 64);
+        TestWorld world = new TestWorld(cave);
+        Vec3 listener = cave.pointAt(cave.length() - 1.5);
+        RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+        Vec3 firstSource = cave.pointAt(1.5);
+        AcousticTracer.trace(
+                world,
+                firstSource,
+                listener,
+                AcousticTracer.probeSourceRoom(world, firstSource),
+                listenerProbe,
+                AcousticTracer.TraceQuality.FULL
+        );
+
+        int sourceCount = 24;
+        List<Vec3> sources = new ArrayList<>(sourceCount);
+        List<RoomProbe> sourceProbes = new ArrayList<>(sourceCount);
+        for (int index = 0; index < sourceCount; index++) {
+            double pathPosition = 2.5 + index * 2.0;
+            Vec3 warmSource = cave.pointAt(pathPosition);
+            Vec3 movingSource = cave.pointAt(pathPosition + 0.02);
+            RoomProbe probe = AcousticTracer.probeSourceRoom(world, warmSource);
+            AcousticTracer.trace(
+                    world,
+                    warmSource,
+                    listener,
+                    probe,
+                    listenerProbe,
+                    AcousticTracer.TraceQuality.FULL
+            );
+            sources.add(movingSource);
+            sourceProbes.add(probe);
+        }
+        // Mirror AcousticRuntime's bounded parallel batch lanes. All 24 voices still
+        // execute the identical trace pipeline; only their independent work is split.
+        ExecutorService workers = Executors.newFixedThreadPool(
+                AcousticRuntime.realtimeBatchLaneCount()
+        );
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<Double>> futures = new ArrayList<>(sourceCount);
+        try {
+            for (int index = 0; index < sourceCount; index++) {
+                final int sourceIndex = index;
+                futures.add(workers.submit(() -> {
+                    start.await();
+                    AcousticResult result = AcousticTracer.trace(
+                            world,
+                            sources.get(sourceIndex),
+                            listener,
+                            sourceProbes.get(sourceIndex),
+                            listenerProbe,
+                            AcousticTracer.TraceQuality.FULL
+                    );
+                    assertTrue(result.directGain() >= 0.0F);
+                    return AcousticTracer.lastTraceTiming().diffractionAirNanoseconds()
+                            / 1_000_000.0;
+                }));
+            }
+            long batchStarted = System.nanoTime();
+            start.countDown();
+            double[] airMilliseconds = new double[sourceCount];
+            for (int index = 0; index < sourceCount; index++) {
+                airMilliseconds[index] = futures.get(index).get();
+            }
+            Arrays.sort(airMilliseconds);
+            double percentile95 = airMilliseconds[22];
+            double batchMilliseconds = (System.nanoTime() - batchStarted) / 1_000_000.0;
+            System.out.println("p95ConcurrentSharedAirFieldMilliseconds=" + percentile95
+                    + ", maximum=" + airMilliseconds[sourceCount - 1]
+                    + ", twentyFourVoiceBatchMilliseconds=" + batchMilliseconds);
+            assertTrue(percentile95 < 3.0, () ->
+                    "concurrent shared listener field p95 exceeded 3 ms: " + percentile95);
+            assertTrue(batchMilliseconds < 20.0, () ->
+                    "24-voice parallel acoustic batch exceeded 20 ms: "
+                            + batchMilliseconds);
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void coldConcurrentSourcesSingleFlightTheInitialAirBackbone() throws Exception {
+        // Compile the tracer without creating a field for the measured world identity.
+        for (int warmup = 0; warmup < 8; warmup++) {
+            trace(position -> position.getX() == 0
+                    && position.getY() >= 0 && position.getY() <= 3
+                    && position.getZ() >= -1 && position.getZ() <= 1);
+        }
+        NoiseCave cave = new NoiseCave(0xC01DF1EL, 64);
+        TestWorld world = new TestWorld(cave);
+        Vec3 listener = cave.pointAt(cave.length() - 1.5);
+        RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+        int sourceCount = 11;
+        List<Vec3> sources = new ArrayList<>(sourceCount);
+        List<RoomProbe> probes = new ArrayList<>(sourceCount);
+        for (int index = 0; index < sourceCount; index++) {
+            Vec3 source = cave.pointAt(1.5 + index * 3.0);
+            sources.add(source);
+            probes.add(AcousticTracer.probeSourceRoom(world, source));
+        }
+        ExecutorService workers = Executors.newFixedThreadPool(sourceCount);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<Double>> futures = new ArrayList<>(sourceCount);
+        try {
+            for (int index = 0; index < sourceCount; index++) {
+                int sourceIndex = index;
+                futures.add(workers.submit(() -> {
+                    start.await();
+                    AcousticTracer.trace(
+                            world,
+                            sources.get(sourceIndex),
+                            listener,
+                            probes.get(sourceIndex),
+                            listenerProbe,
+                            AcousticTracer.TraceQuality.FULL
+                    );
+                    return AcousticTracer.lastTraceTiming().diffractionAirNanoseconds()
+                            / 1_000_000.0;
+                }));
+            }
+            start.countDown();
+            double[] elapsed = new double[sourceCount];
+            for (int index = 0; index < sourceCount; index++) {
+                elapsed[index] = futures.get(index).get();
+            }
+            Arrays.sort(elapsed);
+            double percentile95 = elapsed[9];
+            System.out.println("p95ColdSingleFlightAirFieldMilliseconds=" + percentile95
+                    + ", maximum=" + elapsed[sourceCount - 1]);
+            assertTrue(percentile95 < 3.0, () ->
+                    "initial shared field single-flight exceeded 3 ms: " + percentile95);
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void fortyFiveColdVoicesDoNotRecomputeTheSameListenerSide() throws Exception {
+        // Runtime propagation always receives an immutable AcousticScene. Exercise
+        // that production hierarchy rather than the generic BlockGetter fallback used
+        // by small formula tests.
+        for (int warmup = 0; warmup < 12; warmup++) {
+            AcousticScene warmScene = AcousticSceneFixtures
+                    .sixtyFourCubeWithOffsetWallOpening();
+            Vec3 warmSource = new Vec3(10.5, 8.5, 10.5);
+            Vec3 warmListener = new Vec3(54.5, 8.5, 10.5);
+            AcousticTracer.trace(
+                    warmScene, warmSource, warmListener,
+                    AcousticTracer.probeSourceRoom(warmScene, warmSource),
+                    AcousticTracer.probeRoom(warmScene, warmListener),
+                    AcousticTracer.TraceQuality.FULL
+            );
+        }
+        AcousticScene world = AcousticSceneFixtures
+                .sixtyFourCubeWithOffsetWallOpening();
+        Vec3 listener = new Vec3(54.5, 8.5, 10.5);
+        RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+        int sourceCount = 45;
+        List<Vec3> sources = new ArrayList<>(sourceCount);
+        List<RoomProbe> probes = new ArrayList<>(sourceCount);
+        for (int index = 0; index < sourceCount; index++) {
+            Vec3 source = new Vec3(
+                    2.5 + index % 28,
+                    1.5 + index % 14,
+                    5.5 + index % 5
+            );
+            sources.add(source);
+            probes.add(AcousticTracer.probeSourceRoom(world, source));
+        }
+        ExecutorService workers = Executors.newFixedThreadPool(
+                AcousticRuntime.realtimeBatchLaneCount()
+        );
+        List<Future<AcousticTracer.TraceTiming>> futures = new ArrayList<>(sourceCount);
+        try {
+            long started = System.nanoTime();
+            CountDownLatch start = new CountDownLatch(1);
+            for (int index = 0; index < sourceCount; index++) {
+                int sourceIndex = index;
+                futures.add(workers.submit(() -> {
+                    start.await();
+                    AcousticTracer.trace(
+                            world, sources.get(sourceIndex), listener,
+                            probes.get(sourceIndex), listenerProbe,
+                            AcousticTracer.TraceQuality.FULL
+                    );
+                    return AcousticTracer.lastTraceTiming();
+                }));
+            }
+            start.countDown();
+            double[] elapsed = new double[sourceCount];
+            java.util.Map<String, Integer> modes = new java.util.TreeMap<>();
+            long maximumExpanded = 0L;
+            int elapsedIndex = 0;
+            for (Future<AcousticTracer.TraceTiming> future : futures) {
+                AcousticTracer.TraceTiming timing = future.get();
+                elapsed[elapsedIndex++] = timing.totalNanoseconds()
+                        / 1_000_000.0;
+                modes.merge(timing.diffractionAirMode(), 1, Integer::sum);
+                maximumExpanded = Math.max(
+                        maximumExpanded, timing.diffractionAirExpanded()
+                );
+            }
+            double batchMilliseconds = (System.nanoTime() - started) / 1_000_000.0;
+            Arrays.sort(elapsed);
+            double percentile95 = elapsed[42];
+            System.out.println("p95FortyFiveColdTraceMilliseconds=" + percentile95
+                    + ", maximum=" + elapsed[sourceCount - 1]
+                    + ", fortyFiveVoiceBatchMilliseconds=" + batchMilliseconds
+                    + ", modes=" + modes + ", maximumExpanded=" + maximumExpanded);
+            // The strict 3 ms contract belongs to one uncached full topology search
+            // (covered by coldDenseFullSearchP95RemainsBelowThreeMilliseconds).
+            // This test instead guards end-to-end delivery of a whole simultaneous
+            // voice burst, where four bounded worker lanes intentionally share CPU.
+            assertTrue(batchMilliseconds < 50.0, () ->
+                    "45-voice cold batch exceeded 50 ms: " + batchMilliseconds);
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void concurrentSourcesReuseTheFieldAcrossListenerVoxelBoundaries() throws Exception {
+        NoiseCave cave = new NoiseCave(0xB0A4D4EEL, 64);
+        TestWorld world = new TestWorld(cave);
+        int sourceCount = 11;
+        List<Vec3> sources = new ArrayList<>(sourceCount);
+        List<RoomProbe> probes = new ArrayList<>(sourceCount);
+        for (int index = 0; index < sourceCount; index++) {
+            Vec3 source = cave.pointAt(1.5 + index * 3.0);
+            sources.add(source);
+            probes.add(AcousticTracer.probeSourceRoom(world, source));
+        }
+        Vec3 initialListener = cave.pointAt(cave.length() - 1.5);
+        RoomProbe initialProbe = AcousticTracer.probeRoom(world, initialListener);
+        for (int index = 0; index < sourceCount; index++) {
+            AcousticTracer.trace(
+                    world, sources.get(index), initialListener, probes.get(index),
+                    initialProbe, AcousticTracer.TraceQuality.FULL
+            );
+        }
+
+        ExecutorService workers = Executors.newFixedThreadPool(sourceCount);
+        List<Double> samples = new ArrayList<>();
+        try {
+            for (int step = 0; step < 4; step++) {
+                Vec3 listener = cave.pointAt(cave.length() - 2.25 - step * 1.05);
+                RoomProbe listenerProbe = AcousticTracer.probeRoom(world, listener);
+                CountDownLatch start = new CountDownLatch(1);
+                List<Future<Double>> futures = new ArrayList<>(sourceCount);
+                for (int index = 0; index < sourceCount; index++) {
+                    int sourceIndex = index;
+                    futures.add(workers.submit(() -> {
+                        start.await();
+                        AcousticTracer.trace(
+                                world, sources.get(sourceIndex), listener,
+                                probes.get(sourceIndex), listenerProbe,
+                                AcousticTracer.TraceQuality.FULL
+                        );
+                        return AcousticTracer.lastTraceTiming().diffractionAirNanoseconds()
+                                / 1_000_000.0;
+                    }));
+                }
+                start.countDown();
+                for (Future<Double> future : futures) {
+                    samples.add(future.get());
+                }
+            }
+        } finally {
+            workers.shutdownNow();
+        }
+        double[] elapsed = samples.stream().mapToDouble(Double::doubleValue).toArray();
+        Arrays.sort(elapsed);
+        double percentile95 = elapsed[(int) Math.floor((elapsed.length - 1) * 0.95)];
+        System.out.println("p95ListenerBoundarySharedFieldMilliseconds=" + percentile95
+                + ", maximum=" + elapsed[elapsed.length - 1]);
+        assertTrue(percentile95 < 3.0, () ->
+                "listener-boundary shared field p95 exceeded 3 ms: " + percentile95);
     }
 
     @Test

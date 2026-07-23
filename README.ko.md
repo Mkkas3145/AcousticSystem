@@ -6,7 +6,7 @@
 
 **블록과 공간에 따라 소리가 달라지는 Minecraft 음향 물리 모드**
 
-[![Version](https://img.shields.io/badge/Version-1.16.1-f2b632?style=for-the-badge)](https://github.com/Mkkas3145/AcousticSystem/releases)
+[![Version](https://img.shields.io/badge/Version-1.16.2-f2b632?style=for-the-badge)](https://github.com/Mkkas3145/AcousticSystem/releases)
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11%20%7C%2026.1.2%20%7C%2026.2-62b47a?style=for-the-badge)](#지원-환경)
 [![Loaders](https://img.shields.io/badge/Loaders-Fabric%20%7C%20Forge%20%7C%20NeoForge-4c78a8?style=for-the-badge)](#지원-환경)
 [![English](https://img.shields.io/badge/README-English-555555?style=for-the-badge)](README.md)

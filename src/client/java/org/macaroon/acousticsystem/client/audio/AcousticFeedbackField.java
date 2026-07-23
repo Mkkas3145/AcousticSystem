@@ -78,6 +78,7 @@ final class AcousticFeedbackField {
     private float modulationTime = 0.25F;
     private float targetBoundaryMorph = 1.0F;
     private int targetTailOutputFrames;
+    private boolean excited;
     private float diffuserFeedback;
     private float targetDiffuserFeedback;
 
@@ -193,14 +194,26 @@ final class AcousticFeedbackField {
         if (!ready) {
             return 0L;
         }
+        if (!excited
+                && Math.abs(input) <= 1.0E-7F
+                && Math.abs(decimationInput) <= 1.0E-7F
+                && remainingOutputFrames == 0) {
+            // A configured but never-excited field is common outdoors and for the
+            // remote-room side of a voice. Running two complete eight-line FDNs for
+            // zeros used an audio core without producing a sample. Once excited, this
+            // fast path stays disabled so a real tail is never truncated.
+            return 0L;
+        }
         decimationInput += input;
         outputPhase ^= 1;
         if (outputPhase == 0) {
             previousLeft = nextLeft;
             previousRight = nextRight;
-            processInternal(decimationInput * 0.5F, transportHighFrequency);
+            float internalInput = decimationInput * 0.5F;
+            processInternal(internalInput, transportHighFrequency);
             decimationInput = 0.0F;
-            if (Math.abs(input) > 1.0E-7F) {
+            if (Math.abs(internalInput) > 1.0E-7F) {
+                excited = true;
                 remainingOutputFrames = Math.max(
                         remainingOutputFrames,
                         targetTailOutputFrames

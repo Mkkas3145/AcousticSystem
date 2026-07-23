@@ -1,7 +1,9 @@
 package org.macaroon.acousticsystem.client.simulation;
 
 import it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap;
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.objects.Object2DoubleOpenHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.BlockGetter;
@@ -32,8 +34,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.IntConsumer;
 
 public final class AcousticTracer {
+    private static final boolean PROFILE_TRACE = Boolean.getBoolean("acousticsystem.profileTrace")
+            || "true".equalsIgnoreCase(System.getenv("ACOUSTICSYSTEM_PROFILE_TRACE"));
     private static final double DIFFRACTION_MARGIN = 0.075;
     private static final Vec3 NEGATIVE_X_NORMAL = new Vec3(-1.0, 0.0, 0.0);
     private static final Vec3 POSITIVE_X_NORMAL = new Vec3(1.0, 0.0, 0.0);
@@ -79,18 +85,52 @@ public final class AcousticTracer {
     private static final Map<Integer, RoomRayGrid> ROOM_RAY_GRIDS = new ConcurrentHashMap<>();
     private static final Map<AirPathCacheKey, PropagationGraphPath> AIR_PATH_CACHE =
             new ConcurrentHashMap<>();
+    private static final Map<AirPathMissCacheKey, Boolean> AIR_PATH_MISS_CACHE =
+            new ConcurrentHashMap<>();
+    private static final Map<ListenerAirFieldKey, ListenerAirRouteField> LISTENER_AIR_FIELDS =
+            new ConcurrentHashMap<>();
+    private static final Map<SparsePathCacheKey, List<PropagationGraphPath>> SPARSE_PATH_CACHE =
+            new ConcurrentHashMap<>();
     private static final Map<StructuralPathCacheKey, StructuralPath> STRUCTURAL_PATH_CACHE =
             new ConcurrentHashMap<>();
     private static final Map<TransmissionCacheKey, Transmission> TRANSMISSION_CACHE =
             new ConcurrentHashMap<>();
     private static final Map<TraceCacheKey, AcousticResult> TRACE_CACHE =
             new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedQueue<AirPathCacheKey> AIR_PATH_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<AirPathMissCacheKey> AIR_PATH_MISS_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<ListenerAirFieldKey> LISTENER_AIR_FIELD_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<SparsePathCacheKey> SPARSE_PATH_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<StructuralPathCacheKey> STRUCTURAL_PATH_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<TransmissionCacheKey> TRANSMISSION_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<TraceCacheKey> TRACE_CACHE_ORDER =
+            new ConcurrentLinkedQueue<>();
     private static final ThreadLocal<TransmissionScratch> TRANSMISSION_SCRATCH = ThreadLocal.withInitial(
             TransmissionScratch::new
     );
     private static final ThreadLocal<BlockPos.MutableBlockPos> WALK_POSITION = ThreadLocal.withInitial(
             BlockPos.MutableBlockPos::new
     );
+    private static final ThreadLocal<CollisionQuery> COLLISION_QUERY = ThreadLocal.withInitial(
+            CollisionQuery::new
+    );
+    private static final ThreadLocal<TraceTiming> LAST_TRACE_TIMING = ThreadLocal.withInitial(
+            TraceTiming::empty
+    );
+    private static final ThreadLocal<DiffractionTiming> LAST_DIFFRACTION_TIMING =
+            ThreadLocal.withInitial(DiffractionTiming::empty);
+    private static final ThreadLocal<AirSearchStats> LAST_AIR_SEARCH =
+            ThreadLocal.withInitial(AirSearchStats::none);
+    private static final ThreadLocal<DenseAirSearchScratch> DENSE_AIR_SEARCH =
+            ThreadLocal.withInitial(DenseAirSearchScratch::new);
+    private static final ThreadLocal<SurfaceHit[]> ROOM_SURFACE_HOLDER =
+            ThreadLocal.withInitial(() -> new SurfaceHit[1]);
 
     private AcousticTracer() {
     }
@@ -172,11 +212,13 @@ public final class AcousticTracer {
             RoomProbe listenerRoomProbe,
             TraceQuality quality
     ) {
+        long traceStarted = System.nanoTime();
+        LAST_DIFFRACTION_TIMING.set(DiffractionTiming.empty());
         long sceneRevision = level instanceof AcousticScene scene
                 ? scene.revision()
                 : 0L;
         TraceCacheKey traceCacheKey = new TraceCacheKey(
-                level,
+                cacheIdentity(level),
                 sceneRevision,
                 AcousticMaterialRegistry.revision(),
                 graphPointKey(source),
@@ -187,6 +229,7 @@ public final class AcousticTracer {
         );
         AcousticResult cachedTrace = TRACE_CACHE.get(traceCacheKey);
         if (cachedTrace != null) {
+            LAST_TRACE_TIMING.set(TraceTiming.cacheHit(System.nanoTime() - traceStarted));
             return cachedTrace;
         }
         EmitterMediumTransfer sourceMedium = solveEmitterBoundary(level, source);
@@ -205,6 +248,7 @@ public final class AcousticTracer {
         FiniteWavefront directWavefront = traceFiniteWavefront(
                 level, source, listener, direction, right, up, 8
         );
+        long directFinished = System.nanoTime();
         Transmission center = directWavefront.center();
         // The offset rays sample the finite first Fresnel zone around the geometric ray.
         // Combine their power continuously on both sides of an edge. Switching from the
@@ -212,6 +256,7 @@ public final class AcousticTracer {
         // an otherwise tiny occluder produce an audible step in level.
         float diffractionContribution = 0.0F;
         DiffractionPath diffractionPath = null;
+        DiffractionTiming primaryDiffractionTiming = DiffractionTiming.empty();
         float[] diffractionSpectrum = new float[AcousticBands.COUNT];
         if (center.firstBounds() != null) {
             diffractionPath = traceDiffraction(
@@ -222,6 +267,10 @@ public final class AcousticTracer {
                     sourceRoomProbe.acoustics().gain() > 0.0F
                             && listenerRoomProbe.acoustics().gain() > 0.0F
             );
+            // Reflection legs may run their own diffraction query later in this trace.
+            // Preserve the primary propagation timing now so diagnostics do not report
+            // a cheap reflected connector in place of the expensive source path.
+            primaryDiffractionTiming = LAST_DIFFRACTION_TIMING.get();
             diffractionSpectrum = diffractionPath.bands().clone();
             // The offset bundle is a finite Fresnel-zone quadrature, while the edge
             // solution reconstructs energy missing from that same incident wavefront.
@@ -236,9 +285,11 @@ public final class AcousticTracer {
                 );
             }
         }
+        long diffractionFinished = System.nanoTime();
         StructuralPath structuralPath = traceStructuralPath(
                 level, source, listener, tuning
         );
+        long structureFinished = System.nanoTime();
         float[] directSpectrum = directWavefront.bands().clone();
         applyEmitterMediumResponse(directSpectrum, sourceMedium);
         applyMediumResponse(directSpectrum, listenerMedium);
@@ -296,6 +347,7 @@ public final class AcousticTracer {
                         diffractionPath == null || !diffractionPath.multipleBends(),
                         center.travelTimeSeconds()
                 );
+        long reflectionsFinished = System.nanoTime();
         // A resolved image reflection is already rendered by the source-specific early
         // reflection channel. Feeding the same path into the shared late-field send
         // counts it twice and lets one image-path topology change spike total loudness.
@@ -386,26 +438,114 @@ public final class AcousticTracer {
                 sphericalSpreadingGain(tuning.meters(directDistance), tuning),
                 resolvedField.directionalField(source)
         );
-        if (TRACE_CACHE.size() >= 512) {
-            TRACE_CACHE.clear();
+        AcousticResult published = putBounded(
+                TRACE_CACHE, TRACE_CACHE_ORDER, traceCacheKey, result, 512
+        );
+        long finished = System.nanoTime();
+        TraceTiming timing = new TraceTiming(
+                false,
+                directFinished - traceStarted,
+                diffractionFinished - directFinished,
+                primaryDiffractionTiming.airNanoseconds(),
+                primaryDiffractionTiming.sparseNanoseconds(),
+                primaryDiffractionTiming.evaluationNanoseconds(),
+                primaryDiffractionTiming.airSearch().mode(),
+                primaryDiffractionTiming.airSearch().expanded(),
+                structureFinished - diffractionFinished,
+                reflectionsFinished - structureFinished,
+                finished - reflectionsFinished,
+                finished - traceStarted
+        );
+        LAST_TRACE_TIMING.set(timing);
+        if (PROFILE_TRACE) {
+            System.out.printf(
+                    "acousticTraceMs direct=%.3f diffraction=%.3f structure=%.3f reflections=%.3f assembly=%.3f total=%.3f%n",
+                    (directFinished - traceStarted) / 1_000_000.0,
+                    (diffractionFinished - directFinished) / 1_000_000.0,
+                    (structureFinished - diffractionFinished) / 1_000_000.0,
+                    (reflectionsFinished - structureFinished) / 1_000_000.0,
+                    (finished - reflectionsFinished) / 1_000_000.0,
+                    (finished - traceStarted) / 1_000_000.0
+            );
         }
-        TRACE_CACHE.put(traceCacheKey, result);
-        return result;
+        return published;
+    }
+
+    /** Timing for the most recent trace on the calling worker thread. */
+    static TraceTiming lastTraceTiming() {
+        return LAST_TRACE_TIMING.get();
+    }
+
+    record TraceTiming(
+            boolean cacheHit,
+            long directNanoseconds,
+            long diffractionNanoseconds,
+            long diffractionAirNanoseconds,
+            long diffractionSparseNanoseconds,
+            long diffractionEvaluationNanoseconds,
+            String diffractionAirMode,
+            int diffractionAirExpanded,
+            long structureNanoseconds,
+            long reflectionsNanoseconds,
+            long assemblyNanoseconds,
+            long totalNanoseconds
+    ) {
+        private static TraceTiming empty() {
+            return new TraceTiming(
+                    false, 0L, 0L, 0L, 0L, 0L, "none", 0,
+                    0L, 0L, 0L, 0L
+            );
+        }
+
+        private static TraceTiming cacheHit(long totalNanoseconds) {
+            return new TraceTiming(
+                    true, 0L, 0L, 0L, 0L, 0L, "cache", 0,
+                    0L, 0L, 0L,
+                    totalNanoseconds
+            );
+        }
+    }
+
+    private record DiffractionTiming(
+            long airNanoseconds,
+            long sparseNanoseconds,
+            long evaluationNanoseconds,
+            AirSearchStats airSearch
+    ) {
+        private static DiffractionTiming empty() {
+            return new DiffractionTiming(0L, 0L, 0L, AirSearchStats.none());
+        }
+    }
+
+    private record AirSearchStats(String mode, int expanded) {
+        private static AirSearchStats none() {
+            return new AirSearchStats("none", 0);
+        }
     }
 
     public static RoomProbe probeRoom(BlockGetter level, Vec3 listener) {
-        return probeRoom(level, listener, AcousticMaterialRegistry.tuning().roomRayCount());
+        return probeRoom(
+                level, listener,
+                AcousticMaterialRegistry.tuning().roomRayCount(),
+                true
+        );
     }
 
     static RoomProbe probeSourceRoom(BlockGetter level, Vec3 source) {
         return probeRoom(
                 level,
                 source,
-                AcousticMaterialRegistry.tuning().sourceRoomRayCount()
+                AcousticMaterialRegistry.tuning().sourceRoomRayCount(),
+                false
         );
     }
 
-    private static RoomProbe probeRoom(BlockGetter level, Vec3 listener, int requestedRayCount) {
+    private static RoomProbe probeRoom(
+            BlockGetter level,
+            Vec3 listener,
+            int requestedRayCount,
+            boolean parallelRays
+    ) {
         MediumSample listenerMedium = sampleMedium(level, listener);
         AcousticTuning tuning = AcousticMaterialRegistry.tuning();
         RoomRayGrid grid = roomRayGrid(requestedRayCount);
@@ -416,10 +556,10 @@ public final class AcousticTracer {
         float[] openingWeights = new float[hits.length];
         OpeningBoundary[] openingModels = new OpeningBoundary[hits.length];
         Arrays.fill(openingBoundaries, Double.POSITIVE_INFINITY);
-        SurfaceHit[] firstHitHolder = new SurfaceHit[1];
-
-        for (int ray = 0; ray < hits.length; ray++) {
+        IntConsumer castRay = ray -> {
             Vec3 direction = grid.directions()[ray];
+            SurfaceHit[] firstHitHolder = ROOM_SURFACE_HOLDER.get();
+            firstHitHolder[0] = null;
             SurfaceHit hit = firstAcousticSurface(
                     level,
                     listener,
@@ -435,6 +575,13 @@ public final class AcousticTracer {
                 // the walls inside the opening as if they enclosed the listener.
                 openingBoundaries[ray] = probeDistance;
                 openingWeights[ray] = 1.0F;
+            }
+        };
+        if (parallelRays) {
+            AcousticWorkerPool.parallelFor(hits.length, castRay);
+        } else {
+            for (int ray = 0; ray < hits.length; ray++) {
+                castRay.accept(ray);
             }
         }
 
@@ -601,7 +748,8 @@ public final class AcousticTracer {
                                 leakage.reverberationTimeSeconds(),
                                 0.12F,
                                 tuning.maxDecayTime()
-                        )
+                        ),
+                        parallelRays
                 );
         float reflectionDelay = Mth.clamp(lateReverb.earlyDelay(), 0.0F, 0.3F);
         float lateDelay = Mth.clamp(lateReverb.lateDelay(), 0.0F, 0.1F);
@@ -927,49 +1075,104 @@ public final class AcousticTracer {
             boolean allowAirCellGraph,
             boolean preferAirCellGraph
     ) {
+        long diffractionStarted = System.nanoTime();
+        LAST_AIR_SEARCH.set(AirSearchStats.none());
         double directDistance = source.distanceTo(listener);
         if (directDistance < 1.0E-6 || candidateBudget <= 0
                 || tuning.diffractionGainScale() <= 1.0E-6F) {
+            LAST_DIFFRACTION_TIMING.set(DiffractionTiming.empty());
             return new DiffractionPath(
                     new float[AcousticBands.COUNT], directDistance, directDistance,
                     List.of(), false, false
             );
         }
 
+        // Traverse the hierarchy in spatial-complexity order.  Portals, visible edges
+        // and their A* links are an exact sparse representation whenever they prove a
+        // clear path.  Expanding the full air-voxel volume first made a simple doorway
+        // pay O(r^3) work before this O(edges log nodes) proof was even attempted.
+        //
+        // The air graph is still the complete connectivity fallback for mazes and
+        // irregular caves that the finite sparse graph cannot prove.  Both routes feed
+        // the same frequency-dependent diffraction evaluator, so this changes search
+        // representation and cost, not the propagation law or an audible cutoff.
         boolean hasPortalEvidence = !sourceOpenings.isEmpty()
                 || !listenerOpenings.isEmpty();
-        // Traverse the hierarchy from its sparse physical representation downward.
-        // A block-centred sound is still a boundary emitter: endpoint blocks are already
-        // excluded by transmission and visibility segment tests. Starting a full voxel
-        // search solely because the coordinate lies in its emitting block flooded the
-        // outdoor half-space before an otherwise valid portal/edge path was considered.
-        // The air graph remains the complete fallback whenever the sparse graph cannot
-        // connect the listener, and remains the primary representation when neither
-        // endpoint probe exposes useful portal evidence.
-        PropagationGraphPath airPath = allowAirCellGraph
-                && preferAirCellGraph && !hasPortalEvidence
-                ? searchAirCellGraph(level, source, listener, candidateBudget)
+        VerifiedAirBackbone verifiedAir = allowAirCellGraph
+                ? verifiedCachedAirPath(
+                        level, source, listener, hasPortalEvidence
+                )
                 : null;
-        List<PropagationGraphPath> paths = airPath != null
-                ? List.of()
-                : searchPropagationGraph(
-                        level,
-                        source,
-                        listener,
-                        obstacle,
-                        sourceOpenings,
-                        listenerOpenings,
-                        candidateBudget,
-                        tuning
+        PropagationGraphPath verifiedAirBackbone = verifiedAir == null
+                ? null : verifiedAir.path();
+        // Portal samples carry the multi-exit arrival field used for localization.  In
+        // that case recompute the tiny sparse graph and retain the air route only as a
+        // topology backbone; using one cached voxel path alone would arbitrarily pick
+        // a side and make the apparent direction jump while walking past an opening.
+        boolean reusableVerifiedBackbone = verifiedAirBackbone != null
+                && (!hasPortalEvidence
+                        || verifiedAir.listenerUnchanged()
+                        || verifiedAirBackbone.points().size() > 3);
+        List<PropagationGraphPath> paths = List.of();
+        if (!reusableVerifiedBackbone) {
+            List<PropagationGraphPath> hierarchicalPaths = List.of();
+            if (allowAirCellGraph && level instanceof AcousticScene scene) {
+                hierarchicalPaths = searchScenePortalGraph(
+                        scene, source, listener,
+                        Math.max(1, tuning.diffractionMaxPaths())
                 );
+            }
+            // The portal hierarchy proves long-range connectivity, but its voxel
+            // corridor is not a substitute for the actual diffraction silhouette.
+            // Always refine the first arrivals through the visibility/edge graph;
+            // otherwise even a single wall corner is localized at an arbitrary voxel
+            // turn and can lose its UTD edge contribution.
+            boolean firstOrderRefinement = hierarchicalPaths.stream().anyMatch(
+                    path -> path.points().size() <= 3
+            );
+            List<PropagationGraphPath> edgePaths =
+                    hierarchicalPaths.isEmpty() || firstOrderRefinement
+                            ? searchPropagationGraph(
+                            level,
+                            source,
+                            listener,
+                            obstacle,
+                            sourceOpenings,
+                            listenerOpenings,
+                            candidateBudget,
+                            tuning,
+                            !hierarchicalPaths.isEmpty()
+                    ) : List.of();
+            if (hierarchicalPaths.isEmpty()) {
+                paths = edgePaths;
+            } else if (edgePaths.isEmpty()) {
+                paths = hierarchicalPaths;
+            } else {
+                ArrayList<PropagationGraphPath> combined = new ArrayList<>(
+                        edgePaths.size() + hierarchicalPaths.size()
+                );
+                combined.addAll(edgePaths);
+                combined.addAll(hierarchicalPaths);
+                paths = List.copyOf(combined);
+            }
+        }
+        long sparseGraphFinished = System.nanoTime();
         boolean edgeGraphReachedListener = paths.stream().anyMatch(
                 PropagationGraphPath::clear
         );
-        if (allowAirCellGraph && airPath == null && (!edgeGraphReachedListener
-                || hasPortalEvidence)) {
-            airPath = searchAirCellGraph(level, source, listener, candidateBudget);
-        }
+        PropagationGraphPath airPath = reusableVerifiedBackbone
+                ? verifiedAirBackbone
+                : allowAirCellGraph && !edgeGraphReachedListener
+                        ? searchAirCellGraph(level, source, listener, candidateBudget)
+                        : null;
+        long airGraphFinished = System.nanoTime();
         if (paths.isEmpty() && airPath == null) {
+            LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
+                    airGraphFinished - sparseGraphFinished,
+                    sparseGraphFinished - diffractionStarted,
+                    0L,
+                    LAST_AIR_SEARCH.get()
+            ));
             return new DiffractionPath(
                     new float[AcousticBands.COUNT], directDistance, directDistance,
                     List.of(), false, false
@@ -1008,6 +1211,13 @@ public final class AcousticTracer {
             evaluatedAirPath = null;
         }
         if (evaluated.isEmpty() && evaluatedAirPath == null) {
+            long finished = System.nanoTime();
+            LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
+                    airGraphFinished - sparseGraphFinished,
+                    sparseGraphFinished - diffractionStarted,
+                    finished - airGraphFinished,
+                    LAST_AIR_SEARCH.get()
+            ));
             return new DiffractionPath(
                     new float[AcousticBands.COUNT], directDistance, directDistance,
                     List.of(), false, false
@@ -1077,11 +1287,28 @@ public final class AcousticTracer {
                 );
             }
         }
-        return new DiffractionPath(
+        DiffractionPath result = new DiffractionPath(
                 combined, bestDistance, bestAirDistance,
                 List.copyOf(directionalArrivals), hasClearPath,
                 multipleDiffractionBackbone
         );
+        long finished = System.nanoTime();
+        LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
+                airGraphFinished - sparseGraphFinished,
+                sparseGraphFinished - diffractionStarted,
+                finished - airGraphFinished,
+                LAST_AIR_SEARCH.get()
+        ));
+        if (PROFILE_TRACE) {
+            System.out.printf(
+                    "  diffractionMs air=%.3f sparse=%.3f evaluate=%.3f total=%.3f%n",
+                    (airGraphFinished - sparseGraphFinished) / 1_000_000.0,
+                    (sparseGraphFinished - diffractionStarted) / 1_000_000.0,
+                    (finished - airGraphFinished) / 1_000_000.0,
+                    (finished - diffractionStarted) / 1_000_000.0
+            );
+        }
+        return result;
     }
 
     private static List<EvaluatedGraphPath> mergeCorrelatedGraphPaths(
@@ -1133,12 +1360,28 @@ public final class AcousticTracer {
             EvaluatedGraphPath representative = candidate.score() > lobe.score()
                     ? candidate
                     : lobe;
+            double lobePower = lobe.score() * lobe.score();
+            double candidatePower = candidate.score() * candidate.score();
+            Vec3 lobeArrival = lobe.arrivalPoint().subtract(listener);
+            Vec3 candidateArrival = candidate.arrivalPoint().subtract(listener);
+            Vec3 arrivalMoment = lobeArrival.normalize().scale(lobePower).add(
+                    candidateArrival.normalize().scale(candidatePower)
+            );
+            double combinedArrivalPower = lobePower + candidatePower;
+            Vec3 mergedArrival = representative.arrivalPoint();
+            if (combinedArrivalPower > 1.0E-12
+                    && arrivalMoment.lengthSqr() > 1.0E-12) {
+                double radius = (lobeArrival.length() * lobePower
+                        + candidateArrival.length() * candidatePower)
+                        / combinedArrivalPower;
+                mergedArrival = listener.add(arrivalMoment.normalize().scale(radius));
+            }
             lobes.set(correlated, new EvaluatedGraphPath(
                     envelope,
                     weightedEnergy(envelope),
                     Math.min(lobe.pathDistance(), candidate.pathDistance()),
                     representative.airDistance(),
-                    representative.arrivalPoint(),
+                    mergedArrival,
                     lobe.clear() || candidate.clear()
             ));
         }
@@ -1154,8 +1397,39 @@ public final class AcousticTracer {
             List<RoomProbe.OpeningSample> sourceOpenings,
             List<RoomProbe.OpeningSample> listenerOpenings,
             int candidateBudget,
-            AcousticTuning tuning
+            AcousticTuning tuning,
+            boolean hierarchyAlreadyConnected
     ) {
+        SparsePathCacheKey cacheKey = new SparsePathCacheKey(
+                cacheIdentity(level),
+                level instanceof AcousticScene scene ? scene.revision() : 0L,
+                airCellKey(source),
+                airCellKey(listener),
+                candidateBudget,
+                tuning
+        );
+        List<PropagationGraphPath> cached = SPARSE_PATH_CACHE.get(cacheKey);
+        if (cached != null) {
+            List<PropagationGraphPath> adapted = adaptCachedSparsePaths(
+                    level, cached, source, listener
+            );
+            if (!adapted.isEmpty()) {
+                return adapted;
+            }
+            SPARSE_PATH_CACHE.remove(cacheKey, cached);
+        }
+        List<PropagationGraphPath> neighboring = adaptNeighboringCachedSparsePaths(
+                level, cacheKey, source, listener
+        );
+        if (!neighboring.isEmpty()) {
+            return putBounded(
+                    SPARSE_PATH_CACHE,
+                    SPARSE_PATH_CACHE_ORDER,
+                    cacheKey,
+                    neighboring,
+                    512
+            );
+        }
         List<PropagationGraphNode> portals = new ArrayList<>(
                 sourceOpenings.size() + listenerOpenings.size()
         );
@@ -1171,7 +1445,9 @@ public final class AcousticTracer {
         PriorityQueue<PropagationGraphState> frontier = new PriorityQueue<>(
                 Comparator.comparingDouble(PropagationGraphState::priority)
         );
-        Map<GraphPointKey, Double> bestDistanceByNode = new HashMap<>();
+        Object2DoubleOpenHashMap<GraphPointKey> bestDistanceByNode =
+                new Object2DoubleOpenHashMap<>();
+        bestDistanceByNode.defaultReturnValue(Double.POSITIVE_INFINITY);
         PropagationGraphNode start = new PropagationGraphNode(source, 1.0F, GraphNodeKind.SOURCE);
         frontier.add(new PropagationGraphState(
                 start, null, 0.0, source.distanceTo(listener), 1.0F
@@ -1180,14 +1456,18 @@ public final class AcousticTracer {
 
         List<PropagationGraphPath> clearPaths = new ArrayList<>();
         int expanded = 0;
-        int maximumExpansions = Math.max(16, candidateBudget * 5);
+        // When the persistent portal graph has already proved connectivity, this graph
+        // is a local silhouette refinement layer rather than a second global pathfinder.
+        // Its failure cannot delete the hierarchical path, so bounded local expansion
+        // removes duplicate maze traversal without imposing an acoustic distance limit.
+        int maximumExpansions = hierarchyAlreadyConnected
+                ? 4
+                : Math.max(16, candidateBudget * 5);
         int maximumCompletePaths = Math.max(4, tuning.diffractionMaxPaths() * 2);
         while (!frontier.isEmpty() && expanded < maximumExpansions) {
             PropagationGraphState state = frontier.poll();
             GraphPointKey stateKey = graphPointKey(state.node().point());
-            if (state.distance() > bestDistanceByNode.getOrDefault(
-                    stateKey, Double.POSITIVE_INFINITY
-            ) + 1.0E-7) {
+            if (state.distance() > bestDistanceByNode.getDouble(stateKey) + 1.0E-7) {
                 continue;
             }
             expanded++;
@@ -1248,7 +1528,138 @@ public final class AcousticTracer {
                 );
             }
         }
-        return clearPaths;
+        if (clearPaths.isEmpty()) {
+            return clearPaths;
+        }
+        return putBounded(
+                SPARSE_PATH_CACHE,
+                SPARSE_PATH_CACHE_ORDER,
+                cacheKey,
+                List.copyOf(clearPaths),
+                512
+        );
+    }
+
+    /**
+     * Repairs only the source/listener connectors of an unchanged interior graph path.
+     * Every connector is tested against the current immutable scene and the exact
+     * sub-block endpoint. A blocked connector rejects the cached route and triggers the
+     * full portal/visibility/edge A* above; no stale path is accepted by age or by a
+     * movement threshold.
+     */
+    private static List<PropagationGraphPath> adaptCachedSparsePaths(
+            BlockGetter level,
+            List<PropagationGraphPath> cached,
+            Vec3 source,
+            Vec3 listener
+    ) {
+        List<PropagationGraphPath> adapted = new ArrayList<>(cached.size());
+        for (PropagationGraphPath path : cached) {
+            List<Vec3> points = path.points();
+            if (points.size() < 2) {
+                continue;
+            }
+            Vec3 firstInterior = points.size() > 2 ? points.get(1) : listener;
+            Vec3 lastInterior = points.size() > 2
+                    ? points.get(points.size() - 2)
+                    : source;
+            if (firstCollisionBounds(level, source, firstInterior) != null
+                    || firstCollisionBounds(level, lastInterior, listener) != null) {
+                continue;
+            }
+            List<Vec3> repaired = new ArrayList<>(points);
+            repaired.set(0, source);
+            repaired.set(repaired.size() - 1, listener);
+            List<Vec3> arrivalSamples = points.size() > 2
+                    ? List.of(lastInterior)
+                    : List.of(source);
+            adapted.add(new PropagationGraphPath(
+                    List.copyOf(repaired),
+                    path.apertureAmplitude(),
+                    path.clear(),
+                    lastInterior,
+                    arrivalSamples
+            ));
+        }
+        return adapted;
+    }
+
+    /**
+     * Repairs one changed endpoint of a neighboring sparse graph cell.  The unchanged
+     * portal/edge sequence is retained only when both new connectors remain visible in
+     * the current immutable scene.
+     */
+    private static List<PropagationGraphPath> adaptNeighboringCachedSparsePaths(
+            BlockGetter level,
+            SparsePathCacheKey requested,
+            Vec3 source,
+            Vec3 listener
+    ) {
+        List<PropagationGraphPath> best = List.of();
+        double bestEndpointDistance = Double.POSITIVE_INFINITY;
+        AirCellKey start = requested.source();
+        AirCellKey goal = requested.listener();
+        for (int endpoint = 0; endpoint < 2; endpoint++) {
+            for (int x = -1; x <= 1; x++) {
+                for (int y = -1; y <= 1; y++) {
+                    for (int z = -1; z <= 1; z++) {
+                        if (x == 0 && y == 0 && z == 0) {
+                            continue;
+                        }
+                        AirCellKey candidateSource = endpoint == 0
+                                ? new AirCellKey(
+                                        start.x() + x,
+                                        start.y() + y,
+                                        start.z() + z
+                                )
+                                : start;
+                        AirCellKey candidateListener = endpoint == 1
+                                ? new AirCellKey(
+                                        goal.x() + x,
+                                        goal.y() + y,
+                                        goal.z() + z
+                                )
+                                : goal;
+                        List<PropagationGraphPath> candidate = SPARSE_PATH_CACHE.get(
+                                new SparsePathCacheKey(
+                                        requested.level(),
+                                        requested.sceneRevision(),
+                                        candidateSource,
+                                        candidateListener,
+                                        requested.candidateBudget(),
+                                        requested.tuning()
+                                )
+                        );
+                        if (candidate == null) {
+                            continue;
+                        }
+                        List<PropagationGraphPath> adapted = adaptCachedSparsePaths(
+                                level, candidate, source, listener
+                        );
+                        if (adapted.isEmpty()) {
+                            continue;
+                        }
+                        PropagationGraphPath representative = candidate.get(0);
+                        Vec3 priorEndpoint = endpoint == 0
+                                ? representative.points().get(0)
+                                : representative.points().get(
+                                        representative.points().size() - 1
+                                );
+                        double endpointDistance = priorEndpoint.distanceToSqr(
+                                endpoint == 0 ? source : listener
+                        );
+                        if (endpointDistance + 1.0E-9 < bestEndpointDistance
+                                || Math.abs(endpointDistance - bestEndpointDistance)
+                                        <= 1.0E-9
+                                        && adapted.size() > best.size()) {
+                            bestEndpointDistance = endpointDistance;
+                            best = adapted;
+                        }
+                    }
+                }
+            }
+        }
+        return best.isEmpty() ? best : List.copyOf(best);
     }
 
     /**
@@ -1265,6 +1676,7 @@ public final class AcousticTracer {
             Vec3 listener,
             int candidateBudget
     ) {
+        LAST_AIR_SEARCH.set(new AirSearchStats("cold", 0));
         AirPathCacheKey cacheKey = airPathCacheKey(level, source, listener);
         PropagationGraphPath cached = AIR_PATH_CACHE.get(cacheKey);
         if (cached != null) {
@@ -1272,29 +1684,166 @@ public final class AcousticTracer {
                     level, cached, source, listener
             );
             if (adapted != null) {
+                LAST_AIR_SEARCH.set(new AirSearchStats("pair-cache", 0));
                 return adapted;
             }
             AIR_PATH_CACHE.remove(cacheKey, cached);
         }
+        List<AirCellKey> startKeys = airEndpointCells(level, source);
+        List<AirCellKey> goalKeys = airEndpointCells(level, listener);
+        if (startKeys.isEmpty() || goalKeys.isEmpty()) {
+            LAST_AIR_SEARCH.set(new AirSearchStats("no-endpoint", 0));
+            return null;
+        }
+        if (airComponentsProveDisconnection(level, startKeys, goalKeys)) {
+            LAST_AIR_SEARCH.set(new AirSearchStats("component-disconnected", 0));
+            return null;
+        }
+        AirPathMissCacheKey missCacheKey = new AirPathMissCacheKey(
+                cacheKey,
+                airSeedSignature(airCellKey(source), startKeys),
+                airSeedSignature(airCellKey(listener), goalKeys)
+        );
+        if (AIR_PATH_MISS_CACHE.containsKey(missCacheKey)) {
+            LAST_AIR_SEARCH.set(new AirSearchStats("miss-cache", 0));
+            return null;
+        }
+
+        // A moving emitter changes only the first connector.  Repair that proven
+        // endpoint before expanding the listener field; reverse flood expansion is
+        // useful for genuinely new branches but is needless work for the common
+        // entity/block-sound movement case.  Listener-side repairs remain below the
+        // shared-field lookup because arrival-direction continuity belongs to the
+        // listener-rooted field.
+        VerifiedAirBackbone sourceRepair = adaptNeighboringSourceCachedAirPath(
+                level, cacheKey, source, listener
+        );
+        if (sourceRepair != null) {
+            putBounded(
+                    AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                    cacheKey, sourceRepair.path(), 2048
+            );
+            LAST_AIR_SEARCH.set(new AirSearchStats("source-repair", 0));
+            return sourceRepair.path();
+        }
+
+        ListenerAirFieldKey fieldKey = new ListenerAirFieldKey(
+                cacheKey.level(),
+                cacheKey.sceneRevision(),
+                cacheKey.listener(),
+                airSeedSignature(cacheKey.listener(), goalKeys)
+        );
+        ListenerAirRouteField listenerField = LISTENER_AIR_FIELDS.get(fieldKey);
+        if (listenerField != null && listenerField.hasBackbone()) {
+            long sharedStarted = System.nanoTime();
+            List<Long> sharedCells = listenerField.connect(
+                    level, source, startKeys, candidateBudget
+            );
+            long sharedConnected = System.nanoTime();
+            if (sharedCells != null) {
+                PropagationGraphPath shared = buildAirPropagationPath(
+                        level, source, listener, sharedCells, listenerField
+                );
+                if (PROFILE_TRACE) {
+                    System.out.printf(
+                            "    sharedAir connect=%.4f ms build=%.4f ms cells=%d%n",
+                            (sharedConnected - sharedStarted) / 1_000_000.0,
+                            (System.nanoTime() - sharedConnected) / 1_000_000.0,
+                            sharedCells.size()
+                    );
+                }
+                if (shared != null) {
+                    putBounded(
+                            AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                            cacheKey, shared, 2048
+                    );
+                    return shared;
+                }
+            }
+        }
+        // A one-cell endpoint move already has a fully validated interior route in the
+        // per-pair cache. Repair that connector before waiting for a newly rooted shared
+        // field; otherwise every voice stalls behind the first cold field build whenever
+        // the listener crosses a voxel boundary.
         PropagationGraphPath neighboring = adaptNeighboringCachedAirPath(
                 level, cacheKey, source, listener
         );
         if (neighboring != null) {
-            AIR_PATH_CACHE.put(cacheKey, neighboring);
+            putBounded(
+                    AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                    cacheKey, neighboring, 2048
+            );
+            LAST_AIR_SEARCH.set(new AirSearchStats("neighbor-repair", 0));
             return neighboring;
         }
-        List<AirCellKey> startKeys = airEndpointCells(level, source);
-        List<AirCellKey> goalKeys = airEndpointCells(level, listener);
-        if (startKeys.isEmpty() || goalKeys.isEmpty()) {
-            return null;
+        if (listenerField == null) {
+            ListenerAirRouteField inherited = neighboringListenerAirField(fieldKey);
+            ListenerAirRouteField created = new ListenerAirRouteField(
+                    listener, goalKeys, inherited
+            );
+            ListenerAirRouteField raced = LISTENER_AIR_FIELDS.putIfAbsent(fieldKey, created);
+            listenerField = raced == null ? created : raced;
+            if (raced == null) {
+                LISTENER_AIR_FIELD_ORDER.add(fieldKey);
+                while (LISTENER_AIR_FIELDS.size() > 8) {
+                    ListenerAirFieldKey oldest = LISTENER_AIR_FIELD_ORDER.poll();
+                    if (oldest == null) {
+                        break;
+                    }
+                    LISTENER_AIR_FIELDS.remove(oldest);
+                }
+            }
         }
-
-        PriorityQueue<AirGraphState> forwardFrontier = new PriorityQueue<>(
-                Comparator.comparingDouble(AirGraphState::priority)
-        );
-        PriorityQueue<AirGraphState> backwardFrontier = new PriorityQueue<>(
-                Comparator.comparingDouble(AirGraphState::priority)
-        );
+        boolean initialFieldBuilder = false;
+        if (!listenerField.hasBackbone()) {
+            initialFieldBuilder = listenerField.claimBackboneBuild();
+            if (!initialFieldBuilder) {
+                listenerField.awaitBackboneBuild();
+                if (listenerField.hasBackbone()) {
+                    List<Long> sharedCells = listenerField.connect(
+                            level, source, startKeys, candidateBudget
+                    );
+                    if (sharedCells != null) {
+                        PropagationGraphPath shared = buildAirPropagationPath(
+                                level, source, listener, sharedCells, listenerField
+                        );
+                        if (shared != null) {
+                            putBounded(
+                                    AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                                    cacheKey, shared, 2048
+                            );
+                            return shared;
+                        }
+                    }
+                }
+                initialFieldBuilder = listenerField.claimBackboneBuild();
+            }
+        }
+        if (level instanceof AcousticScene scene) {
+            DenseAirSearchResult dense = searchDenseAirGraph(
+                    scene, source, listener, startKeys, goalKeys,
+                    candidateBudget
+            );
+            LAST_AIR_SEARCH.set(new AirSearchStats(
+                    dense.path() == null ? "dense-inconclusive" : "dense-connected",
+                    dense.expanded()
+            ));
+            if (dense.path() != null) {
+                listenerField.register(dense.path());
+                PropagationGraphPath densePath = buildAirPropagationPath(
+                        level, source, listener, dense.path(), listenerField
+                );
+                if (densePath != null) {
+                    AIR_PATH_MISS_CACHE.remove(missCacheKey);
+                    return putBounded(
+                            AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                            cacheKey, densePath, 2048
+                    );
+                }
+            }
+        }
+        AirGraphHeap forwardFrontier = new AirGraphHeap(1024);
+        AirGraphHeap backwardFrontier = new AirGraphHeap(1024);
         Long2DoubleOpenHashMap forwardDistance = new Long2DoubleOpenHashMap(
                 Math.max(1024, candidateBudget * 128)
         );
@@ -1303,38 +1852,44 @@ public final class AcousticTracer {
         );
         forwardDistance.defaultReturnValue(Double.POSITIVE_INFINITY);
         backwardDistance.defaultReturnValue(Double.POSITIVE_INFINITY);
-        Long2ObjectOpenHashMap<AirGraphState> forwardStates =
-                new Long2ObjectOpenHashMap<>();
-        Long2ObjectOpenHashMap<AirGraphState> backwardStates =
-                new Long2ObjectOpenHashMap<>();
+        Long2LongOpenHashMap forwardPrevious = new Long2LongOpenHashMap();
+        Long2LongOpenHashMap backwardPrevious = new Long2LongOpenHashMap();
+        forwardPrevious.defaultReturnValue(Long.MIN_VALUE);
+        backwardPrevious.defaultReturnValue(Long.MIN_VALUE);
         for (AirCellKey startKey : startKeys) {
-            Vec3 startCenter = airCellCenter(startKey);
-            AirGraphState start = new AirGraphState(
-                    startKey,
-                    null,
-                    source.distanceTo(startCenter),
-                    source.distanceTo(startCenter) + startCenter.distanceTo(listener)
-            );
             long packedStart = packAirCell(startKey);
-            if (start.distance() < forwardDistance.get(packedStart)) {
-                forwardFrontier.add(start);
-                forwardDistance.put(packedStart, start.distance());
-                forwardStates.put(packedStart, start);
+            double distance = distanceFromCellCenter(
+                    startKey.x(), startKey.y(), startKey.z(), source
+            );
+            if (distance < forwardDistance.get(packedStart)) {
+                forwardFrontier.add(
+                        packedStart,
+                        distance,
+                        distance + endpointGraphHeuristic(
+                                startKey.x(), startKey.y(), startKey.z(),
+                                goalKeys, listener
+                        )
+                );
+                forwardDistance.put(packedStart, distance);
+                forwardPrevious.put(packedStart, Long.MIN_VALUE);
             }
         }
         for (AirCellKey goalKey : goalKeys) {
-            Vec3 goalCenter = airCellCenter(goalKey);
-            AirGraphState end = new AirGraphState(
-                    goalKey,
-                    null,
-                    listener.distanceTo(goalCenter),
-                    listener.distanceTo(goalCenter) + goalCenter.distanceTo(source)
-            );
             long packedGoal = packAirCell(goalKey);
-            if (end.distance() < backwardDistance.get(packedGoal)) {
-                backwardFrontier.add(end);
-                backwardDistance.put(packedGoal, end.distance());
-                backwardStates.put(packedGoal, end);
+            double distance = distanceFromCellCenter(
+                    goalKey.x(), goalKey.y(), goalKey.z(), listener
+            );
+            if (distance < backwardDistance.get(packedGoal)) {
+                backwardFrontier.add(
+                        packedGoal,
+                        distance,
+                        distance + endpointGraphHeuristic(
+                                goalKey.x(), goalKey.y(), goalKey.z(),
+                                startKeys, source
+                        )
+                );
+                backwardDistance.put(packedGoal, distance);
+                backwardPrevious.put(packedGoal, Long.MIN_VALUE);
             }
         }
 
@@ -1345,15 +1900,14 @@ public final class AcousticTracer {
                 65536
         );
         double bestMeetingDistance = Double.POSITIVE_INFINITY;
-        AirGraphState forwardMeeting = null;
-        AirGraphState backwardMeeting = null;
+        long meetingCell = Long.MIN_VALUE;
         boolean expandForward = true;
         while (!forwardFrontier.isEmpty()
                 && !backwardFrontier.isEmpty()
                 && expanded < maximumExpansions) {
             if (bestMeetingDistance < Double.POSITIVE_INFINITY
-                    && forwardFrontier.peek().priority() >= bestMeetingDistance
-                    && backwardFrontier.peek().priority() >= bestMeetingDistance) {
+                    && forwardFrontier.peekPriority() >= bestMeetingDistance
+                    && backwardFrontier.peekPriority() >= bestMeetingDistance) {
                 break;
             }
             // Alternate the two admissible A* frontiers. Picking only the globally
@@ -1364,7 +1918,7 @@ public final class AcousticTracer {
             // search budget or biasing the physical route.
             boolean forward = expandForward;
             expandForward = !expandForward;
-            PriorityQueue<AirGraphState> frontier = forward
+            AirGraphHeap frontier = forward
                     ? forwardFrontier
                     : backwardFrontier;
             Long2DoubleOpenHashMap ownDistance = forward
@@ -1373,133 +1927,698 @@ public final class AcousticTracer {
             Long2DoubleOpenHashMap otherDistance = forward
                     ? backwardDistance
                     : forwardDistance;
-            Long2ObjectOpenHashMap<AirGraphState> ownStates = forward
-                    ? forwardStates
-                    : backwardStates;
-            Long2ObjectOpenHashMap<AirGraphState> otherStates = forward
-                    ? backwardStates
-                    : forwardStates;
-            Vec3 oppositeCenter = forward ? listener : source;
-            AirGraphState state = frontier.poll();
-            long packedState = packAirCell(state.key());
-            if (state.distance() > ownDistance.get(packedState) + 1.0E-7) {
+            Long2LongOpenHashMap ownPrevious = forward
+                    ? forwardPrevious
+                    : backwardPrevious;
+            List<AirCellKey> oppositeSeeds = forward ? goalKeys : startKeys;
+            Vec3 oppositeEndpoint = forward ? listener : source;
+            long packedState = frontier.poll();
+            double stateDistance = frontier.lastDistance();
+            if (stateDistance > ownDistance.get(packedState) + 1.0E-7) {
                 continue;
             }
-            AirGraphState oppositeState = otherStates.get(packedState);
-            if (oppositeState != null) {
-                double meetingDistance = state.distance() + oppositeState.distance();
+            double oppositeStateDistance = otherDistance.get(packedState);
+            if (oppositeStateDistance < Double.POSITIVE_INFINITY) {
+                double meetingDistance = stateDistance + oppositeStateDistance;
                 if (meetingDistance < bestMeetingDistance) {
                     bestMeetingDistance = meetingDistance;
-                    forwardMeeting = forward ? state : oppositeState;
-                    backwardMeeting = forward ? oppositeState : state;
+                    meetingCell = packedState;
                 }
             }
             expanded++;
-            Vec3 from = airCellCenter(state.key());
-            BlockState fromState = level.getBlockState(new BlockPos(
-                    state.key().x(), state.key().y(), state.key().z()
-            ));
+            int stateX = BlockPos.getX(packedState);
+            int stateY = BlockPos.getY(packedState);
+            int stateZ = BlockPos.getZ(packedState);
+            boolean fromAir = isAirCell(level, stateX, stateY, stateZ);
             for (int[] offset : AIR_GRAPH_NEIGHBORS) {
-                AirCellKey nextKey = new AirCellKey(
-                        state.key().x() + offset[0],
-                        state.key().y() + offset[1],
-                        state.key().z() + offset[2]
-                );
-                Vec3 next = airCellCenter(nextKey);
-                BlockState nextState = level.getBlockState(new BlockPos(
-                        nextKey.x(), nextKey.y(), nextKey.z()
-                ));
+                int nextX = stateX + offset[0];
+                int nextY = stateY + offset[1];
+                int nextZ = stateZ + offset[2];
+                boolean nextAir = isAirCell(level, nextX, nextY, nextZ);
                 // Two face-neighboring air voxels have an unobstructed segment by
                 // construction. Only partial collision cells need the more expensive
                 // shape query; this is the common-case hot path in long caves.
-                if (!fromState.isAir() || !nextState.isAir()) {
+                if (!fromAir || !nextAir) {
+                    Vec3 from = new Vec3(
+                            stateX + 0.5, stateY + 0.5, stateZ + 0.5
+                    );
+                    Vec3 next = new Vec3(
+                            nextX + 0.5, nextY + 0.5, nextZ + 0.5
+                    );
                     if (pointInsideCollision(level, next)
                             || firstCollisionBounds(level, from, next) != null) {
                         continue;
                     }
                 }
-                double distance = state.distance() + 1.0;
-                long packedNext = packAirCell(nextKey);
+                double distance = stateDistance + 1.0;
+                long packedNext = BlockPos.asLong(nextX, nextY, nextZ);
                 if (distance + 1.0E-7 >= ownDistance.get(packedNext)) {
                     continue;
                 }
-                AirGraphState nextStateNode = new AirGraphState(
-                        nextKey,
-                        state,
-                        distance,
-                        distance + next.distanceTo(oppositeCenter)
-                );
                 ownDistance.put(packedNext, distance);
-                ownStates.put(packedNext, nextStateNode);
-                frontier.add(nextStateNode);
+                ownPrevious.put(packedNext, packedState);
+                frontier.add(
+                        packedNext,
+                        distance,
+                        distance + endpointGraphHeuristic(
+                                nextX, nextY, nextZ,
+                                oppositeSeeds, oppositeEndpoint
+                        )
+                );
                 double oppositeDistance = otherDistance.get(packedNext);
                 if (oppositeDistance < Double.POSITIVE_INFINITY) {
                     double meetingDistance = distance + oppositeDistance;
                     if (meetingDistance < bestMeetingDistance) {
-                        AirGraphState otherState = otherStates.get(packedNext);
                         bestMeetingDistance = meetingDistance;
-                        forwardMeeting = forward ? nextStateNode : otherState;
-                        backwardMeeting = forward ? otherState : nextStateNode;
+                        meetingCell = packedNext;
                     }
                 }
             }
         }
-        if (forwardMeeting == null || backwardMeeting == null) {
+        if (PROFILE_TRACE) {
+            System.out.printf(
+                    "    airGraph expanded=%d limit=%d connected=%s%n",
+                    expanded, maximumExpansions, meetingCell != Long.MIN_VALUE
+            );
+        }
+        LAST_AIR_SEARCH.set(new AirSearchStats(
+                meetingCell != Long.MIN_VALUE
+                        ? "full-connected"
+                        : expanded >= maximumExpansions
+                        ? "full-limit"
+                        : "full-exhausted",
+                expanded
+        ));
+        if (meetingCell == Long.MIN_VALUE) {
+            // Only an exhausted frontier proves disconnection. Reaching the bounded
+            // expansion capacity is inconclusive and must remain eligible for another
+            // exact endpoint/scene query.
+            if (forwardFrontier.isEmpty() || backwardFrontier.isEmpty()) {
+                putBounded(
+                        AIR_PATH_MISS_CACHE,
+                        AIR_PATH_MISS_CACHE_ORDER,
+                        missCacheKey,
+                        Boolean.TRUE,
+                        512
+                );
+            }
+            if (initialFieldBuilder) {
+                listenerField.finishBackboneBuild();
+            }
             return null;
         }
-        ArrayDeque<Vec3> reversed = new ArrayDeque<>();
-        for (AirGraphState state = forwardMeeting;
-             state != null;
-             state = state.previous()) {
-            reversed.addFirst(airCellCenter(state.key()));
+        ArrayDeque<Long> reversed = new ArrayDeque<>();
+        for (long cell = meetingCell;
+             cell != Long.MIN_VALUE;
+             cell = forwardPrevious.get(cell)) {
+            reversed.addFirst(cell);
         }
-        List<Vec3> raw = new ArrayList<>(reversed.size() + 2);
+        List<Long> cellPath = new ArrayList<>(reversed.size() + 8);
+        cellPath.addAll(reversed);
+        for (long cell = backwardPrevious.get(meetingCell);
+             cell != Long.MIN_VALUE;
+             cell = backwardPrevious.get(cell)) {
+            cellPath.add(cell);
+        }
+        listenerField.register(cellPath);
+        PropagationGraphPath result = buildAirPropagationPath(
+                level, source, listener, cellPath, listenerField
+        );
+        if (result == null) {
+            if (initialFieldBuilder) {
+                listenerField.finishBackboneBuild();
+            }
+            return null;
+        }
+        AIR_PATH_MISS_CACHE.remove(missCacheKey);
+        return putBounded(
+                AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER, cacheKey, result, 2048
+        );
+    }
+
+    private static List<PropagationGraphPath> searchScenePortalGraph(
+            AcousticScene scene,
+            Vec3 source,
+            Vec3 listener,
+            int maximumPaths
+    ) {
+        List<AirCellKey> starts = airEndpointCells(scene, source);
+        List<AirCellKey> goals = airEndpointCells(scene, listener);
+        if (starts.isEmpty() || goals.isEmpty()) {
+            return List.of();
+        }
+        List<PropagationGraphPath> result = new ArrayList<>();
+        for (AirCellKey start : starts) {
+            for (AirCellKey goal : goals) {
+                List<List<Long>> routes = scene.portalPaths(
+                        start.x(), start.y(), start.z(),
+                        goal.x(), goal.y(), goal.z(),
+                        maximumPaths
+                );
+                for (List<Long> route : routes) {
+                    PropagationGraphPath path = buildAirPropagationPath(
+                            scene, source, listener, route, null
+                    );
+                    if (path != null) {
+                        result.add(path);
+                        if (result.size() >= maximumPaths) {
+                            return List.copyOf(result);
+                        }
+                    }
+                }
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private static DenseAirSearchResult searchDenseAirGraph(
+            AcousticScene scene,
+            Vec3 source,
+            Vec3 listener,
+            List<AirCellKey> startKeys,
+            List<AirCellKey> goalKeys,
+            int candidateBudget
+    ) {
+        DenseAirSearchScratch scratch = DENSE_AIR_SEARCH.get();
+        boolean singleSeed = startKeys.size() == 1 && goalKeys.size() == 1;
+        scratch.begin(scene.cellCapacity(), !singleSeed);
+        DenseEndpointHeuristic goalHeuristic = DenseEndpointHeuristic.from(
+                goalKeys, listener
+        );
+        DenseEndpointHeuristic startHeuristic = DenseEndpointHeuristic.from(
+                startKeys, source
+        );
+        if (singleSeed) {
+            return searchDenseSingleSeed(
+                    scene, source, listener,
+                    startKeys.get(0), goalKeys.get(0),
+                    candidateBudget, scratch
+            );
+        }
+        for (AirCellKey start : startKeys) {
+            int id = scene.airCellIndex(start.x(), start.y(), start.z());
+            if (id < 0) {
+                continue;
+            }
+            double distance = distanceFromCellCenter(
+                    start.x(), start.y(), start.z(), source
+            );
+            if (distance < scratch.forwardDistance(id)) {
+                scratch.setForward(id, distance, -1);
+                scratch.forwardFrontier.add(
+                        id, distance,
+                        distance + goalHeuristic.distance(
+                                start.x(), start.y(), start.z()
+                        )
+                );
+            }
+        }
+        for (AirCellKey goal : goalKeys) {
+            int id = scene.airCellIndex(goal.x(), goal.y(), goal.z());
+            if (id < 0) {
+                continue;
+            }
+            double distance = distanceFromCellCenter(
+                    goal.x(), goal.y(), goal.z(), listener
+            );
+            if (distance < scratch.backwardDistance(id)) {
+                scratch.setBackward(id, distance, -1);
+                scratch.backwardFrontier.add(
+                        id, distance,
+                        distance + startHeuristic.distance(
+                                goal.x(), goal.y(), goal.z()
+                        )
+                );
+            }
+        }
+        if (scratch.forwardFrontier.isEmpty()
+                || scratch.backwardFrontier.isEmpty()) {
+            return new DenseAirSearchResult(null, 0);
+        }
+        int maximumExpansions = Mth.clamp(
+                (int) Math.ceil(source.distanceTo(listener))
+                        * candidateBudget * 32,
+                8192,
+                65536
+        );
+        double bestMeetingDistance = Double.POSITIVE_INFINITY;
+        int meeting = -1;
+        int expanded = 0;
+        boolean expandForward = true;
+        while (!scratch.forwardFrontier.isEmpty()
+                && !scratch.backwardFrontier.isEmpty()
+                && expanded < maximumExpansions) {
+            if (bestMeetingDistance < Double.POSITIVE_INFINITY
+                    && scratch.forwardFrontier.peekPriority() >= bestMeetingDistance
+                    && scratch.backwardFrontier.peekPriority() >= bestMeetingDistance) {
+                break;
+            }
+            boolean forward = expandForward;
+            expandForward = !expandForward;
+            IntAirGraphHeap frontier = forward
+                    ? scratch.forwardFrontier : scratch.backwardFrontier;
+            int state = frontier.poll();
+            double stateDistance = frontier.lastDistance();
+            double knownDistance = forward
+                    ? scratch.forwardDistance(state)
+                    : scratch.backwardDistance(state);
+            if (stateDistance > knownDistance + 1.0E-7) {
+                continue;
+            }
+            double opposite = forward
+                    ? scratch.backwardDistance(state)
+                    : scratch.forwardDistance(state);
+            if (opposite < Double.POSITIVE_INFINITY
+                    && stateDistance + opposite < bestMeetingDistance) {
+                bestMeetingDistance = stateDistance + opposite;
+                meeting = state;
+            }
+            expanded++;
+            int stateX = scene.cellX(state);
+            int stateY = scene.cellY(state);
+            int stateZ = scene.cellZ(state);
+            for (int[] offset : AIR_GRAPH_NEIGHBORS) {
+                int nextX = stateX + offset[0];
+                int nextY = stateY + offset[1];
+                int nextZ = stateZ + offset[2];
+                int next = scene.neighborCellIndex(
+                        state, offset[0], offset[1], offset[2]
+                );
+                if (next < 0) {
+                    continue;
+                }
+                if (!scene.isAirCellIndex(next)) {
+                    // Partial collision cells are uncommon but remain part of the same
+                    // exact graph when their centre-to-centre segment is physically
+                    // clear. Cells outside the immutable capture are left to the old
+                    // complete fallback, never guessed as open or closed here.
+                    Vec3 from = new Vec3(
+                            stateX + 0.5, stateY + 0.5, stateZ + 0.5
+                    );
+                    Vec3 to = new Vec3(
+                            nextX + 0.5, nextY + 0.5, nextZ + 0.5
+                    );
+                    if (pointInsideCollision(scene, to)
+                            || firstCollisionBounds(scene, from, to) != null) {
+                        continue;
+                    }
+                }
+                double nextDistance = stateDistance + 1.0;
+                double prior = forward
+                        ? scratch.forwardDistance(next)
+                        : scratch.backwardDistance(next);
+                if (nextDistance + 1.0E-7 >= prior) {
+                    continue;
+                }
+                if (forward) {
+                    scratch.setForward(next, nextDistance, state);
+                } else {
+                    scratch.setBackward(next, nextDistance, state);
+                }
+                frontier.add(
+                        next,
+                        nextDistance,
+                        nextDistance + (forward
+                                ? goalHeuristic.distance(nextX, nextY, nextZ)
+                                : startHeuristic.distance(nextX, nextY, nextZ))
+                );
+                double nextOpposite = forward
+                        ? scratch.backwardDistance(next)
+                        : scratch.forwardDistance(next);
+                if (nextOpposite < Double.POSITIVE_INFINITY
+                        && nextDistance + nextOpposite < bestMeetingDistance) {
+                    bestMeetingDistance = nextDistance + nextOpposite;
+                    meeting = next;
+                }
+            }
+        }
+        if (meeting < 0) {
+            return new DenseAirSearchResult(null, expanded);
+        }
+        ArrayDeque<Long> reversed = new ArrayDeque<>();
+        for (int cell = meeting; cell >= 0; cell = scratch.forwardPrevious(cell)) {
+            reversed.addFirst(BlockPos.asLong(
+                    scene.cellX(cell), scene.cellY(cell), scene.cellZ(cell)
+            ));
+        }
+        List<Long> path = new ArrayList<>(reversed.size() + 8);
+        path.addAll(reversed);
+        for (int cell = scratch.backwardPrevious(meeting);
+             cell >= 0;
+             cell = scratch.backwardPrevious(cell)) {
+            path.add(BlockPos.asLong(
+                    scene.cellX(cell), scene.cellY(cell), scene.cellZ(cell)
+            ));
+        }
+        return new DenseAirSearchResult(List.copyOf(path), expanded);
+    }
+
+    private static DenseAirSearchResult searchDenseSingleSeed(
+            AcousticScene scene,
+            Vec3 source,
+            Vec3 listener,
+            AirCellKey startKey,
+            AirCellKey goalKey,
+            int candidateBudget,
+            DenseAirSearchScratch scratch
+    ) {
+        int start = scene.airCellIndex(startKey.x(), startKey.y(), startKey.z());
+        int goal = scene.airCellIndex(goalKey.x(), goalKey.y(), goalKey.z());
+        if (start < 0 || goal < 0) {
+            return new DenseAirSearchResult(null, 0);
+        }
+        double startConnector = distanceFromCellCenter(
+                startKey.x(), startKey.y(), startKey.z(), source
+        );
+        double goalConnector = distanceFromCellCenter(
+                goalKey.x(), goalKey.y(), goalKey.z(), listener
+        );
+        double priorityBase = startConnector + goalConnector;
+        scratch.setForward(start, startConnector, -1);
+        scratch.setBackward(goal, goalConnector, -1);
+        scratch.forwardBuckets.add(
+                start, startConnector,
+                manhattan(startKey.x(), startKey.y(), startKey.z(), goalKey)
+        );
+        scratch.backwardBuckets.add(
+                goal, goalConnector,
+                manhattan(goalKey.x(), goalKey.y(), goalKey.z(), startKey)
+        );
+        int maximumExpansions = Mth.clamp(
+                (int) Math.ceil(source.distanceTo(listener))
+                        * candidateBudget * 32,
+                8192,
+                65536
+        );
+        double bestMeetingDistance = Double.POSITIVE_INFINITY;
+        int meeting = -1;
+        int expanded = 0;
+        boolean expandForward = true;
+        while (!scratch.forwardBuckets.isEmpty()
+                && !scratch.backwardBuckets.isEmpty()
+                && expanded < maximumExpansions) {
+            if (bestMeetingDistance < Double.POSITIVE_INFINITY
+                    && priorityBase + scratch.forwardBuckets.peekPriority()
+                    >= bestMeetingDistance
+                    && priorityBase + scratch.backwardBuckets.peekPriority()
+                    >= bestMeetingDistance) {
+                break;
+            }
+            boolean forward = expandForward;
+            expandForward = !expandForward;
+            IntBucketFrontier frontier = forward
+                    ? scratch.forwardBuckets : scratch.backwardBuckets;
+            int state = frontier.poll();
+            double stateDistance = frontier.lastDistance();
+            double knownDistance = forward
+                    ? scratch.forwardDistance(state)
+                    : scratch.backwardDistance(state);
+            if (stateDistance > knownDistance + 1.0E-7) {
+                continue;
+            }
+            double opposite = forward
+                    ? scratch.backwardDistance(state)
+                    : scratch.forwardDistance(state);
+            if (opposite < Double.POSITIVE_INFINITY
+                    && stateDistance + opposite < bestMeetingDistance) {
+                bestMeetingDistance = stateDistance + opposite;
+                meeting = state;
+            }
+            expanded++;
+            int stateX = scene.cellX(state);
+            int stateY = scene.cellY(state);
+            int stateZ = scene.cellZ(state);
+            for (int[] offset : AIR_GRAPH_NEIGHBORS) {
+                int next = scene.neighborCellIndex(
+                        state, offset[0], offset[1], offset[2]
+                );
+                if (next < 0 || !scene.isAirCellIndex(next)) {
+                    continue;
+                }
+                double nextDistance = stateDistance + 1.0;
+                double prior = forward
+                        ? scratch.forwardDistance(next)
+                        : scratch.backwardDistance(next);
+                if (nextDistance + 1.0E-7 >= prior) {
+                    continue;
+                }
+                if (forward) {
+                    scratch.setForward(next, nextDistance, state);
+                } else {
+                    scratch.setBackward(next, nextDistance, state);
+                }
+                int nextX = scene.cellX(next);
+                int nextY = scene.cellY(next);
+                int nextZ = scene.cellZ(next);
+                int steps = (int) Math.round(nextDistance
+                        - (forward ? startConnector : goalConnector));
+                int heuristic = forward
+                        ? manhattan(nextX, nextY, nextZ, goalKey)
+                        : manhattan(nextX, nextY, nextZ, startKey);
+                frontier.add(next, nextDistance, steps + heuristic);
+                double nextOpposite = forward
+                        ? scratch.backwardDistance(next)
+                        : scratch.forwardDistance(next);
+                if (nextOpposite < Double.POSITIVE_INFINITY
+                        && nextDistance + nextOpposite < bestMeetingDistance) {
+                    bestMeetingDistance = nextDistance + nextOpposite;
+                    meeting = next;
+                }
+            }
+        }
+        if (meeting < 0) {
+            return new DenseAirSearchResult(null, expanded);
+        }
+        ArrayDeque<Long> reversed = new ArrayDeque<>();
+        for (int cell = meeting; cell >= 0; cell = scratch.forwardPrevious(cell)) {
+            reversed.addFirst(BlockPos.asLong(
+                    scene.cellX(cell), scene.cellY(cell), scene.cellZ(cell)
+            ));
+        }
+        List<Long> path = new ArrayList<>(reversed.size() + 8);
+        path.addAll(reversed);
+        for (int cell = scratch.backwardPrevious(meeting);
+             cell >= 0;
+             cell = scratch.backwardPrevious(cell)) {
+            path.add(BlockPos.asLong(
+                    scene.cellX(cell), scene.cellY(cell), scene.cellZ(cell)
+            ));
+        }
+        return new DenseAirSearchResult(List.copyOf(path), expanded);
+    }
+
+    private static int manhattan(int x, int y, int z, AirCellKey target) {
+        return Math.abs(x - target.x())
+                + Math.abs(y - target.y())
+                + Math.abs(z - target.z());
+    }
+
+
+    static DenseAirSearchMetrics measureDenseAirSearch(
+            AcousticScene scene,
+            Vec3 source,
+            Vec3 listener
+    ) {
+        List<AirCellKey> starts = airEndpointCells(scene, source);
+        List<AirCellKey> goals = airEndpointCells(scene, listener);
+        long started = System.nanoTime();
+        DenseAirSearchResult result = searchDenseAirGraph(
+                scene, source, listener, starts, goals,
+                DIFFRACTION_CANDIDATE_BUDGET
+        );
+        return new DenseAirSearchMetrics(
+                result.path() != null,
+                result.expanded(),
+                System.nanoTime() - started
+        );
+    }
+
+    private static PropagationGraphPath buildAirPropagationPath(
+            BlockGetter level,
+            Vec3 source,
+            Vec3 listener,
+            List<Long> cellPath,
+            ListenerAirRouteField listenerField
+    ) {
+        if (cellPath.isEmpty()) {
+            return null;
+        }
+        List<Vec3> raw = new ArrayList<>(cellPath.size() + 2);
         raw.add(source);
-        raw.addAll(reversed);
-        for (AirGraphState state = backwardMeeting.previous();
-             state != null;
-             state = state.previous()) {
-            raw.add(airCellCenter(state.key()));
+        for (long cell : cellPath) {
+            raw.add(airCellCenter(cell));
         }
         raw.add(listener);
-        int firstArrivalSample = Math.max(1, raw.size() - 14);
-        List<Vec3> arrivalSamples = new ArrayList<>(raw.size() - firstArrivalSample);
-        for (int index = firstArrivalSample; index < raw.size() - 1; index++) {
-            arrivalSamples.add(raw.get(index));
-        }
+        List<Vec3> corridor = collapseCollinearCorridor(raw);
         List<Vec3> pulled = new ArrayList<>();
         pulled.add(source);
         int anchor = 0;
-        while (anchor < raw.size() - 1) {
-            int visible = raw.size() - 1;
-            while (visible > anchor + 1
-                    && firstCollisionBounds(level, raw.get(anchor), raw.get(visible)) != null) {
-                visible--;
+        while (anchor < corridor.size() - 1) {
+            int visible = anchor + 1;
+            while (visible + 1 < corridor.size()
+                    && firstCollisionBounds(
+                    level, corridor.get(anchor), corridor.get(visible + 1)
+            ) == null) {
+                visible++;
             }
             if (visible <= anchor) {
                 return null;
             }
-            pulled.add(raw.get(visible));
+            pulled.add(corridor.get(visible));
             anchor = visible;
         }
         Vec3 arrivalPoint = pulled.size() > 2
                 ? pulled.get(pulled.size() - 2)
                 : source;
-        arrivalPoint = arrivalFieldCentroid(
-                level, arrivalSamples, listener, arrivalPoint
-        );
-        PropagationGraphPath result = new PropagationGraphPath(
+        arrivalPoint = resolveFinalHuygensAperture(level, pulled, listener, arrivalPoint);
+        return new PropagationGraphPath(
                 List.copyOf(pulled),
                 1.0F,
                 true,
                 arrivalPoint,
-                List.copyOf(arrivalSamples)
+                List.of(arrivalPoint)
         );
-        if (AIR_PATH_CACHE.size() >= 256) {
-            AIR_PATH_CACHE.clear();
+    }
+
+    private static List<Vec3> collapseCollinearCorridor(List<Vec3> points) {
+        if (points.size() <= 2) {
+            return points;
         }
-        AIR_PATH_CACHE.put(cacheKey, result);
-        return result;
+        ArrayList<Vec3> result = new ArrayList<>(points.size());
+        result.add(points.get(0));
+        for (int index = 1; index < points.size() - 1; index++) {
+            Vec3 previous = points.get(index - 1);
+            Vec3 current = points.get(index);
+            Vec3 next = points.get(index + 1);
+            Vec3 incoming = current.subtract(previous);
+            Vec3 outgoing = next.subtract(current);
+            double crossSquared = incoming.cross(outgoing).lengthSqr();
+            boolean sameDirection = incoming.dot(outgoing) > 0.0;
+            if (crossSquared > 1.0E-12 || !sameDirection) {
+                result.add(current);
+            }
+        }
+        result.add(points.get(points.size() - 1));
+        return List.copyOf(result);
+    }
+
+    /**
+     * Resolves the last diffraction lobe from the locally visible aperture instead of
+     * from one arbitrary voxel chosen by A*.  Every accepted sample is propagation-open
+     * and visible from both adjacent path legs, so the centroid is the discrete
+     * Huygens aperture through which this route actually reaches the listener.
+     */
+    private static Vec3 resolveFinalHuygensAperture(
+            BlockGetter level,
+            List<Vec3> path,
+            Vec3 listener,
+            Vec3 fallback
+    ) {
+        if (path.size() < 3) {
+            return fallback;
+        }
+        Vec3 previous = path.get(path.size() - 3);
+        BlockPos center = BlockPos.containing(fallback);
+        Vec3 moment = Vec3.ZERO;
+        double totalPower = 0.0;
+        for (int x = center.getX() - 2; x <= center.getX() + 2; x++) {
+            for (int y = center.getY() - 2; y <= center.getY() + 2; y++) {
+                for (int z = center.getZ() - 2; z <= center.getZ() + 2; z++) {
+                    if (!isAirCell(level, x, y, z)) {
+                        continue;
+                    }
+                    Vec3 sample = new Vec3(x + 0.5, y + 0.5, z + 0.5);
+                    double listenerDistance = sample.distanceTo(listener);
+                    if (listenerDistance < 0.50
+                            || firstCollisionBounds(level, previous, sample) != null
+                            || firstCollisionBounds(level, sample, listener) != null) {
+                        continue;
+                    }
+                    double previousDistance = Math.max(0.50, previous.distanceTo(sample));
+                    double geometricAmplitude = 1.0
+                            / (previousDistance * Math.max(0.50, listenerDistance));
+                    double power = geometricAmplitude * geometricAmplitude;
+                    moment = moment.add(sample.scale(power));
+                    totalPower += power;
+                }
+            }
+        }
+        return totalPower > 1.0E-12
+                ? moment.scale(1.0 / totalPower)
+                : fallback;
+    }
+
+    /**
+     * Reprojects a previously solved voxel route onto the current sub-block endpoints.
+     * adaptCachedAirPath validates both changed connectors against the immutable scene;
+     * failure returns null and the normal sparse/A* hierarchy is executed.
+     */
+    private static VerifiedAirBackbone verifiedCachedAirPath(
+            BlockGetter level,
+            Vec3 source,
+            Vec3 listener,
+            boolean preservePortalDirection
+    ) {
+        AirPathCacheKey cacheKey = airPathCacheKey(level, source, listener);
+        PropagationGraphPath cached = AIR_PATH_CACHE.get(cacheKey);
+        if (cached != null) {
+            PropagationGraphPath adapted = adaptCachedAirPath(
+                    level, cached, source, listener
+            );
+            if (adapted != null) {
+                Vec3 cachedListener = cached.points().get(cached.points().size() - 1);
+                return new VerifiedAirBackbone(
+                        adapted,
+                        cachedListener.distanceToSqr(listener) < 1.0E-12
+                );
+            }
+            AIR_PATH_CACHE.remove(cacheKey, cached);
+        }
+        if (!preservePortalDirection) {
+            ListenerAirRouteField listenerField = listenerAirRouteField(level, listener);
+            if (listenerField != null && listenerField.hasBackbone()) {
+                List<Long> knownCells = listenerField.knownRoute(
+                        source, airEndpointCells(level, source)
+                );
+                if (knownCells != null) {
+                    PropagationGraphPath known = buildAirPropagationPath(
+                            level, source, listener, knownCells, listenerField
+                    );
+                    if (known != null) {
+                        putBounded(
+                                AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                                cacheKey, known, 2048
+                        );
+                        return new VerifiedAirBackbone(known, false);
+                    }
+                }
+            }
+        }
+        if (preservePortalDirection) {
+            VerifiedAirBackbone repaired = adaptNeighboringSourceCachedAirPath(
+                    level, cacheKey, source, listener
+            );
+            if (repaired == null) {
+                PropagationGraphPath endpointRepair = adaptNeighboringCachedAirPath(
+                        level, cacheKey, source, listener
+                );
+                if (endpointRepair != null) {
+                    repaired = new VerifiedAirBackbone(endpointRepair, false);
+                }
+            }
+            if (repaired != null) {
+                putBounded(
+                        AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER,
+                        cacheKey, repaired.path(), 2048
+                );
+            }
+            return repaired;
+        }
+        PropagationGraphPath neighboring = adaptNeighboringCachedAirPath(
+                level, cacheKey, source, listener
+        );
+        return neighboring == null
+                ? null : new VerifiedAirBackbone(neighboring, false);
     }
 
     private static PropagationGraphPath adaptCachedAirPath(
@@ -1526,7 +2645,6 @@ public final class AcousticTracer {
         } else {
             return null;
         }
-        List<Vec3> arrivalSamples = new ArrayList<>(cached.arrivalSamples());
         if (airEndpointConnectorClear(level, listener, lastInterior)) {
             adapted.set(adapted.size() - 1, listener);
         } else if (firstCollisionBounds(level, cachedPoints.get(cachedPoints.size() - 1), listener) == null) {
@@ -1535,56 +2653,22 @@ public final class AcousticTracer {
             // corner. Keeping that one valid edge avoids a full A* restart at every
             // voxel boundary and preserves the same arrival lobe while moving.
             adapted.add(listener);
-            arrivalSamples.add(cachedPoints.get(cachedPoints.size() - 1));
         } else {
             return null;
         }
-        Vec3 arrivalPoint = arrivalFieldCentroid(
-                level,
-                arrivalSamples,
-                listener,
-                lastInterior
+        Vec3 arrivalPoint = adapted.size() > 2
+                ? adapted.get(adapted.size() - 2)
+                : adapted.get(0);
+        arrivalPoint = resolveFinalHuygensAperture(
+                level, adapted, listener, arrivalPoint
         );
         return new PropagationGraphPath(
                 List.copyOf(adapted),
                 cached.apertureAmplitude(),
                 cached.clear(),
                 arrivalPoint,
-                List.copyOf(arrivalSamples)
+                List.of(arrivalPoint)
         );
-    }
-
-    private static Vec3 arrivalFieldCentroid(
-            BlockGetter level,
-            List<Vec3> samples,
-            Vec3 listener,
-            Vec3 fallback
-    ) {
-        Vec3 moment = Vec3.ZERO;
-        double totalWeight = 0.0;
-        for (Vec3 point : samples) {
-            double distance = point.distanceTo(listener);
-            if (distance <= 1.0E-6) {
-                continue;
-            }
-            float amplitude = weightedEnergy(
-                    traceTransmission(level, point, listener).bands()
-            );
-            double power = amplitude * amplitude;
-            if (power <= 1.0E-8) {
-                continue;
-            }
-            // This is the first spatial moment of the listener-visible wavefront.
-            // Transmission power makes a point enter or leave the field continuously
-            // as an edge crosses the line of sight; distance reproduces the radial
-            // moment used by the propagation solver without normalizing away spread.
-            double weight = distance * power;
-            moment = moment.add(point.scale(weight));
-            totalWeight += weight;
-        }
-        return totalWeight > 1.0E-10
-                ? moment.scale(1.0 / totalWeight)
-                : fallback;
     }
 
     private static PropagationGraphPath adaptNeighboringCachedAirPath(
@@ -1596,6 +2680,47 @@ public final class AcousticTracer {
         PropagationGraphPath best = null;
         double bestEndpointDistance = Double.POSITIVE_INFINITY;
         AirCellKey goal = requested.listener();
+        AirCellKey start = requested.source();
+        // Incremental Phi*/D* Lite principle: retain the unchanged interior route and
+        // repair only the endpoint connector after a one-cell source movement. The
+        // listener-side variant below does the symmetric operation. Both connectors are
+        // collision-tested against the current immutable scene before reuse.
+        for (int x = -1; x <= 1; x++) {
+            for (int y = -1; y <= 1; y++) {
+                for (int z = -1; z <= 1; z++) {
+                    if (x == 0 && y == 0 && z == 0) {
+                        continue;
+                    }
+                    PropagationGraphPath candidate = AIR_PATH_CACHE.get(
+                            new AirPathCacheKey(
+                                    requested.level(),
+                                    requested.sceneRevision(),
+                                    new AirCellKey(
+                                            start.x() + x,
+                                            start.y() + y,
+                                            start.z() + z
+                                    ),
+                                    goal
+                            )
+                    );
+                    if (candidate == null) {
+                        continue;
+                    }
+                    PropagationGraphPath adapted = adaptCachedAirPath(
+                            level, candidate, source, listener
+                    );
+                    if (adapted == null) {
+                        continue;
+                    }
+                    double endpointDistance = candidate.points().get(0)
+                            .distanceToSqr(source);
+                    if (endpointDistance < bestEndpointDistance) {
+                        bestEndpointDistance = endpointDistance;
+                        best = adapted;
+                    }
+                }
+            }
+        }
         for (int x = -1; x <= 1; x++) {
             for (int y = -1; y <= 1; y++) {
                 for (int z = -1; z <= 1; z++) {
@@ -1633,6 +2758,64 @@ public final class AcousticTracer {
             }
         }
         return best;
+    }
+
+    /** Repairs only a moving source endpoint, leaving the listener arrival field intact. */
+    private static VerifiedAirBackbone adaptNeighboringSourceCachedAirPath(
+            BlockGetter level,
+            AirPathCacheKey requested,
+            Vec3 source,
+            Vec3 listener
+    ) {
+        PropagationGraphPath best = null;
+        double bestEndpointDistance = Double.POSITIVE_INFINITY;
+        boolean bestListenerUnchanged = false;
+        AirCellKey start = requested.source();
+        for (int x = -1; x <= 1; x++) {
+            for (int y = -1; y <= 1; y++) {
+                for (int z = -1; z <= 1; z++) {
+                    if (x == 0 && y == 0 && z == 0) {
+                        continue;
+                    }
+                    PropagationGraphPath candidate = AIR_PATH_CACHE.get(
+                            new AirPathCacheKey(
+                                    requested.level(),
+                                    requested.sceneRevision(),
+                                    new AirCellKey(
+                                            start.x() + x,
+                                            start.y() + y,
+                                            start.z() + z
+                                    ),
+                                    requested.listener()
+                            )
+                    );
+                    if (candidate == null) {
+                        continue;
+                    }
+                    PropagationGraphPath adapted = adaptCachedAirPath(
+                            level, candidate, source, listener
+                    );
+                    if (adapted == null) {
+                        continue;
+                    }
+                    double endpointDistance = candidate.points().get(0)
+                            .distanceToSqr(source);
+                    if (endpointDistance < bestEndpointDistance) {
+                        bestEndpointDistance = endpointDistance;
+                        best = adapted;
+                        Vec3 candidateListener = candidate.points().get(
+                                candidate.points().size() - 1
+                        );
+                        bestListenerUnchanged = candidateListener.distanceToSqr(listener)
+                                < 1.0E-12;
+                    }
+                }
+            }
+        }
+        if (best == null) {
+            return null;
+        }
+        return new VerifiedAirBackbone(best, bestListenerUnchanged);
     }
 
     private static AirCellKey airCellKey(Vec3 point) {
@@ -1699,15 +2882,132 @@ public final class AcousticTracer {
                 ? scene.revision()
                 : 0L;
         return new AirPathCacheKey(
-                level,
+                cacheIdentity(level),
                 sceneRevision,
                 airCellKey(source),
                 airCellKey(listener)
         );
     }
 
+    private static ListenerAirRouteField listenerAirRouteField(
+            BlockGetter level,
+            Vec3 listener
+    ) {
+        List<AirCellKey> seeds = airEndpointCells(level, listener);
+        if (seeds.isEmpty()) {
+            return null;
+        }
+        AirCellKey cell = airCellKey(listener);
+        long sceneRevision = level instanceof AcousticScene scene
+                ? scene.revision()
+                : 0L;
+        return LISTENER_AIR_FIELDS.get(new ListenerAirFieldKey(
+                cacheIdentity(level),
+                sceneRevision,
+                cell,
+                airSeedSignature(cell, seeds)
+        ));
+    }
+
+    private static ListenerAirRouteField neighboringListenerAirField(
+            ListenerAirFieldKey requested
+    ) {
+        ListenerAirRouteField best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        for (Map.Entry<ListenerAirFieldKey, ListenerAirRouteField> entry
+                : LISTENER_AIR_FIELDS.entrySet()) {
+            ListenerAirFieldKey candidate = entry.getKey();
+            if (candidate.level() != requested.level()
+                    || candidate.sceneRevision() != requested.sceneRevision()
+                    || !entry.getValue().hasBackbone()) {
+                continue;
+            }
+            int dx = Math.abs(candidate.listener().x() - requested.listener().x());
+            int dy = Math.abs(candidate.listener().y() - requested.listener().y());
+            int dz = Math.abs(candidate.listener().z() - requested.listener().z());
+            int distance = dx + dy + dz;
+            // Distance is not a validity rule. Import the nearest retained field and
+            // let buildAirPropagationPath collision-test its terminal connector. This
+            // also breaks the latency feedback loop where a slow calculation lets the
+            // listener move more than two voxels and therefore forces every voice to
+            // start another cold search.
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = entry.getValue();
+            }
+        }
+        return best;
+    }
+
     private static Vec3 airCellCenter(AirCellKey key) {
         return new Vec3(key.x() + 0.5, key.y() + 0.5, key.z() + 0.5);
+    }
+
+    private static Vec3 airCellCenter(long packed) {
+        return new Vec3(
+                BlockPos.getX(packed) + 0.5,
+                BlockPos.getY(packed) + 0.5,
+                BlockPos.getZ(packed) + 0.5
+        );
+    }
+
+    private static double distanceFromCellCenter(
+            int x,
+            int y,
+            int z,
+            Vec3 point
+    ) {
+        double dx = x + 0.5 - point.x;
+        double dy = y + 0.5 - point.y;
+        double dz = z + 0.5 - point.z;
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private static int airSeedSignature(
+            AirCellKey containing,
+            List<AirCellKey> seeds
+    ) {
+        int signature = 0;
+        for (AirCellKey seed : seeds) {
+            int dx = seed.x() - containing.x();
+            int dy = seed.y() - containing.y();
+            int dz = seed.z() - containing.z();
+            if (dx == 0 && dy == 0 && dz == 0) signature |= 1;
+            else if (dx == 1 && dy == 0 && dz == 0) signature |= 1 << 1;
+            else if (dx == -1 && dy == 0 && dz == 0) signature |= 1 << 2;
+            else if (dx == 0 && dy == 1 && dz == 0) signature |= 1 << 3;
+            else if (dx == 0 && dy == -1 && dz == 0) signature |= 1 << 4;
+            else if (dx == 0 && dy == 0 && dz == 1) signature |= 1 << 5;
+            else if (dx == 0 && dy == 0 && dz == -1) signature |= 1 << 6;
+        }
+        return signature;
+    }
+
+    /**
+     * Exact obstacle-free lower bound for the six-neighbour air graph. A route must pay
+     * one unit for every face transition to one of the endpoint's valid seed cells and
+     * then the measured seed-centre-to-endpoint connector. Unlike a raw Euclidean
+     * heuristic this uses the graph's actual metric, while taking the minimum across
+     * all boundary-emitter seeds keeps it admissible for block-centred sounds.
+     */
+    private static double endpointGraphHeuristic(
+            int x,
+            int y,
+            int z,
+            List<AirCellKey> endpointSeeds,
+            Vec3 endpoint
+    ) {
+        double best = Double.POSITIVE_INFINITY;
+        for (AirCellKey seed : endpointSeeds) {
+            int faceSteps = Math.abs(x - seed.x())
+                    + Math.abs(y - seed.y())
+                    + Math.abs(z - seed.z());
+            double connector = distanceFromCellCenter(
+                    seed.x(), seed.y(), seed.z(), endpoint
+            );
+            best = Math.min(best, faceSteps + connector);
+        }
+        return best;
     }
 
     private static long packAirCell(AirCellKey key) {
@@ -1791,7 +3091,7 @@ public final class AcousticTracer {
             PropagationGraphState state,
             PropagationGraphNode node,
             PriorityQueue<PropagationGraphState> frontier,
-            Map<GraphPointKey, Double> bestDistanceByNode
+            Object2DoubleOpenHashMap<GraphPointKey> bestDistanceByNode
     ) {
         double segmentDistance = state.node().point().distanceTo(node.point());
         if (segmentDistance < 1.0E-4 || pointInsideCollision(level, node.point())) {
@@ -1802,9 +3102,7 @@ public final class AcousticTracer {
         }
         double distance = state.distance() + segmentDistance;
         GraphPointKey key = graphPointKey(node.point());
-        if (distance + 1.0E-7 >= bestDistanceByNode.getOrDefault(
-                key, Double.POSITIVE_INFINITY
-        )) {
+        if (distance + 1.0E-7 >= bestDistanceByNode.getDouble(key)) {
             return;
         }
         bestDistanceByNode.put(key, distance);
@@ -1871,7 +3169,11 @@ public final class AcousticTracer {
             appendVisibleObstacleEdges(level, source, obstacle, result);
         }
         int radialNodeCount = 0;
+        radialDirections:
         for (int angularStep = 0; angularStep < 8; angularStep++) {
+            if (radialNodeCount >= candidateBudget) {
+                break;
+            }
             double angle = angularStep * Math.PI * 0.25;
             Vec3 radial = right.scale(Math.cos(angle)).add(up.scale(Math.sin(angle)));
             double nearRadius = projectedSilhouetteRadius(planeCenter, radial, corners)
@@ -1887,6 +3189,9 @@ public final class AcousticTracer {
                         nearPoint, 1.0F, GraphNodeKind.EDGE
                 ));
                 radialNodeCount++;
+                if (radialNodeCount >= candidateBudget) {
+                    break radialDirections;
+                }
             }
 
             // Visibility is not monotonic across a facade: several finite doors may be
@@ -1919,6 +3224,9 @@ public final class AcousticTracer {
                             GraphNodeKind.EDGE
                     ));
                     radialNodeCount++;
+                    if (radialNodeCount >= candidateBudget) {
+                        break radialDirections;
+                    }
                 }
                 previousClear = clear;
                 previousRadius = radius;
@@ -2056,13 +3364,15 @@ public final class AcousticTracer {
         // source-facing point whose outgoing ray immediately hits another voxel of that
         // same screen. Compare support planes along the current propagation direction;
         // a genuinely later wall has a strictly later entry plane.
-        double nextObstacleEntry = Double.POSITIVE_INFINITY;
-        for (Vec3 corner : aabbCorners(outgoingObstacle)) {
-            nextObstacleEntry = Math.min(
-                    nextObstacleEntry,
-                    corner.subtract(source).dot(searchDirection)
-            );
-        }
+        double supportX = searchDirection.x >= 0.0
+                ? outgoingObstacle.minX : outgoingObstacle.maxX;
+        double supportY = searchDirection.y >= 0.0
+                ? outgoingObstacle.minY : outgoingObstacle.maxY;
+        double supportZ = searchDirection.z >= 0.0
+                ? outgoingObstacle.minZ : outgoingObstacle.maxZ;
+        double nextObstacleEntry = (supportX - source.x) * searchDirection.x
+                + (supportY - source.y) * searchDirection.y
+                + (supportZ - source.z) * searchDirection.z;
         return nextObstacleEntry > currentObstacleExit + 1.0E-4;
     }
 
@@ -2177,6 +3487,43 @@ public final class AcousticTracer {
                 Math.round(point.y * 1024.0),
                 Math.round(point.z * 1024.0)
         );
+    }
+
+    private static Object cacheIdentity(BlockGetter level) {
+        return level instanceof AcousticScene scene
+                ? scene.cacheIdentity()
+                : level;
+    }
+
+    private static boolean isAirCell(BlockGetter level, int x, int y, int z) {
+        if (level instanceof AcousticScene scene) {
+            return scene.isPropagationOpen(x, y, z);
+        }
+        BlockPos position = WALK_POSITION.get().set(x, y, z);
+        BlockState state = level.getBlockState(position);
+        return state.isAir() || state.getCollisionShape(level, position).isEmpty();
+    }
+
+    private static <K, V> V putBounded(
+            Map<K, V> cache,
+            ConcurrentLinkedQueue<K> insertionOrder,
+            K key,
+            V value,
+            int maximumSize
+    ) {
+        V existing = cache.putIfAbsent(key, value);
+        if (existing != null) {
+            return existing;
+        }
+        insertionOrder.add(key);
+        while (cache.size() > maximumSize) {
+            K oldest = insertionOrder.poll();
+            if (oldest == null) {
+                break;
+            }
+            cache.remove(oldest);
+        }
+        return value;
     }
 
     private static double fresnelRadius(
@@ -2340,7 +3687,7 @@ public final class AcousticTracer {
                 ? scene.revision()
                 : 0L;
         StructuralPathCacheKey cacheKey = new StructuralPathCacheKey(
-                level,
+                cacheIdentity(level),
                 sceneRevision,
                 graphPointKey(source),
                 graphPointKey(listener),
@@ -2512,11 +3859,10 @@ public final class AcousticTracer {
         StructuralPath result = new StructuralPath(
                 bands, radiationPoint, structuralDistance
         );
-        if (STRUCTURAL_PATH_CACHE.size() >= 256) {
-            STRUCTURAL_PATH_CACHE.clear();
-        }
-        STRUCTURAL_PATH_CACHE.put(cacheKey, result);
-        return result;
+        return putBounded(
+                STRUCTURAL_PATH_CACHE, STRUCTURAL_PATH_CACHE_ORDER,
+                cacheKey, result, 256
+        );
     }
 
     private static List<StructuralStart> structuralStarts(
@@ -2961,7 +4307,7 @@ public final class AcousticTracer {
                 ? scene.revision()
                 : 0L;
         TransmissionCacheKey cacheKey = new TransmissionCacheKey(
-                level,
+                cacheIdentity(level),
                 sceneRevision,
                 AcousticMaterialRegistry.revision(),
                 from,
@@ -2997,12 +4343,19 @@ public final class AcousticTracer {
                     || (ignoreToBlock && pos.equals(toBlock))) {
                 return true;
             }
+            int sceneCollisionClass = level instanceof AcousticScene scene
+                    ? scene.collisionClass(pos)
+                    : -1;
+            if (sceneCollisionClass == 0) {
+                return true;
+            }
             BlockState state = level.getBlockState(pos);
-            if (state.isAir()) {
+            if (sceneCollisionClass < 0 && state.isAir()) {
                 return true;
             }
             SolidIntersection solid;
-            if (isCollisionShapeFullBlock(level, pos, state)) {
+            if (sceneCollisionClass == 1
+                    || sceneCollisionClass < 0 && isCollisionShapeFullBlock(level, pos, state)) {
                 AABB bounds = new AABB(pos);
                 SegmentInterval interval = intersectSegment(bounds, from, to);
                 solid = interval == null
@@ -3063,11 +4416,10 @@ public final class AcousticTracer {
                 fluidStats.startFluid(),
                 fluidStats.endFluid()
         );
-        if (TRANSMISSION_CACHE.size() >= 4096) {
-            TRANSMISSION_CACHE.clear();
-        }
-        TRANSMISSION_CACHE.put(cacheKey, result);
-        return result;
+        return putBounded(
+                TRANSMISSION_CACHE, TRANSMISSION_CACHE_ORDER,
+                cacheKey, result, 4096
+        );
     }
 
     /**
@@ -3077,10 +4429,46 @@ public final class AcousticTracer {
      * finite-aperture sweep much more expensive without changing graph connectivity.
      */
     private static AABB firstCollisionBounds(BlockGetter level, Vec3 from, Vec3 to) {
-        AABB[] result = new AABB[1];
-        walkBlocks(from, to, (pos, endpoint) -> {
+        if (level instanceof AcousticScene scene
+                && !scene.mayIntersectPotentialCollision(from, to)) {
+            return null;
+        }
+        CollisionQuery query = COLLISION_QUERY.get();
+        query.prepare(level, from, to);
+        walkBlocks(from, to, query);
+        return query.result;
+    }
+
+    private static final class CollisionQuery implements BlockVisitor {
+        private BlockGetter level;
+        private Vec3 from;
+        private Vec3 to;
+        private AABB result;
+
+        private void prepare(BlockGetter level, Vec3 from, Vec3 to) {
+            this.level = level;
+            this.from = from;
+            this.to = to;
+            result = null;
+        }
+
+        @Override
+        public boolean visit(BlockPos pos, boolean endpoint) {
             if (endpoint) {
                 return true;
+            }
+            if (level instanceof AcousticScene scene) {
+                int collisionClass = scene.collisionClass(pos);
+                if (collisionClass == 0) {
+                    return true;
+                }
+                if (collisionClass == 1) {
+                    if (intersectsUnitBlockPositive(pos, from, to)) {
+                        result = new AABB(pos);
+                        return false;
+                    }
+                    return true;
+                }
             }
             BlockState state = level.getBlockState(pos);
             if (state.isAir()) {
@@ -3090,7 +4478,7 @@ public final class AcousticTracer {
                 AABB bounds = new AABB(pos);
                 SegmentInterval interval = intersectSegment(bounds, from, to);
                 if (interval != null && interval.end() - interval.start() > 1.0E-7) {
-                    result[0] = bounds;
+                    result = bounds;
                     return false;
                 }
                 return true;
@@ -3103,16 +4491,82 @@ public final class AcousticTracer {
             if (intersection.distance() <= 1.0E-7) {
                 return true;
             }
-            result[0] = intersection.firstBounds() != null
+            result = intersection.firstBounds() != null
                     ? intersection.firstBounds()
                     : shape.bounds().move(pos);
             return false;
-        });
-        return result[0];
+        }
+    }
+
+    private static boolean intersectsUnitBlockPositive(
+            BlockPos pos,
+            Vec3 from,
+            Vec3 to
+    ) {
+        double minimum = 0.0;
+        double maximum = 1.0;
+        double dx = to.x - from.x;
+        if (Math.abs(dx) < 1.0E-15) {
+            if (from.x < pos.getX() || from.x > pos.getX() + 1.0) {
+                return false;
+            }
+        } else {
+            double first = (pos.getX() - from.x) / dx;
+            double second = (pos.getX() + 1.0 - from.x) / dx;
+            if (first > second) {
+                double swap = first; first = second; second = swap;
+            }
+            minimum = Math.max(minimum, first);
+            maximum = Math.min(maximum, second);
+            if (maximum - minimum <= 1.0E-7) {
+                return false;
+            }
+        }
+        double dy = to.y - from.y;
+        if (Math.abs(dy) < 1.0E-15) {
+            if (from.y < pos.getY() || from.y > pos.getY() + 1.0) {
+                return false;
+            }
+        } else {
+            double first = (pos.getY() - from.y) / dy;
+            double second = (pos.getY() + 1.0 - from.y) / dy;
+            if (first > second) {
+                double swap = first; first = second; second = swap;
+            }
+            minimum = Math.max(minimum, first);
+            maximum = Math.min(maximum, second);
+            if (maximum - minimum <= 1.0E-7) {
+                return false;
+            }
+        }
+        double dz = to.z - from.z;
+        if (Math.abs(dz) < 1.0E-15) {
+            if (from.z < pos.getZ() || from.z > pos.getZ() + 1.0) {
+                return false;
+            }
+        } else {
+            double first = (pos.getZ() - from.z) / dz;
+            double second = (pos.getZ() + 1.0 - from.z) / dz;
+            if (first > second) {
+                double swap = first; first = second; second = swap;
+            }
+            minimum = Math.max(minimum, first);
+            maximum = Math.min(maximum, second);
+        }
+        return maximum - minimum > 1.0E-7;
     }
 
     private static boolean pointInsideCollision(BlockGetter level, Vec3 point) {
         BlockPos position = BlockPos.containing(point);
+        if (level instanceof AcousticScene scene) {
+            int collisionClass = scene.collisionClass(position);
+            if (collisionClass == 0) {
+                return false;
+            }
+            if (collisionClass == 1) {
+                return true;
+            }
+        }
         BlockState state = level.getBlockState(position);
         if (state.isAir()) {
             return false;
@@ -3231,11 +4685,18 @@ public final class AcousticTracer {
             if (endpoint) {
                 return true;
             }
-            BlockState state = level.getBlockState(pos);
-            if (state.isAir()) {
+            int sceneCollisionClass = level instanceof AcousticScene scene
+                    ? scene.collisionClass(pos)
+                    : -1;
+            if (sceneCollisionClass == 0) {
                 return true;
             }
-            if (isCollisionShapeFullBlock(level, pos, state)) {
+            BlockState state = level.getBlockState(pos);
+            if (sceneCollisionClass < 0 && state.isAir()) {
+                return true;
+            }
+            if (sceneCollisionClass == 1
+                    || sceneCollisionClass < 0 && isCollisionShapeFullBlock(level, pos, state)) {
                 AABB bounds = new AABB(pos);
                 SegmentInterval interval = intersectSegment(bounds, from, to);
                 if (interval == null || interval.end() - interval.start() <= 1.0E-7) {
@@ -4289,16 +5750,110 @@ public final class AcousticTracer {
     private record AirCellKey(int x, int y, int z) {
     }
 
-    private record AirPathCacheKey(
+    /**
+     * Uses the immutable section/component graph only for a mathematical no-path
+     * proof. A component touching uncaptured space remains open and therefore falls
+     * through to the complete voxel search; distant routes are never rejected merely
+     * because they leave the current snapshot boundary.
+     */
+    private static boolean airComponentsProveDisconnection(
             BlockGetter level,
+            List<AirCellKey> starts,
+            List<AirCellKey> goals
+    ) {
+        if (!(level instanceof AcousticScene scene)) {
+            return false;
+        }
+        int[] startComponents = new int[starts.size()];
+        int startCount = 0;
+        boolean allStartsClosed = true;
+        for (AirCellKey start : starts) {
+            int component = scene.airComponentId(start.x(), start.y(), start.z());
+            if (component < 0) {
+                return false;
+            }
+            boolean duplicate = false;
+            for (int index = 0; index < startCount; index++) {
+                duplicate |= startComponents[index] == component;
+            }
+            if (!duplicate) {
+                startComponents[startCount++] = component;
+                allStartsClosed &= scene.isAirComponentClosed(component);
+            }
+        }
+        int[] goalComponents = new int[goals.size()];
+        int goalCount = 0;
+        boolean allGoalsClosed = true;
+        for (AirCellKey goal : goals) {
+            int component = scene.airComponentId(goal.x(), goal.y(), goal.z());
+            if (component < 0) {
+                return false;
+            }
+            for (int startIndex = 0; startIndex < startCount; startIndex++) {
+                if (startComponents[startIndex] == component) {
+                    return false;
+                }
+            }
+            boolean duplicate = false;
+            for (int index = 0; index < goalCount; index++) {
+                duplicate |= goalComponents[index] == component;
+            }
+            if (!duplicate) {
+                goalComponents[goalCount++] = component;
+                allGoalsClosed &= scene.isAirComponentClosed(component);
+            }
+        }
+        return startCount > 0 && goalCount > 0
+                && (allStartsClosed || allGoalsClosed);
+    }
+
+    private record VerifiedAirBackbone(
+            PropagationGraphPath path,
+            boolean listenerUnchanged
+    ) {
+    }
+
+    private record AirPathCacheKey(
+            Object level,
             long sceneRevision,
             AirCellKey source,
             AirCellKey listener
     ) {
     }
 
+    private record AirPathMissCacheKey(
+            AirPathCacheKey topology,
+            int sourceSeeds,
+            int listenerSeeds
+    ) {
+    }
+
+    private record ListenerAirFieldKey(
+            Object level,
+            long sceneRevision,
+            AirCellKey listener,
+            int listenerSeeds
+    ) {
+    }
+
+    private record ArrivalTransferKey(
+            GraphPointKey listener,
+            AirCellKey sample
+    ) {
+    }
+
+    private record SparsePathCacheKey(
+            Object level,
+            long sceneRevision,
+            AirCellKey source,
+            AirCellKey listener,
+            int candidateBudget,
+            AcousticTuning tuning
+    ) {
+    }
+
     private record StructuralPathCacheKey(
-            BlockGetter level,
+            Object level,
             long sceneRevision,
             GraphPointKey source,
             GraphPointKey listener,
@@ -4307,7 +5862,7 @@ public final class AcousticTracer {
     }
 
     private static final class TransmissionCacheKey {
-        private final BlockGetter level;
+        private final Object level;
         private final long sceneRevision;
         private final long materialRevision;
         private final Vec3 from;
@@ -4317,7 +5872,7 @@ public final class AcousticTracer {
         private final int hash;
 
         private TransmissionCacheKey(
-                BlockGetter level,
+                Object level,
                 long sceneRevision,
                 long materialRevision,
                 Vec3 from,
@@ -4366,7 +5921,7 @@ public final class AcousticTracer {
     }
 
     private static final class TraceCacheKey {
-        private final BlockGetter level;
+        private final Object level;
         private final long sceneRevision;
         private final long materialRevision;
         private final GraphPointKey source;
@@ -4377,7 +5932,7 @@ public final class AcousticTracer {
         private final int hash;
 
         private TraceCacheKey(
-                BlockGetter level,
+                Object level,
                 long sceneRevision,
                 long materialRevision,
                 GraphPointKey source,
@@ -4429,12 +5984,819 @@ public final class AcousticTracer {
         }
     }
 
-    private record AirGraphState(
-            AirCellKey key,
-            AirGraphState previous,
-            double distance,
-            double priority
+    private record DenseAirSearchResult(List<Long> path, int expanded) {
+    }
+
+    record DenseAirSearchMetrics(
+            boolean connected,
+            int expanded,
+            long elapsedNanoseconds
     ) {
+    }
+
+    private record DenseEndpointHeuristic(
+            int[] xs,
+            int[] ys,
+            int[] zs,
+            double[] connectors
+    ) {
+        private static DenseEndpointHeuristic from(
+                List<AirCellKey> cells,
+                Vec3 endpoint
+        ) {
+            int[] xs = new int[cells.size()];
+            int[] ys = new int[cells.size()];
+            int[] zs = new int[cells.size()];
+            double[] connectors = new double[cells.size()];
+            for (int index = 0; index < cells.size(); index++) {
+                AirCellKey cell = cells.get(index);
+                xs[index] = cell.x();
+                ys[index] = cell.y();
+                zs[index] = cell.z();
+                connectors[index] = distanceFromCellCenter(
+                        cell.x(), cell.y(), cell.z(), endpoint
+                );
+            }
+            return new DenseEndpointHeuristic(xs, ys, zs, connectors);
+        }
+
+        private double distance(int x, int y, int z) {
+            double best = Double.POSITIVE_INFINITY;
+            for (int index = 0; index < xs.length; index++) {
+                double candidate = Math.abs(x - xs[index])
+                        + Math.abs(y - ys[index])
+                        + Math.abs(z - zs[index])
+                        + connectors[index];
+                if (candidate < best) {
+                    best = candidate;
+                }
+            }
+            return best;
+        }
+    }
+
+    /** Reused dense arrays replace four primitive hash tables in scene-backed A*. */
+    private static final class DenseAirSearchScratch {
+        private double[] forwardDistances = new double[0];
+        private double[] backwardDistances = new double[0];
+        private int[] forwardPrevious = new int[0];
+        private int[] backwardPrevious = new int[0];
+        private int[] forwardStamps = new int[0];
+        private int[] backwardStamps = new int[0];
+        private int stamp = 1;
+        private final IntAirGraphHeap forwardFrontier = new IntAirGraphHeap(1024);
+        private final IntAirGraphHeap backwardFrontier = new IntAirGraphHeap(1024);
+        private final IntBucketFrontier forwardBuckets = new IntBucketFrontier();
+        private final IntBucketFrontier backwardBuckets = new IntBucketFrontier();
+
+        private void begin(int capacity, boolean prepareHeaps) {
+            if (forwardDistances.length < capacity) {
+                forwardDistances = new double[capacity];
+                backwardDistances = new double[capacity];
+                forwardPrevious = new int[capacity];
+                backwardPrevious = new int[capacity];
+                forwardStamps = new int[capacity];
+                backwardStamps = new int[capacity];
+                stamp = 1;
+            } else if (++stamp == 0) {
+                Arrays.fill(forwardStamps, 0);
+                Arrays.fill(backwardStamps, 0);
+                stamp = 1;
+            }
+            if (prepareHeaps) {
+                forwardFrontier.begin(capacity);
+                backwardFrontier.begin(capacity);
+            }
+            forwardBuckets.clear();
+            backwardBuckets.clear();
+        }
+
+        private double forwardDistance(int cell) {
+            return forwardStamps[cell] == stamp
+                    ? forwardDistances[cell] : Double.POSITIVE_INFINITY;
+        }
+
+        private double backwardDistance(int cell) {
+            return backwardStamps[cell] == stamp
+                    ? backwardDistances[cell] : Double.POSITIVE_INFINITY;
+        }
+
+        private void setForward(int cell, double distance, int previous) {
+            forwardStamps[cell] = stamp;
+            forwardDistances[cell] = distance;
+            forwardPrevious[cell] = previous;
+        }
+
+        private void setBackward(int cell, double distance, int previous) {
+            backwardStamps[cell] = stamp;
+            backwardDistances[cell] = distance;
+            backwardPrevious[cell] = previous;
+        }
+
+        private int forwardPrevious(int cell) {
+            return forwardPrevious[cell];
+        }
+
+        private int backwardPrevious(int cell) {
+            return backwardPrevious[cell];
+        }
+    }
+
+    /** Dial-style monotone frontier for the integer f-cost of a six-neighbour grid. */
+    private static final class IntBucketFrontier {
+        private int[] heads = new int[256];
+        private int[] cells = new int[2048];
+        private int[] next = new int[2048];
+        private double[] distances = new double[2048];
+        private int entries;
+        private int size;
+        private int minimumPriority;
+        private double lastDistance;
+
+        private IntBucketFrontier() {
+            Arrays.fill(heads, -1);
+        }
+
+        private void clear() {
+            Arrays.fill(heads, -1);
+            entries = 0;
+            size = 0;
+            minimumPriority = Integer.MAX_VALUE;
+        }
+
+        private boolean isEmpty() {
+            return size == 0;
+        }
+
+        private int peekPriority() {
+            advance();
+            return minimumPriority;
+        }
+
+        private double lastDistance() {
+            return lastDistance;
+        }
+
+        private void add(int cell, double distance, int priority) {
+            ensureBucket(priority);
+            ensureEntry(entries + 1);
+            cells[entries] = cell;
+            distances[entries] = distance;
+            next[entries] = heads[priority];
+            heads[priority] = entries++;
+            size++;
+            if (priority < minimumPriority) {
+                minimumPriority = priority;
+            }
+        }
+
+        private int poll() {
+            advance();
+            int entry = heads[minimumPriority];
+            heads[minimumPriority] = next[entry];
+            size--;
+            lastDistance = distances[entry];
+            return cells[entry];
+        }
+
+        private void advance() {
+            if (size == 0) {
+                minimumPriority = Integer.MAX_VALUE;
+                return;
+            }
+            while (minimumPriority < heads.length
+                    && heads[minimumPriority] < 0) {
+                minimumPriority++;
+            }
+        }
+
+        private void ensureBucket(int priority) {
+            if (priority < heads.length) {
+                return;
+            }
+            int oldLength = heads.length;
+            int nextLength = oldLength;
+            while (nextLength <= priority) {
+                nextLength <<= 1;
+            }
+            heads = Arrays.copyOf(heads, nextLength);
+            Arrays.fill(heads, oldLength, nextLength, -1);
+        }
+
+        private void ensureEntry(int required) {
+            if (required <= cells.length) {
+                return;
+            }
+            int nextLength = Math.max(required, cells.length + (cells.length >>> 1));
+            cells = Arrays.copyOf(cells, nextLength);
+            next = Arrays.copyOf(next, nextLength);
+            distances = Arrays.copyOf(distances, nextLength);
+        }
+    }
+
+    /** Allocation-free integer heap for dense scene cell ids. */
+    private static final class IntAirGraphHeap {
+        private int[] cells;
+        private double[] distances;
+        private double[] priorities;
+        private int[] positions = new int[0];
+        private int size;
+        private double lastDistance;
+
+        private IntAirGraphHeap(int initialCapacity) {
+            int capacity = Math.max(16, initialCapacity);
+            cells = new int[capacity];
+            distances = new double[capacity];
+            priorities = new double[capacity];
+        }
+
+        private void begin(int cellCapacity) {
+            size = 0;
+            if (positions.length < cellCapacity) {
+                positions = new int[cellCapacity];
+            }
+            Arrays.fill(positions, 0, cellCapacity, -1);
+        }
+
+        private boolean isEmpty() {
+            return size == 0;
+        }
+
+        private double peekPriority() {
+            return size == 0 ? Double.POSITIVE_INFINITY : priorities[0];
+        }
+
+        private double lastDistance() {
+            return lastDistance;
+        }
+
+        private void add(int cell, double distance, double priority) {
+            int existing = positions[cell];
+            if (existing >= 0) {
+                double oldPriority = priorities[existing];
+                double oldDistance = distances[existing];
+                distances[existing] = distance;
+                priorities[existing] = priority;
+                if (AirGraphHeap.comesBefore(
+                        priority, distance, oldPriority, oldDistance
+                )) {
+                    siftUp(existing, cell, distance, priority);
+                } else {
+                    siftDown(existing, cell, distance, priority);
+                }
+                return;
+            }
+            ensureCapacity(size + 1);
+            int index = size++;
+            siftUp(index, cell, distance, priority);
+        }
+
+        private void siftUp(
+                int index,
+                int cell,
+                double distance,
+                double priority
+        ) {
+            while (index > 0) {
+                int parent = (index - 1) >>> 1;
+                if (!AirGraphHeap.comesBefore(
+                        priority, distance,
+                        priorities[parent], distances[parent]
+                )) {
+                    break;
+                }
+                cells[index] = cells[parent];
+                distances[index] = distances[parent];
+                priorities[index] = priorities[parent];
+                positions[cells[index]] = index;
+                index = parent;
+            }
+            cells[index] = cell;
+            distances[index] = distance;
+            priorities[index] = priority;
+            positions[cell] = index;
+        }
+
+        private int poll() {
+            int result = cells[0];
+            lastDistance = distances[0];
+            positions[result] = -1;
+            int last = --size;
+            if (last == 0) {
+                return result;
+            }
+            int movedCell = cells[last];
+            double movedDistance = distances[last];
+            double movedPriority = priorities[last];
+            int index = 0;
+            int half = size >>> 1;
+            while (index < half) {
+                int child = (index << 1) + 1;
+                int right = child + 1;
+                if (right < size && AirGraphHeap.comesBefore(
+                        priorities[right], distances[right],
+                        priorities[child], distances[child]
+                )) {
+                    child = right;
+                }
+                if (!AirGraphHeap.comesBefore(
+                        priorities[child], distances[child],
+                        movedPriority, movedDistance
+                )) {
+                    break;
+                }
+                cells[index] = cells[child];
+                distances[index] = distances[child];
+                priorities[index] = priorities[child];
+                positions[cells[index]] = index;
+                index = child;
+            }
+            cells[index] = movedCell;
+            distances[index] = movedDistance;
+            priorities[index] = movedPriority;
+            positions[movedCell] = index;
+            return result;
+        }
+
+        private void siftDown(
+                int index,
+                int cell,
+                double distance,
+                double priority
+        ) {
+            int half = size >>> 1;
+            while (index < half) {
+                int child = (index << 1) + 1;
+                int right = child + 1;
+                if (right < size && AirGraphHeap.comesBefore(
+                        priorities[right], distances[right],
+                        priorities[child], distances[child]
+                )) {
+                    child = right;
+                }
+                if (!AirGraphHeap.comesBefore(
+                        priorities[child], distances[child],
+                        priority, distance
+                )) {
+                    break;
+                }
+                cells[index] = cells[child];
+                distances[index] = distances[child];
+                priorities[index] = priorities[child];
+                positions[cells[index]] = index;
+                index = child;
+            }
+            cells[index] = cell;
+            distances[index] = distance;
+            priorities[index] = priority;
+            positions[cell] = index;
+        }
+
+        private void ensureCapacity(int required) {
+            if (required <= cells.length) {
+                return;
+            }
+            int next = Math.max(required, cells.length + (cells.length >>> 1));
+            cells = Arrays.copyOf(cells, next);
+            distances = Arrays.copyOf(distances, next);
+            priorities = Arrays.copyOf(priorities, next);
+        }
+    }
+
+    /** Allocation-free binary heap for the voxel A* frontier. */
+    private static final class AirGraphHeap {
+        private long[] cells;
+        private double[] distances;
+        private double[] priorities;
+        private int size;
+        private double lastDistance;
+
+        private AirGraphHeap(int initialCapacity) {
+            int capacity = Math.max(16, initialCapacity);
+            cells = new long[capacity];
+            distances = new double[capacity];
+            priorities = new double[capacity];
+        }
+
+        private boolean isEmpty() {
+            return size == 0;
+        }
+
+        private double peekPriority() {
+            return size == 0 ? Double.POSITIVE_INFINITY : priorities[0];
+        }
+
+        private double lastDistance() {
+            return lastDistance;
+        }
+
+        private void add(long cell, double distance, double priority) {
+            ensureCapacity(size + 1);
+            int index = size++;
+            while (index > 0) {
+                int parent = (index - 1) >>> 1;
+                if (!comesBefore(
+                        priority, distance,
+                        priorities[parent], distances[parent]
+                )) {
+                    break;
+                }
+                cells[index] = cells[parent];
+                distances[index] = distances[parent];
+                priorities[index] = priorities[parent];
+                index = parent;
+            }
+            cells[index] = cell;
+            distances[index] = distance;
+            priorities[index] = priority;
+        }
+
+        private long poll() {
+            long result = cells[0];
+            lastDistance = distances[0];
+            int last = --size;
+            if (last == 0) {
+                return result;
+            }
+            long movedCell = cells[last];
+            double movedDistance = distances[last];
+            double movedPriority = priorities[last];
+            int index = 0;
+            int half = size >>> 1;
+            while (index < half) {
+                int child = (index << 1) + 1;
+                int right = child + 1;
+                if (right < size && comesBefore(
+                        priorities[right], distances[right],
+                        priorities[child], distances[child]
+                )) {
+                    child = right;
+                }
+                if (!comesBefore(
+                        priorities[child], distances[child],
+                        movedPriority, movedDistance
+                )) {
+                    break;
+                }
+                cells[index] = cells[child];
+                distances[index] = distances[child];
+                priorities[index] = priorities[child];
+                index = child;
+            }
+            cells[index] = movedCell;
+            distances[index] = movedDistance;
+            priorities[index] = movedPriority;
+            return result;
+        }
+
+        private static boolean comesBefore(
+                double leftPriority,
+                double leftDistance,
+                double rightPriority,
+                double rightDistance
+        ) {
+            int priorityOrder = Double.compare(leftPriority, rightPriority);
+            if (priorityOrder != 0) {
+                return priorityOrder < 0;
+            }
+            // All monotone routes in open space have the same admissible f score.
+            // Preferring the deeper state follows one shortest route instead of
+            // breadth-expanding the entire equal-cost Manhattan volume.
+            return leftDistance > rightDistance;
+        }
+
+        private void ensureCapacity(int required) {
+            if (required <= cells.length) {
+                return;
+            }
+            int next = Math.max(required, cells.length + (cells.length >>> 1));
+            cells = Arrays.copyOf(cells, next);
+            distances = Arrays.copyOf(distances, next);
+            priorities = Arrays.copyOf(priorities, next);
+        }
+    }
+
+    /**
+     * Exact listener-rooted route forest shared by every primary source in one immutable
+     * scene. Each registered branch is a suffix of a shortest six-neighbour air path, so
+     * a later A* can terminate on that branch with its measured remaining cost instead of
+     * solving the same listener half of the graph again. A bounded connector search is
+     * only an acceleration layer: if it cannot prove a connection, the original complete
+     * bidirectional search still runs and then grows this field.
+     */
+    private static final class ListenerAirRouteField {
+        private final Vec3 anchorListener;
+        private final List<AirCellKey> goalCells;
+        private final Map<Long, RouteStep> routes = new ConcurrentHashMap<>();
+        private final Map<ArrivalTransferKey, Float> arrivalTransfers = new ConcurrentHashMap<>();
+        private final ConcurrentLinkedQueue<ArrivalTransferKey> arrivalTransferOrder =
+                new ConcurrentLinkedQueue<>();
+        private volatile boolean hasBackbone;
+        private boolean buildingBackbone;
+
+        private ListenerAirRouteField(
+                Vec3 anchorListener,
+                List<AirCellKey> goalCells,
+                ListenerAirRouteField inherited
+        ) {
+            this.anchorListener = anchorListener;
+            this.goalCells = List.copyOf(goalCells);
+            if (inherited != null) {
+                for (Map.Entry<Long, RouteStep> entry : inherited.routes.entrySet()) {
+                    long cell = entry.getKey();
+                    RouteStep step = entry.getValue();
+                    routes.put(cell, step);
+                }
+                hasBackbone = inherited.hasBackbone();
+            }
+            for (AirCellKey goal : goalCells) {
+                long packed = packAirCell(goal);
+                double distance = distanceFromCellCenter(
+                        goal.x(), goal.y(), goal.z(), anchorListener
+                );
+                routes.merge(
+                        packed,
+                        new RouteStep(distance, Long.MIN_VALUE),
+                        (known, candidate) -> known.distance() <= candidate.distance()
+                                ? known : candidate
+                );
+            }
+        }
+
+        private boolean hasBackbone() {
+            return hasBackbone;
+        }
+
+        private synchronized boolean claimBackboneBuild() {
+            if (hasBackbone || buildingBackbone) {
+                return false;
+            }
+            buildingBackbone = true;
+            return true;
+        }
+
+        private synchronized void awaitBackboneBuild() {
+            while (buildingBackbone && !hasBackbone) {
+                try {
+                    wait();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+
+        private synchronized void finishBackboneBuild() {
+            buildingBackbone = false;
+            notifyAll();
+        }
+
+        private void register(List<Long> cells) {
+            if (cells.isEmpty()) {
+                return;
+            }
+            int last = cells.size() - 1;
+            long finalCell = cells.get(last);
+            double remaining = distanceFromCellCenter(
+                    BlockPos.getX(finalCell),
+                    BlockPos.getY(finalCell),
+                    BlockPos.getZ(finalCell),
+                    anchorListener
+            );
+            long next = Long.MIN_VALUE;
+            for (int index = last; index >= 0; index--) {
+                long cell = cells.get(index);
+                RouteStep known = routes.get(cell);
+                if (known == null || remaining + 1.0E-7 < known.distance()) {
+                    RouteStep candidate = new RouteStep(remaining, next);
+                    routes.merge(
+                            cell,
+                            candidate,
+                            (current, replacement) -> current.distance()
+                                    <= replacement.distance() + 1.0E-7
+                                    ? current : replacement
+                    );
+                } else {
+                    // Join the already shorter suffix. Upstream cells must inherit its
+                    // measured remaining cost instead of retaining the longer branch
+                    // that happened to discover the intersection later.
+                    remaining = known.distance();
+                }
+                next = cell;
+                remaining += 1.0;
+            }
+            hasBackbone = true;
+            finishBackboneBuild();
+        }
+
+        private List<Long> connect(
+                BlockGetter level,
+                Vec3 source,
+                List<AirCellKey> startCells,
+                int candidateBudget
+        ) {
+            List<Long> known = knownRoute(source, startCells);
+            if (known != null) {
+                LAST_AIR_SEARCH.set(new AirSearchStats("tree-hit", 0));
+                return known;
+            }
+
+            // The registered listener tree is an exact set of proven suffixes. Search
+            // only the new source connector and terminate when A* proves that its best
+            // tree intersection cannot be displaced. This preserves the same grid
+            // metric and collision tests as the full search; it merely reuses work
+            // shared by every voice around this listener.
+            AirGraphHeap frontier = new AirGraphHeap(256);
+            Long2DoubleOpenHashMap distances = new Long2DoubleOpenHashMap(
+                    Math.max(512, candidateBudget * 64)
+            );
+            distances.defaultReturnValue(Double.POSITIVE_INFINITY);
+            Long2LongOpenHashMap previous = new Long2LongOpenHashMap();
+            previous.defaultReturnValue(Long.MIN_VALUE);
+            for (AirCellKey start : startCells) {
+                long packed = packAirCell(start);
+                double distance = distanceFromCellCenter(
+                        start.x(), start.y(), start.z(), source
+                );
+                if (distance >= distances.get(packed)) {
+                    continue;
+                }
+                distances.put(packed, distance);
+                previous.put(packed, Long.MIN_VALUE);
+                frontier.add(
+                        packed,
+                        distance,
+                        distance + endpointGraphHeuristic(
+                                start.x(), start.y(), start.z(),
+                                goalCells, anchorListener
+                        )
+                );
+            }
+
+            double bestDistance = Double.POSITIVE_INFINITY;
+            long meetingCell = Long.MIN_VALUE;
+            int expanded = 0;
+            int maximumExpansions = Mth.clamp(
+                    (int) Math.ceil(source.distanceTo(anchorListener))
+                            * candidateBudget * 32,
+                    8192,
+                    65536
+            );
+            while (!frontier.isEmpty() && expanded < maximumExpansions) {
+                if (frontier.peekPriority() >= bestDistance) {
+                    break;
+                }
+                long packedState = frontier.poll();
+                double stateDistance = frontier.lastDistance();
+                if (stateDistance > distances.get(packedState) + 1.0E-7) {
+                    continue;
+                }
+                RouteStep suffix = routes.get(packedState);
+                if (suffix != null) {
+                    double candidate = stateDistance + suffix.distance();
+                    if (candidate < bestDistance) {
+                        bestDistance = candidate;
+                        meetingCell = packedState;
+                    }
+                }
+                expanded++;
+                int stateX = BlockPos.getX(packedState);
+                int stateY = BlockPos.getY(packedState);
+                int stateZ = BlockPos.getZ(packedState);
+                boolean fromAir = isAirCell(level, stateX, stateY, stateZ);
+                for (int[] offset : AIR_GRAPH_NEIGHBORS) {
+                    int nextX = stateX + offset[0];
+                    int nextY = stateY + offset[1];
+                    int nextZ = stateZ + offset[2];
+                    boolean nextAir = isAirCell(level, nextX, nextY, nextZ);
+                    if (!fromAir || !nextAir) {
+                        Vec3 from = new Vec3(
+                                stateX + 0.5, stateY + 0.5, stateZ + 0.5
+                        );
+                        Vec3 next = new Vec3(
+                                nextX + 0.5, nextY + 0.5, nextZ + 0.5
+                        );
+                        if (pointInsideCollision(level, next)
+                                || firstCollisionBounds(level, from, next) != null) {
+                            continue;
+                        }
+                    }
+                    double distance = stateDistance + 1.0;
+                    long packedNext = BlockPos.asLong(nextX, nextY, nextZ);
+                    if (distance + 1.0E-7 >= distances.get(packedNext)) {
+                        continue;
+                    }
+                    distances.put(packedNext, distance);
+                    previous.put(packedNext, packedState);
+                    frontier.add(
+                            packedNext,
+                            distance,
+                            distance + endpointGraphHeuristic(
+                                    nextX, nextY, nextZ,
+                                    goalCells, anchorListener
+                            )
+                    );
+                }
+            }
+            LAST_AIR_SEARCH.set(new AirSearchStats(
+                    meetingCell != Long.MIN_VALUE
+                            ? "tree-connect"
+                            : expanded >= maximumExpansions
+                            ? "tree-limit"
+                            : "tree-exhausted",
+                    expanded
+            ));
+            if (meetingCell == Long.MIN_VALUE) {
+                return null;
+            }
+            ArrayDeque<Long> reversed = new ArrayDeque<>();
+            for (long cell = meetingCell;
+                 cell != Long.MIN_VALUE;
+                 cell = previous.get(cell)) {
+                reversed.addFirst(cell);
+            }
+            List<Long> connected = completeRoute(
+                    new ArrayList<>(reversed), meetingCell
+            );
+            if (connected != null) {
+                register(connected);
+            }
+            return connected;
+        }
+
+        private List<Long> knownRoute(
+                Vec3 source,
+                List<AirCellKey> startCells
+        ) {
+            long directMeeting = Long.MIN_VALUE;
+            double directDistance = Double.POSITIVE_INFINITY;
+            for (AirCellKey start : startCells) {
+                long packed = packAirCell(start);
+                RouteStep suffix = routes.get(packed);
+                if (suffix == null) {
+                    continue;
+                }
+                double candidate = distanceFromCellCenter(
+                        start.x(), start.y(), start.z(), source
+                ) + suffix.distance();
+                if (candidate < directDistance) {
+                    directDistance = candidate;
+                    directMeeting = packed;
+                }
+            }
+            if (directMeeting != Long.MIN_VALUE) {
+                return completeRoute(List.of(directMeeting), directMeeting);
+            }
+            return null;
+        }
+
+        private List<Long> completeRoute(List<Long> prefix, long meetingCell) {
+            List<Long> result = new ArrayList<>(prefix.size() + 16);
+            result.addAll(prefix);
+            LongOpenHashSet cycleGuard = new LongOpenHashSet();
+            cycleGuard.add(meetingCell);
+            RouteStep meeting = routes.get(meetingCell);
+            for (long cell = meeting == null ? Long.MIN_VALUE : meeting.next();
+                 cell != Long.MIN_VALUE;) {
+                if (!cycleGuard.add(cell)) {
+                    return null;
+                }
+                result.add(cell);
+                RouteStep step = routes.get(cell);
+                if (step == null) {
+                    return null;
+                }
+                cell = step.next();
+            }
+            return List.copyOf(result);
+        }
+
+        private float arrivalAmplitude(BlockGetter level, Vec3 sample, Vec3 listener) {
+            ArrivalTransferKey key = new ArrivalTransferKey(
+                    graphPointKey(listener), airCellKey(sample)
+            );
+            boolean[] created = {false};
+            float value = arrivalTransfers.computeIfAbsent(key, ignored -> {
+                created[0] = true;
+                return weightedEnergy(
+                        traceTransmission(level, sample, listener).bands()
+                );
+            });
+            if (created[0]) {
+                arrivalTransferOrder.add(key);
+            }
+            while (arrivalTransfers.size() > 4096) {
+                ArrivalTransferKey oldest = arrivalTransferOrder.poll();
+                if (oldest == null) {
+                    break;
+                }
+                arrivalTransfers.remove(oldest);
+            }
+            return value;
+        }
+
+        private record RouteStep(double distance, long next) {
+        }
     }
 
     private record StructuralStart(BlockPos position, double contactDistance) {

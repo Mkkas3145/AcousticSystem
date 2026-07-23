@@ -100,9 +100,14 @@ abstract class ChannelMixin {
         OpenALAcousticEffects.configureDistanceAttenuation(source, maximumDistance);
     }
 
-    @Inject(method = "play", at = @At("HEAD"))
+    @Inject(method = "play", at = @At("HEAD"), cancellable = true)
     private void acousticsystem$applyBeforePlayback(CallbackInfo ci) {
-        AcousticRuntime.applyBeforePlay(source, acousticsystem$position, acousticsystem$relative);
+        if (!AcousticRuntime.applyBeforePlay(
+                source, acousticsystem$position, acousticsystem$relative
+        )) {
+            ci.cancel();
+            return;
+        }
         SoftwareAcousticMixer.play(source);
     }
 
@@ -123,6 +128,7 @@ abstract class ChannelMixin {
 
     @Inject(method = "destroy", at = @At("HEAD"))
     private void acousticsystem$releaseEffects(CallbackInfo ci) {
+        AcousticRuntime.forgetDeferredSource(source);
         OpenALAcousticEffects.releaseSource(source);
         SoftwareAcousticMixer.releaseSource(source);
     }
