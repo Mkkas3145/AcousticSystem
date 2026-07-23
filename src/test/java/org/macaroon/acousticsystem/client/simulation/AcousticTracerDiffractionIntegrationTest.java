@@ -27,6 +27,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.IntFunction;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1057,6 +1058,155 @@ class AcousticTracerDiffractionIntegrationTest {
                 + ", evaluation=" + evaluation[18]);
         assertTrue(percentile95 < 5.0, () ->
                 "very complex wild diffraction p95 exceeded 5 ms: " + percentile95);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ACOUSTICSYSTEM_PERFORMANCE_SMOKE", matches = "true")
+    void diverseColdDiffractionMatrixRemainsBelowFiveMilliseconds() {
+        List<DiffractionPerformanceCase> cases = List.of(
+                new DiffractionPerformanceCase("single-offset-opening", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .sixtyFourCubeWithOffsetWallOpening(),
+                                new Vec3(10.5, 8.5, 10.5),
+                                new Vec3(54.5, 8.5, 10.5)
+                        )),
+                new DiffractionPerformanceCase("two-competing-openings", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .sixtyFourCubeWithTwinWallOpenings(),
+                                new Vec3(10.5, 8.5, 31.5),
+                                new Vec3(54.5, 8.5, 31.5)
+                        )),
+                new DiffractionPerformanceCase("wild-irregular-l-tunnel", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .thirtyTwoCubeWithWildIrregularTunnel(),
+                                new Vec3(2.5, 8.5, 2.5),
+                                new Vec3(29.5, 8.5, 28.5)
+                        )),
+                new DiffractionPerformanceCase("five-leg-serpentine-tunnel", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .sixtyFourCubeWithSerpentineTunnel(),
+                                new Vec3(2.5, 8.5, 2.5),
+                                new Vec3(61.5, 8.5, 42.5)
+                        )),
+                new DiffractionPerformanceCase("horizontal-vertical-dogleg", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .thirtyTwoCubeWithVerticalDogleg(),
+                                new Vec3(2.5, 4.5, 4.5),
+                                new Vec3(20.5, 24.5, 28.5)
+                        )),
+                new DiffractionPerformanceCase("seeded-perfect-maze", sample ->
+                        performanceSample(
+                                AcousticSceneFixtures
+                                        .sixtyFourCubeWithWildPerfectMaze(
+                                                0xD1FFAC7L + sample
+                                        ),
+                                new Vec3(1.5, 8.5, 1.5),
+                                new Vec3(61.5, 8.5, 61.5)
+                        )),
+                new DiffractionPerformanceCase("room-exterior-corner", sample ->
+                        performanceSample(
+                                new TestWorld(position ->
+                                        roomWithExteriorTurn(position, true)
+                                ),
+                                new Vec3(3.5, 2.5, 0.5),
+                                new Vec3(5.5, 2.5, 10.5)
+                        )),
+                new DiffractionPerformanceCase("room-outdoor-s-corridor", sample ->
+                        performanceSample(
+                                new TestWorld(position ->
+                                        roomToOutdoorMaze(position, true)
+                                ),
+                                new Vec3(3.5, 2.5, 0.5),
+                                new Vec3(5.5, 2.5, 19.5)
+                        )),
+                new DiffractionPerformanceCase("deep-exterior-diagonal-shadow", sample ->
+                        performanceSample(
+                                new TestWorld(position ->
+                                        deepExteriorShadowRoom(position, true)
+                                ),
+                                new Vec3(7.5, 2.5, 5.5),
+                                new Vec3(11.5, 2.5, 8.5)
+                        )),
+                new DiffractionPerformanceCase("seeded-noise-cave", sample -> {
+                    long seed = 0xC0A7E5L + sample * 0x9E3779B9L;
+                    AcousticScene scene = AcousticSceneFixtures
+                            .sixtyFourCubeWithSeededNoiseCave(seed);
+                    double sourceX = 1.5;
+                    double listenerX = 62.5;
+                    return performanceSample(
+                            scene,
+                            new Vec3(
+                                    sourceX,
+                                    AcousticSceneFixtures.seededNoiseCaveY(
+                                            seed, sourceX
+                                    ),
+                                    AcousticSceneFixtures.seededNoiseCaveZ(
+                                            seed, sourceX
+                                    )
+                            ),
+                            new Vec3(
+                                    listenerX,
+                                    AcousticSceneFixtures.seededNoiseCaveY(
+                                            seed, listenerX
+                                    ),
+                                    AcousticSceneFixtures.seededNoiseCaveZ(
+                                            seed, listenerX
+                                    )
+                            )
+                    );
+                })
+        );
+
+        for (DiffractionPerformanceCase performanceCase : cases) {
+            for (int warmup = 0; warmup < 6; warmup++) {
+                tracePerformanceSample(performanceCase.factory().apply(-warmup - 1));
+            }
+            double[] total = new double[20];
+            double[] air = new double[20];
+            double[] sparse = new double[20];
+            double[] evaluation = new double[20];
+            for (int sampleIndex = 0; sampleIndex < total.length; sampleIndex++) {
+                AcousticResult result = tracePerformanceSample(
+                        performanceCase.factory().apply(sampleIndex)
+                );
+                AcousticTracer.TraceTiming timing = AcousticTracer.lastTraceTiming();
+                total[sampleIndex] =
+                        timing.diffractionNanoseconds() / 1_000_000.0;
+                air[sampleIndex] =
+                        timing.diffractionAirNanoseconds() / 1_000_000.0;
+                sparse[sampleIndex] =
+                        timing.diffractionSparseNanoseconds() / 1_000_000.0;
+                evaluation[sampleIndex] =
+                        timing.diffractionEvaluationNanoseconds() / 1_000_000.0;
+                assertTrue(
+                        result.diffractionContribution() > 0.0F,
+                        () -> performanceCase.name()
+                                + " lost its connected diffraction path: " + result
+                );
+            }
+            Arrays.sort(total);
+            Arrays.sort(air);
+            Arrays.sort(sparse);
+            Arrays.sort(evaluation);
+            double percentile95 = total[18];
+            System.out.println("diffractionMatrix[" + performanceCase.name()
+                    + "] p95=" + percentile95
+                    + ", max=" + total[19]
+                    + ", air=" + air[18]
+                    + ", sparse=" + sparse[18]
+                    + ", evaluation=" + evaluation[18]);
+            assertTrue(
+                    percentile95 < 5.0,
+                    () -> performanceCase.name()
+                            + " diffraction p95 exceeded 5 ms: "
+                            + percentile95 + ", maximum=" + total[19]
+            );
+        }
     }
 
     @Test
@@ -2874,6 +3024,46 @@ class AcousticTracerDiffractionIntegrationTest {
             }
             previousDirection = direction;
         }
+    }
+
+    private static DiffractionPerformanceSample performanceSample(
+            BlockGetter world,
+            Vec3 source,
+            Vec3 listener
+    ) {
+        return new DiffractionPerformanceSample(world, source, listener);
+    }
+
+    private static AcousticResult tracePerformanceSample(
+            DiffractionPerformanceSample sample
+    ) {
+        RoomProbe sourceProbe = AcousticTracer.probeSourceRoom(
+                sample.world(), sample.source()
+        );
+        RoomProbe listenerProbe = AcousticTracer.probeRoom(
+                sample.world(), sample.listener()
+        );
+        return AcousticTracer.trace(
+                sample.world(),
+                sample.source(),
+                sample.listener(),
+                sourceProbe,
+                listenerProbe,
+                AcousticTracer.TraceQuality.FULL
+        );
+    }
+
+    private record DiffractionPerformanceCase(
+            String name,
+            IntFunction<DiffractionPerformanceSample> factory
+    ) {
+    }
+
+    private record DiffractionPerformanceSample(
+            BlockGetter world,
+            Vec3 source,
+            Vec3 listener
+    ) {
     }
 
     /**

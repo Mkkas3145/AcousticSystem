@@ -1098,11 +1098,15 @@ public final class AcousticTracer {
         // representation and cost, not the propagation law or an audible cutoff.
         boolean hasPortalEvidence = !sourceOpenings.isEmpty()
                 || !listenerOpenings.isEmpty();
+        long airGraphNanoseconds = 0L;
+        long sparseGraphNanoseconds = 0L;
+        long phaseStarted = System.nanoTime();
         VerifiedAirBackbone verifiedAir = allowAirCellGraph
                 ? verifiedCachedAirPath(
                         level, source, listener, hasPortalEvidence
                 )
                 : null;
+        airGraphNanoseconds += System.nanoTime() - phaseStarted;
         PropagationGraphPath verifiedAirBackbone = verifiedAir == null
                 ? null : verifiedAir.path();
         // Portal samples carry the multi-exit arrival field used for localization.  In
@@ -1114,6 +1118,7 @@ public final class AcousticTracer {
                         || verifiedAir.listenerUnchanged()
                         || verifiedAirBackbone.points().size() > 3);
         List<PropagationGraphPath> paths = List.of();
+        phaseStarted = System.nanoTime();
         if (!reusableVerifiedBackbone) {
             List<PropagationGraphPath> hierarchicalPaths = List.of();
             if (allowAirCellGraph && level instanceof AcousticScene scene) {
@@ -1156,20 +1161,22 @@ public final class AcousticTracer {
                 paths = List.copyOf(combined);
             }
         }
-        long sparseGraphFinished = System.nanoTime();
+        sparseGraphNanoseconds += System.nanoTime() - phaseStarted;
         boolean edgeGraphReachedListener = paths.stream().anyMatch(
                 PropagationGraphPath::clear
         );
+        phaseStarted = System.nanoTime();
         PropagationGraphPath airPath = reusableVerifiedBackbone
                 ? verifiedAirBackbone
                 : allowAirCellGraph && !edgeGraphReachedListener
                         ? searchAirCellGraph(level, source, listener, candidateBudget)
                         : null;
-        long airGraphFinished = System.nanoTime();
+        airGraphNanoseconds += System.nanoTime() - phaseStarted;
+        long evaluationStarted = System.nanoTime();
         if (paths.isEmpty() && airPath == null) {
             LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
-                    airGraphFinished - sparseGraphFinished,
-                    sparseGraphFinished - diffractionStarted,
+                    airGraphNanoseconds,
+                    sparseGraphNanoseconds,
                     0L,
                     LAST_AIR_SEARCH.get()
             ));
@@ -1213,9 +1220,9 @@ public final class AcousticTracer {
         if (evaluated.isEmpty() && evaluatedAirPath == null) {
             long finished = System.nanoTime();
             LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
-                    airGraphFinished - sparseGraphFinished,
-                    sparseGraphFinished - diffractionStarted,
-                    finished - airGraphFinished,
+                    airGraphNanoseconds,
+                    sparseGraphNanoseconds,
+                    finished - evaluationStarted,
                     LAST_AIR_SEARCH.get()
             ));
             return new DiffractionPath(
@@ -1294,17 +1301,17 @@ public final class AcousticTracer {
         );
         long finished = System.nanoTime();
         LAST_DIFFRACTION_TIMING.set(new DiffractionTiming(
-                airGraphFinished - sparseGraphFinished,
-                sparseGraphFinished - diffractionStarted,
-                finished - airGraphFinished,
+                airGraphNanoseconds,
+                sparseGraphNanoseconds,
+                finished - evaluationStarted,
                 LAST_AIR_SEARCH.get()
         ));
         if (PROFILE_TRACE) {
             System.out.printf(
                     "  diffractionMs air=%.3f sparse=%.3f evaluate=%.3f total=%.3f%n",
-                    (airGraphFinished - sparseGraphFinished) / 1_000_000.0,
-                    (sparseGraphFinished - diffractionStarted) / 1_000_000.0,
-                    (finished - airGraphFinished) / 1_000_000.0,
+                    airGraphNanoseconds / 1_000_000.0,
+                    sparseGraphNanoseconds / 1_000_000.0,
+                    (finished - evaluationStarted) / 1_000_000.0,
                     (finished - diffractionStarted) / 1_000_000.0
             );
         }
@@ -1906,8 +1913,8 @@ public final class AcousticTracer {
                 && !backwardFrontier.isEmpty()
                 && expanded < maximumExpansions) {
             if (bestMeetingDistance < Double.POSITIVE_INFINITY
-                    && forwardFrontier.peekPriority() >= bestMeetingDistance
-                    && backwardFrontier.peekPriority() >= bestMeetingDistance) {
+                    && (forwardFrontier.peekPriority() >= bestMeetingDistance
+                    || backwardFrontier.peekPriority() >= bestMeetingDistance)) {
                 break;
             }
             // Alternate the two admissible A* frontiers. Picking only the globally
@@ -2189,8 +2196,8 @@ public final class AcousticTracer {
                 && !scratch.backwardFrontier.isEmpty()
                 && expanded < maximumExpansions) {
             if (bestMeetingDistance < Double.POSITIVE_INFINITY
-                    && scratch.forwardFrontier.peekPriority() >= bestMeetingDistance
-                    && scratch.backwardFrontier.peekPriority() >= bestMeetingDistance) {
+                    && (scratch.forwardFrontier.peekPriority() >= bestMeetingDistance
+                    || scratch.backwardFrontier.peekPriority() >= bestMeetingDistance)) {
                 break;
             }
             boolean forward = expandForward;
@@ -2338,10 +2345,10 @@ public final class AcousticTracer {
                 && !scratch.backwardBuckets.isEmpty()
                 && expanded < maximumExpansions) {
             if (bestMeetingDistance < Double.POSITIVE_INFINITY
-                    && priorityBase + scratch.forwardBuckets.peekPriority()
+                    && (priorityBase + scratch.forwardBuckets.peekPriority()
                     >= bestMeetingDistance
-                    && priorityBase + scratch.backwardBuckets.peekPriority()
-                    >= bestMeetingDistance) {
+                    || priorityBase + scratch.backwardBuckets.peekPriority()
+                    >= bestMeetingDistance)) {
                 break;
             }
             boolean forward = expandForward;
@@ -6073,23 +6080,33 @@ public final class AcousticTracer {
     }
 
     /**
-     * Paged search state indexed by the scene's stable dense cell ids. A scene can
-     * contain millions of cells, while one bounded A* touches only a small fraction.
-     * Allocating six arrays for the complete scene on every propagation worker used to
-     * multiply a large snapshot by the worker count and exhaust the client heap.
+     * Search state indexed by the scene's stable dense cell ids. Compact scenes use
+     * stamped contiguous arrays for cache locality. Large scenes switch to bounded
+     * 16^3 pages, because multiplying six world-sized arrays by every propagation
+     * worker can exhaust the client heap.
      */
     private static final class DenseAirSearchScratch {
         private static final int PAGE_SHIFT = 12;
         private static final int PAGE_MASK = (1 << PAGE_SHIFT) - 1;
         private static final int MAX_RETAINED_PAGES = 8;
+        private static final int MAX_FLAT_CELLS = 131072;
 
         private DenseAirSearchPage[] pagesBySection = new DenseAirSearchPage[0];
         private DenseAirSearchPage[] retainedPages =
                 new DenseAirSearchPage[MAX_RETAINED_PAGES];
+        private final int[] hotSections = new int[16];
+        private final DenseAirSearchPage[] hotPages = new DenseAirSearchPage[16];
         private int retainedPageCount;
         private int[] touchedSections = new int[32];
         private int touchedSectionCount;
         private int stamp;
+        private boolean flatMode;
+        private double[] flatForwardDistances = new double[0];
+        private double[] flatBackwardDistances = new double[0];
+        private int[] flatForwardPrevious = new int[0];
+        private int[] flatBackwardPrevious = new int[0];
+        private int[] flatForwardStamps = new int[0];
+        private int[] flatBackwardStamps = new int[0];
         private final IntAirGraphHeap forwardFrontier = new IntAirGraphHeap(1024);
         private final IntAirGraphHeap backwardFrontier = new IntAirGraphHeap(1024);
         private final IntBucketFrontier forwardBuckets = new IntBucketFrontier();
@@ -6097,18 +6114,32 @@ public final class AcousticTracer {
 
         private void begin(int capacity, boolean prepareHeaps) {
             end();
+            flatMode = capacity <= MAX_FLAT_CELLS;
+            if (flatMode && flatForwardDistances.length < capacity) {
+                flatForwardDistances = new double[capacity];
+                flatBackwardDistances = new double[capacity];
+                flatForwardPrevious = new int[capacity];
+                flatBackwardPrevious = new int[capacity];
+                flatForwardStamps = new int[capacity];
+                flatBackwardStamps = new int[capacity];
+            }
             int sectionCapacity = (capacity + PAGE_MASK) >>> PAGE_SHIFT;
-            if (pagesBySection.length < sectionCapacity) {
+            if (!flatMode && pagesBySection.length < sectionCapacity) {
                 pagesBySection = Arrays.copyOf(pagesBySection, sectionCapacity);
-            } else if (pagesBySection.length > Math.max(256, sectionCapacity * 4)) {
+            } else if (!flatMode
+                    && pagesBySection.length > Math.max(256, sectionCapacity * 4)) {
                 pagesBySection = new DenseAirSearchPage[sectionCapacity];
             }
             if (++stamp == 0) {
+                Arrays.fill(flatForwardStamps, 0);
+                Arrays.fill(flatBackwardStamps, 0);
                 for (int index = 0; index < retainedPageCount; index++) {
                     retainedPages[index].clearStamps();
                 }
                 stamp = 1;
             }
+            Arrays.fill(hotSections, -1);
+            Arrays.fill(hotPages, null);
             if (prepareHeaps) {
                 forwardFrontier.begin();
                 backwardFrontier.begin();
@@ -6127,12 +6158,21 @@ public final class AcousticTracer {
                 }
             }
             touchedSectionCount = 0;
+            Arrays.fill(hotSections, -1);
+            Arrays.fill(hotPages, null);
+            flatMode = false;
         }
 
         private DenseAirSearchPage pageForWrite(int cell) {
             int section = cell >>> PAGE_SHIFT;
+            int hotSlot = section & 15;
+            if (hotSections[hotSlot] == section) {
+                return hotPages[hotSlot];
+            }
             DenseAirSearchPage page = pagesBySection[section];
             if (page != null) {
+                hotSections[hotSlot] = section;
+                hotPages[hotSlot] = page;
                 return page;
             }
             if (retainedPageCount > 0) {
@@ -6142,6 +6182,8 @@ public final class AcousticTracer {
                 page = new DenseAirSearchPage();
             }
             pagesBySection[section] = page;
+            hotSections[hotSlot] = section;
+            hotPages[hotSlot] = page;
             if (touchedSectionCount == touchedSections.length) {
                 touchedSections = Arrays.copyOf(
                         touchedSections, touchedSections.length << 1
@@ -6153,11 +6195,25 @@ public final class AcousticTracer {
 
         private DenseAirSearchPage page(int cell) {
             int section = cell >>> PAGE_SHIFT;
-            return section < pagesBySection.length
+            int hotSlot = section & 15;
+            if (hotSections[hotSlot] == section) {
+                return hotPages[hotSlot];
+            }
+            DenseAirSearchPage page = section < pagesBySection.length
                     ? pagesBySection[section] : null;
+            if (page != null) {
+                hotSections[hotSlot] = section;
+                hotPages[hotSlot] = page;
+            }
+            return page;
         }
 
         private double forwardDistance(int cell) {
+            if (flatMode) {
+                return flatForwardStamps[cell] == stamp
+                        ? flatForwardDistances[cell]
+                        : Double.POSITIVE_INFINITY;
+            }
             DenseAirSearchPage page = page(cell);
             int local = cell & PAGE_MASK;
             return page != null && page.forwardStamps[local] == stamp
@@ -6165,6 +6221,11 @@ public final class AcousticTracer {
         }
 
         private double backwardDistance(int cell) {
+            if (flatMode) {
+                return flatBackwardStamps[cell] == stamp
+                        ? flatBackwardDistances[cell]
+                        : Double.POSITIVE_INFINITY;
+            }
             DenseAirSearchPage page = page(cell);
             int local = cell & PAGE_MASK;
             return page != null && page.backwardStamps[local] == stamp
@@ -6172,6 +6233,12 @@ public final class AcousticTracer {
         }
 
         private void setForward(int cell, double distance, int previous) {
+            if (flatMode) {
+                flatForwardStamps[cell] = stamp;
+                flatForwardDistances[cell] = distance;
+                flatForwardPrevious[cell] = previous;
+                return;
+            }
             DenseAirSearchPage page = pageForWrite(cell);
             int local = cell & PAGE_MASK;
             page.forwardStamps[local] = stamp;
@@ -6180,6 +6247,12 @@ public final class AcousticTracer {
         }
 
         private void setBackward(int cell, double distance, int previous) {
+            if (flatMode) {
+                flatBackwardStamps[cell] = stamp;
+                flatBackwardDistances[cell] = distance;
+                flatBackwardPrevious[cell] = previous;
+                return;
+            }
             DenseAirSearchPage page = pageForWrite(cell);
             int local = cell & PAGE_MASK;
             page.backwardStamps[local] = stamp;
@@ -6188,10 +6261,16 @@ public final class AcousticTracer {
         }
 
         private int forwardPrevious(int cell) {
+            if (flatMode) {
+                return flatForwardPrevious[cell];
+            }
             return page(cell).forwardPrevious[cell & PAGE_MASK];
         }
 
         private int backwardPrevious(int cell) {
+            if (flatMode) {
+                return flatBackwardPrevious[cell];
+            }
             return page(cell).backwardPrevious[cell & PAGE_MASK];
         }
 
@@ -6200,7 +6279,9 @@ public final class AcousticTracer {
                     + 4L * Integer.BYTES * 4096;
             long estimated = (long) pagesBySection.length * Long.BYTES
                     + (long) touchedSections.length * Integer.BYTES
-                    + (long) retainedPageCount * pageBytes;
+                    + (long) retainedPageCount * pageBytes
+                    + 2L * Double.BYTES * flatForwardDistances.length
+                    + 4L * Integer.BYTES * flatForwardDistances.length;
             return new DenseAirSearchStorageMetrics(
                     sceneCellCapacity,
                     pagesBySection.length,

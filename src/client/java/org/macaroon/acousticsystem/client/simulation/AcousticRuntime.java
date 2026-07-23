@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -123,17 +124,14 @@ public final class AcousticRuntime {
     private static final Set<Integer> DEFERRED_ONSET_SOURCES = ConcurrentHashMap.newKeySet();
     private static final Map<SoundInstance, RealtimeState> REALTIME_STATES = new ConcurrentHashMap<>();
     /*
-     * Continuous propagation is scheduled as one listener-centred batch, not as one
-     * self-requeueing job per voice.  The short lock only publishes/takes immutable
-     * requests; no scene query or acoustic work is performed while it is held.
-     *
-     * This is deliberately completion-driven rather than clock-driven.  A fast machine
-     * can immediately start the newest batch, while a slower machine replaces obsolete
-     * intermediate positions without accumulating work or starving the audio callback.
+     * Every voice owns one running calculation and one replaceable newest request.
+     * Ready voices share four fair worker lanes, but there is no all-voices barrier:
+     * one completed trace reaches the sound thread immediately and that voice's newest
+     * movement request returns at the tail of the ready queue.
      */
-    private static final Object REALTIME_BATCH_LOCK = new Object();
-    private static final AtomicBoolean REALTIME_BATCH_RUNNING = new AtomicBoolean();
-    private static boolean realtimeBatchDirty;
+    private static final ConcurrentLinkedQueue<RealtimeState> REALTIME_READY =
+            new ConcurrentLinkedQueue<>();
+    private static final AtomicInteger REALTIME_DRAINERS = new AtomicInteger();
     private static final AtomicBoolean APPLICATION_DRAIN_QUEUED = new AtomicBoolean();
     private static final LatestPublication<PendingListenerApplication> PENDING_LISTENER_APPLICATION =
             new LatestPublication<>();
@@ -599,6 +597,7 @@ public final class AcousticRuntime {
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
         REALTIME_STATES.clear();
+        REALTIME_READY.clear();
         PENDING_LISTENER_APPLICATION.clear();
         SOUND_REQUEST_CACHE.clear();
         POSITIONAL_SOUND_SCRATCH.clear();
@@ -621,6 +620,7 @@ public final class AcousticRuntime {
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
         REALTIME_STATES.clear();
+        REALTIME_READY.clear();
         PENDING_LISTENER_APPLICATION.clear();
         SOUND_REQUEST_CACHE.clear();
         lastSubmittedBatchKey = null;
@@ -641,6 +641,7 @@ public final class AcousticRuntime {
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
         REALTIME_STATES.clear();
+        REALTIME_READY.clear();
         PENDING_LISTENER_APPLICATION.clear();
         SOUND_REQUEST_CACHE.clear();
         lastSubmittedBatchKey = null;
@@ -661,92 +662,75 @@ public final class AcousticRuntime {
             long expectedGeneration,
             long sequence
     ) {
-        boolean changed = false;
-        synchronized (REALTIME_BATCH_LOCK) {
-            for (SoundRequest sound : sounds) {
-                RealtimeState state = REALTIME_STATES.computeIfAbsent(
-                        sound.sound(), ignored -> new RealtimeState()
-                );
-                changed |= state.offer(
-                        scene, listener, sound, expectedGeneration, sequence
-                );
-            }
-            realtimeBatchDirty |= changed;
-            if (!changed || !REALTIME_BATCH_RUNNING.compareAndSet(false, true)) {
-                return;
+        boolean scheduled = false;
+        for (SoundRequest sound : sounds) {
+            RealtimeState state = REALTIME_STATES.computeIfAbsent(
+                    sound.sound(), ignored -> new RealtimeState()
+            );
+            if (state.offer(
+                    scene, listener, sound, expectedGeneration, sequence
+            )) {
+                REALTIME_READY.offer(state);
+                scheduled = true;
             }
         }
-        PROPAGATION_WORKERS.execute(AcousticRuntime::drainRealtimeBatch);
+        if (scheduled) {
+            startRealtimeDrainers();
+        }
     }
 
     /**
-     * Takes one coherent snapshot of every voice that changed since the previous
-     * calculation.  Processing it on one worker lets all traces reuse the same
-     * listener-rooted route forest without lock contention from sibling voices.
+     * Keeps at most four propagation drains active. Each drain publishes a completed
+     * voice before taking more work, so one expensive source cannot hold back unrelated
+     * channels. A continuously moving source is requeued at the tail and therefore
+     * cannot monopolize a lane.
      */
-    private static void drainRealtimeBatch() {
-        List<RealtimeBatchEntry> batch = new ArrayList<>(REALTIME_STATES.size());
-        synchronized (REALTIME_BATCH_LOCK) {
-            realtimeBatchDirty = false;
-            for (Map.Entry<SoundInstance, RealtimeState> entry
-                    : REALTIME_STATES.entrySet()) {
-                RealtimeRequest request = entry.getValue().take();
-                if (request != null) {
-                    batch.add(new RealtimeBatchEntry(
-                            entry.getKey(), entry.getValue(), request
-                    ));
+    private static void startRealtimeDrainers() {
+        while (!REALTIME_READY.isEmpty()) {
+            int running = REALTIME_DRAINERS.get();
+            if (running >= REALTIME_BATCH_LANES
+                    || !REALTIME_DRAINERS.compareAndSet(running, running + 1)) {
+                if (running >= REALTIME_BATCH_LANES) {
+                    return;
                 }
+                continue;
             }
+            PROPAGATION_WORKERS.execute(AcousticRuntime::drainRealtimeReadyVoices);
         }
-
-        // Newest requests have the best chance of being audible.  Stable ordering also
-        // makes the first shared-field expansion deterministic for a given frame.
-        batch.sort(
-                Comparator.<RealtimeBatchEntry>comparingLong(
-                        entry -> entry.request().sequence()
-                ).reversed().thenComparingDouble(entry ->
-                        entry.request().sound().source().distanceToSqr(
-                                entry.request().listener()
-                        )
-                )
-        );
-        int lanes = Math.min(REALTIME_BATCH_LANES, batch.size());
-        if (lanes <= 1) {
-            for (RealtimeBatchEntry entry : batch) {
-                processRealtimeEntry(entry);
-            }
-        } else {
-            AtomicInteger cursor = new AtomicInteger();
-            CompletableFuture<?>[] laneTasks = new CompletableFuture<?>[lanes];
-            for (int lane = 0; lane < lanes; lane++) {
-                laneTasks[lane] = CompletableFuture.runAsync(() -> {
-                    for (int index = cursor.getAndIncrement(); index < batch.size();
-                         index = cursor.getAndIncrement()) {
-                        processRealtimeEntry(batch.get(index));
-                    }
-                }, PROPAGATION_WORKERS);
-            }
-            CompletableFuture.allOf(laneTasks).join();
-        }
-
-        boolean continueWithLatest = false;
-        synchronized (REALTIME_BATCH_LOCK) {
-            for (RealtimeBatchEntry entry : batch) {
-                continueWithLatest |= entry.state().hasPending();
-            }
-            continueWithLatest |= realtimeBatchDirty;
-            if (!continueWithLatest) {
-                REALTIME_BATCH_RUNNING.set(false);
-                // submitRealtimeUpdates() uses the same lock, so a request cannot slip
-                // between the final dirty check and releasing the running ownership.
-                return;
-            }
-        }
-        PROPAGATION_WORKERS.execute(AcousticRuntime::drainRealtimeBatch);
     }
 
-    private static void processRealtimeEntry(RealtimeBatchEntry entry) {
-        RealtimeRequest request = entry.request();
+    private static void drainRealtimeReadyVoices() {
+        try {
+            RealtimeState state;
+            while ((state = REALTIME_READY.poll()) != null) {
+                try {
+                    RealtimeRequest request = state.take();
+                    if (request != null) {
+                        processRealtimeRequest(state, request);
+                    }
+                } catch (RuntimeException exception) {
+                    AcousticSystem.LOGGER.warn(
+                            "Asynchronous real-time acoustic update failed",
+                            exception
+                    );
+                } finally {
+                    if (state.hasPending()) {
+                        REALTIME_READY.offer(state);
+                    }
+                }
+            }
+        } finally {
+            REALTIME_DRAINERS.decrementAndGet();
+            if (!REALTIME_READY.isEmpty()) {
+                startRealtimeDrainers();
+            }
+        }
+    }
+
+    private static void processRealtimeRequest(
+            RealtimeState state,
+            RealtimeRequest request
+    ) {
         long workerStartedNanoseconds = System.nanoTime();
         SoundRequest source = request.sound();
         ChannelAccess.ChannelHandle handle = source.handle();
@@ -773,7 +757,7 @@ public final class AcousticRuntime {
                 AcousticTracer.lastTraceTiming(),
                 System.nanoTime()
         );
-        entry.state().offerApplication(application);
+        state.offerApplication(application);
         requestApplicationDrain();
     }
 
@@ -1301,13 +1285,6 @@ public final class AcousticRuntime {
             long probeFinishedNanoseconds,
             AcousticTracer.TraceTiming traceTiming,
             long completedNanoseconds
-    ) {
-    }
-
-    private record RealtimeBatchEntry(
-            SoundInstance sound,
-            RealtimeState state,
-            RealtimeRequest request
     ) {
     }
 

@@ -60,6 +60,84 @@ public final class AcousticSceneFixtures {
         );
     }
 
+    public static AcousticScene sixtyFourCubeWithSerpentineTunnel() {
+        Map<AcousticScene.SectionKey, BlockState[]> blocks =
+                solidSections(4, 1, 4);
+        for (int x = 2; x <= 20; x++) {
+            carveTunnelCrossSection(blocks, x, 8, 2, 0);
+        }
+        for (int z = 2; z <= 20; z++) {
+            carveTunnelCrossSection(blocks, 20, 8, z, 1);
+        }
+        for (int x = 20; x <= 42; x++) {
+            carveTunnelCrossSection(blocks, x, 8, 20, 0);
+        }
+        for (int z = 20; z <= 42; z++) {
+            carveTunnelCrossSection(blocks, 42, 8, z, 1);
+        }
+        for (int x = 42; x <= 61; x++) {
+            carveTunnelCrossSection(blocks, x, 8, 42, 0);
+        }
+        return sceneFromBlocks(blocks, 0, 16);
+    }
+
+    public static AcousticScene thirtyTwoCubeWithVerticalDogleg() {
+        Map<AcousticScene.SectionKey, BlockState[]> blocks =
+                solidSections(2, 2, 2);
+        for (int x = 2; x <= 20; x++) {
+            carveTunnelCrossSection(blocks, x, 4, 4, 0);
+        }
+        for (int y = 4; y <= 24; y++) {
+            carveVerticalTunnelCrossSection(blocks, 20, y, 4);
+        }
+        for (int z = 4; z <= 28; z++) {
+            carveTunnelCrossSection(blocks, 20, 24, z, 1);
+        }
+        return sceneFromBlocks(blocks, 0, 32);
+    }
+
+    public static AcousticScene sixtyFourCubeWithSeededNoiseCave(long seed) {
+        Map<AcousticScene.SectionKey, BlockState[]> blocks = new HashMap<>();
+        for (int sectionZ = -1; sectionZ <= 0; sectionZ++) {
+            for (int sectionX = 0; sectionX < 4; sectionX++) {
+                BlockState[] states = new BlockState[4096];
+                Arrays.fill(states, Blocks.STONE.defaultBlockState());
+                blocks.put(
+                        new AcousticScene.SectionKey(sectionX, 0, sectionZ),
+                        states
+                );
+            }
+        }
+        for (int x = 0; x < 64; x++) {
+            double sampleX = x + 0.5;
+            double centerY = noiseCaveCenterY(seed, sampleX);
+            double centerZ = noiseCaveCenterZ(seed, sampleX);
+            double radius = noiseCaveRadius(seed, sampleX);
+            for (int y = 0; y < 16; y++) {
+                for (int z = -16; z < 16; z++) {
+                    double vertical = (y + 0.5 - centerY) / 0.82;
+                    double lateral = z + 0.5 - centerZ;
+                    if (vertical * vertical + lateral * lateral
+                            <= radius * radius) {
+                        setBlock(
+                                blocks, x, y, z,
+                                Blocks.AIR.defaultBlockState()
+                        );
+                    }
+                }
+            }
+        }
+        return sceneFromBlocks(blocks, 0, 16);
+    }
+
+    public static double seededNoiseCaveY(long seed, double x) {
+        return noiseCaveCenterY(seed, x);
+    }
+
+    public static double seededNoiseCaveZ(long seed, double x) {
+        return noiseCaveCenterZ(seed, x);
+    }
+
     public static AcousticScene sixtyFourCubeWithWildPerfectMaze(long seed) {
         Map<AcousticScene.SectionKey, BlockState[]> blocks = new HashMap<>();
         for (int sectionZ = 0; sectionZ < 4; sectionZ++) {
@@ -174,6 +252,110 @@ public final class AcousticSceneFixtures {
                 );
             }
         }
+    }
+
+    private static void carveVerticalTunnelCrossSection(
+            Map<AcousticScene.SectionKey, BlockState[]> blocks,
+            int centerX,
+            int centerY,
+            int centerZ
+    ) {
+        for (int x = centerX - 1; x <= centerX + 1; x++) {
+            for (int z = centerZ - 1; z <= centerZ + 1; z++) {
+                setBlock(
+                        blocks, x, centerY, z,
+                        Blocks.AIR.defaultBlockState()
+                );
+            }
+        }
+    }
+
+    private static Map<AcousticScene.SectionKey, BlockState[]> solidSections(
+            int sectionCountX,
+            int sectionCountY,
+            int sectionCountZ
+    ) {
+        Map<AcousticScene.SectionKey, BlockState[]> blocks = new HashMap<>();
+        for (int sectionY = 0; sectionY < sectionCountY; sectionY++) {
+            for (int sectionZ = 0; sectionZ < sectionCountZ; sectionZ++) {
+                for (int sectionX = 0; sectionX < sectionCountX; sectionX++) {
+                    BlockState[] states = new BlockState[4096];
+                    Arrays.fill(states, Blocks.STONE.defaultBlockState());
+                    blocks.put(
+                            new AcousticScene.SectionKey(
+                                    sectionX, sectionY, sectionZ
+                            ),
+                            states
+                    );
+                }
+            }
+        }
+        return blocks;
+    }
+
+    private static AcousticScene sceneFromBlocks(
+            Map<AcousticScene.SectionKey, BlockState[]> blocks,
+            int minY,
+            int maxY
+    ) {
+        Map<AcousticScene.SectionKey, AcousticSection> sections = new HashMap<>();
+        blocks.forEach((key, states) ->
+                sections.put(key, new AcousticSection(states))
+        );
+        return new AcousticScene(
+                sections, minY, maxY, 1L, new Object(), Map.of()
+        );
+    }
+
+    private static double noiseCaveCenterY(long seed, double x) {
+        return 4.5 + octaveNoise(
+                seed ^ 0x6A09E667F3BCC909L, x, 0.075
+        ) * 2.2;
+    }
+
+    private static double noiseCaveCenterZ(long seed, double x) {
+        return octaveNoise(
+                seed ^ 0xBB67AE8584CAA73BL, x, 0.060
+        ) * 7.0;
+    }
+
+    private static double noiseCaveRadius(long seed, double x) {
+        return 2.35 + octaveNoise(
+                seed ^ 0x3C6EF372FE94F82BL, x, 0.11
+        ) * 0.35;
+    }
+
+    private static double octaveNoise(long seed, double x, double frequency) {
+        double sum = 0.0;
+        double amplitude = 1.0;
+        double normalization = 0.0;
+        for (int octave = 0; octave < 3; octave++) {
+            sum += smoothValueNoise(
+                    seed + octave * 0x9E3779B97F4A7C15L,
+                    x * frequency
+            ) * amplitude;
+            normalization += amplitude;
+            frequency *= 2.03;
+            amplitude *= 0.5;
+        }
+        return sum / normalization;
+    }
+
+    private static double smoothValueNoise(long seed, double x) {
+        long lower = (long) Math.floor(x);
+        double fraction = x - lower;
+        double smooth = fraction * fraction * (3.0 - 2.0 * fraction);
+        double a = hashNoise(seed, lower);
+        double b = hashNoise(seed, lower + 1);
+        return a + (b - a) * smooth;
+    }
+
+    private static double hashNoise(long seed, long coordinate) {
+        long value = seed + coordinate * 0x9E3779B97F4A7C15L;
+        value = (value ^ value >>> 30) * 0xBF58476D1CE4E5B9L;
+        value = (value ^ value >>> 27) * 0x94D049BB133111EBL;
+        value ^= value >>> 31;
+        return ((value >>> 11) * 0x1.0p-53) * 2.0 - 1.0;
     }
 
     private static void setBlock(

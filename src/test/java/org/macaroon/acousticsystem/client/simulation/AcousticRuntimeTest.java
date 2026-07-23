@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -104,6 +105,31 @@ class AcousticRuntimeTest {
     }
 
     @Test
+    void completedVoiceDoesNotWaitForAnotherVoice() {
+        AcousticRuntime.LatestComputationQueue<String, String> fast =
+                new AcousticRuntime.LatestComputationQueue<>();
+        AcousticRuntime.LatestComputationQueue<String, String> slow =
+                new AcousticRuntime.LatestComputationQueue<>();
+
+        assertTrue(fast.offer("fast-position"));
+        assertTrue(slow.offer("slow-position"));
+        assertEquals("fast-position", fast.take());
+        assertEquals("slow-position", slow.take());
+
+        fast.publish("fast-result");
+        assertEquals("fast-result", fast.takePublished());
+        assertFalse(fast.continueOrRelease());
+
+        // The slow calculation is still running. Its state must not form a global
+        // completion barrier for the already finished channel.
+        assertFalse(slow.idle());
+        assertNull(slow.takePublished());
+        slow.publish("slow-result");
+        assertEquals("slow-result", slow.takePublished());
+        assertFalse(slow.continueOrRelease());
+    }
+
+    @Test
     void continuousListenerFieldsCollapseToNewestCompletedMeasurement() {
         AcousticRuntime.LatestPublication<String> publication =
                 new AcousticRuntime.LatestPublication<>();
@@ -132,9 +158,9 @@ class AcousticRuntimeTest {
             voices.add(queue);
         }
 
-        // Render frames can outnumber completed acoustic batches by orders of
-        // magnitude.  Every voice retains only the newest endpoint; a batch sweep does
-        // not inherit frames * voices worth of propagation work.
+        // Render frames can outnumber completed acoustic calculations by orders of
+        // magnitude. Every voice retains only its newest endpoint instead of inheriting
+        // frames * voices worth of propagation work.
         for (int frame = 1; frame <= 2_000; frame++) {
             for (AcousticRuntime.LatestComputationQueue<Integer, String> voice : voices) {
                 assertFalse(voice.offer(frame));
