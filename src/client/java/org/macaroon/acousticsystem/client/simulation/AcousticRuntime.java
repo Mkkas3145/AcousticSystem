@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public final class AcousticRuntime {
     private static final int WORKER_COUNT = Math.max(
@@ -54,9 +55,16 @@ public final class AcousticRuntime {
     // Propagation and listener-field work have reserved capacity inside the same total
     // CPU budget. A long room/tail probe can no longer make a new sound wait behind it.
     private static final int ONSET_WORKER_COUNT = Math.max(1, WORKER_COUNT - 1);
+    /*
+     * Realtime propagation is latency-sensitive, not throughput-only work.  The old
+     * fixed four-lane ceiling made the last voices wait in ceil(voices / 4) waves even
+     * when the propagation pool had idle processors.  Use every propagation worker
+     * except one instead; the reserved worker keeps onset/cache work runnable while
+     * continuous movement is producing realtime requests.
+     */
     private static final int REALTIME_BATCH_LANES = Math.max(
             1,
-            Math.min(4, ONSET_WORKER_COUNT - 1)
+            ONSET_WORKER_COUNT - 1
     );
     private static final AtomicInteger WORKER_SEQUENCE = new AtomicInteger();
     private static final AtomicInteger TAIL_WORKER_SEQUENCE = new AtomicInteger();
@@ -125,9 +133,9 @@ public final class AcousticRuntime {
     private static final Map<SoundInstance, RealtimeState> REALTIME_STATES = new ConcurrentHashMap<>();
     /*
      * Every voice owns one running calculation and one replaceable newest request.
-     * Ready voices share four fair worker lanes, but there is no all-voices barrier:
-     * one completed trace reaches the sound thread immediately and that voice's newest
-     * movement request returns at the tail of the ready queue.
+     * Ready voices share the available latency lanes, but there is no all-voices
+     * barrier: one completed trace reaches the sound thread immediately and that
+     * voice's newest movement request returns at the tail of the ready queue.
      */
     private static final ConcurrentLinkedQueue<RealtimeState> REALTIME_READY =
             new ConcurrentLinkedQueue<>();
@@ -457,12 +465,12 @@ public final class AcousticRuntime {
         // initial source untouched until the same full worker result arrives instead of
         // trading a few milliseconds of onset colour for a visible frame-time spike.
         AcousticResult immediate = null;
-        CompletableFuture<AcousticResult> computation = CompletableFuture.supplyAsync(
+        CompletableFuture<AcousticResult> computation = submitNonBlockingTrace(
                 () -> {
                     RoomProbe sourceRoomProbe = cachedSourceRoomProbe(
                             scene, source, preparedContext.generation(), now
                     );
-                    return AcousticTracer.trace(
+                    return AcousticTracer.traceNonBlocking(
                             scene,
                             source,
                             preparedContext.listener(),
@@ -470,8 +478,7 @@ public final class AcousticRuntime {
                             roomProbe,
                             AcousticTracer.TraceQuality.FULL
                     );
-                },
-                PROPAGATION_WORKERS
+                }
         );
         PreparedResult prepared = new PreparedResult(
                         context.generation(),
@@ -680,10 +687,10 @@ public final class AcousticRuntime {
     }
 
     /**
-     * Keeps at most four propagation drains active. Each drain publishes a completed
-     * voice before taking more work, so one expensive source cannot hold back unrelated
-     * channels. A continuously moving source is requeued at the tail and therefore
-     * cannot monopolize a lane.
+     * Keeps one propagation worker in reserve and uses the rest for realtime drains.
+     * Each drain publishes a completed voice before taking more work, so one expensive
+     * source cannot hold back unrelated channels. A continuously moving source is
+     * requeued at the tail and therefore cannot monopolize a lane.
      */
     private static void startRealtimeDrainers() {
         while (!REALTIME_READY.isEmpty()) {
@@ -703,10 +710,11 @@ public final class AcousticRuntime {
         try {
             RealtimeState state;
             while ((state = REALTIME_READY.poll()) != null) {
+                boolean parked = false;
                 try {
                     RealtimeRequest request = state.take();
                     if (request != null) {
-                        processRealtimeRequest(state, request);
+                        parked = processRealtimeRequest(state, request);
                     }
                 } catch (RuntimeException exception) {
                     AcousticSystem.LOGGER.warn(
@@ -714,7 +722,7 @@ public final class AcousticRuntime {
                             exception
                     );
                 } finally {
-                    if (state.hasPending()) {
+                    if (!parked && state.hasPending()) {
                         REALTIME_READY.offer(state);
                     }
                 }
@@ -727,7 +735,10 @@ public final class AcousticRuntime {
         }
     }
 
-    private static void processRealtimeRequest(
+    /**
+     * @return true when this voice was parked on a shared listener-field completion.
+     */
+    private static boolean processRealtimeRequest(
             RealtimeState state,
             RealtimeRequest request
     ) {
@@ -736,19 +747,39 @@ public final class AcousticRuntime {
         ChannelAccess.ChannelHandle handle = source.handle();
         if (handle == null || handle.isStopped()
                 || request.generation() != generation) {
-            return;
+            return false;
         }
         RoomProbe sourceProbe = cachedSourceRoomProbe(
                 request.scene(), source.source(), request.generation(),
                 request.sequence()
         );
         long probeFinishedNanoseconds = System.nanoTime();
-        AcousticResult result = AcousticTracer.trace(
-                request.scene(), source.source(), request.listener(),
-                sourceProbe, request.listenerProbe(), source.quality()
-        );
+        AcousticResult result;
+        try {
+            result = AcousticTracer.traceNonBlocking(
+                    request.scene(), source.source(), request.listener(),
+                    sourceProbe, request.listenerProbe(), source.quality()
+            );
+        } catch (AcousticTracer.AirFieldPendingException pending) {
+            if (!state.park(request)) {
+                return false;
+            }
+            pending.readiness().whenComplete((ignored, failure) -> {
+                if (failure != null) {
+                    AcousticSystem.LOGGER.warn(
+                            "Shared listener air field failed",
+                            failure
+                    );
+                }
+                if (state.resume()) {
+                    REALTIME_READY.offer(state);
+                    startRealtimeDrainers();
+                }
+            });
+            return true;
+        }
         if (request.generation() != generation || handle.isStopped()) {
-            return;
+            return false;
         }
         PendingApplication application = new PendingApplication(
                 handle, result, request.generation(), request.sequence(),
@@ -759,6 +790,47 @@ public final class AcousticRuntime {
         );
         state.offerApplication(application);
         requestApplicationDrain();
+        return false;
+    }
+
+    /**
+     * Runs a full trace without tying up a carrier worker when another source owns the
+     * same cold listener-field build. Completion resubmits the exact trace operation;
+     * no reduced-quality result or timeout is substituted.
+     */
+    private static CompletableFuture<AcousticResult> submitNonBlockingTrace(
+            Supplier<AcousticResult> trace
+    ) {
+        CompletableFuture<AcousticResult> result = new CompletableFuture<>();
+        submitNonBlockingTraceAttempt(trace, result);
+        return result;
+    }
+
+    private static void submitNonBlockingTraceAttempt(
+            Supplier<AcousticResult> trace,
+            CompletableFuture<AcousticResult> result
+    ) {
+        if (result.isDone()) {
+            return;
+        }
+        PROPAGATION_WORKERS.execute(() -> {
+            if (result.isDone()) {
+                return;
+            }
+            try {
+                result.complete(trace.get());
+            } catch (AcousticTracer.AirFieldPendingException pending) {
+                pending.readiness().whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        result.completeExceptionally(failure);
+                    } else {
+                        submitNonBlockingTraceAttempt(trace, result);
+                    }
+                });
+            } catch (Throwable failure) {
+                result.completeExceptionally(failure);
+            }
+        });
     }
 
     private static RoomProbe realtimeRoomProbe(
@@ -1354,6 +1426,14 @@ public final class AcousticRuntime {
         private boolean hasPending() {
             return queue.continueOrRelease();
         }
+
+        private boolean park(RealtimeRequest request) {
+            return queue.park(request);
+        }
+
+        private boolean resume() {
+            return queue.resume();
+        }
     }
 
     /**
@@ -1364,10 +1444,15 @@ public final class AcousticRuntime {
     static final class LatestComputationQueue<T, A> {
         private T pending;
         private boolean running;
+        private boolean parked;
         private A published;
 
         synchronized boolean offer(T request) {
             pending = request;
+            if (parked) {
+                parked = false;
+                return true;
+            }
             if (running) {
                 return false;
             }
@@ -1382,6 +1467,30 @@ public final class AcousticRuntime {
                 running = false;
             }
             return next;
+        }
+
+        synchronized boolean park(T request) {
+            // A newer request arrived while the attempted trace was running. It may
+            // target another listener field, so process it immediately instead of
+            // parking behind the obsolete field.
+            if (pending != null) {
+                return false;
+            }
+            pending = request;
+            parked = true;
+            return true;
+        }
+
+        synchronized boolean resume() {
+            if (!parked) {
+                return false;
+            }
+            parked = false;
+            if (pending != null) {
+                return true;
+            }
+            running = false;
+            return false;
         }
 
         synchronized void publish(A application) {
@@ -1399,6 +1508,9 @@ public final class AcousticRuntime {
         }
 
         synchronized boolean continueOrRelease() {
+            if (parked) {
+                return false;
+            }
             if (pending != null) {
                 return true;
             }
@@ -1407,7 +1519,7 @@ public final class AcousticRuntime {
         }
 
         synchronized boolean idle() {
-            return !running && pending == null;
+            return !running && !parked && pending == null;
         }
     }
 

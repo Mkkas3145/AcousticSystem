@@ -33,6 +33,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.IntConsumer;
@@ -127,6 +128,12 @@ public final class AcousticTracer {
             ThreadLocal.withInitial(DiffractionTiming::empty);
     private static final ThreadLocal<AirSearchStats> LAST_AIR_SEARCH =
             ThreadLocal.withInitial(AirSearchStats::none);
+    /*
+     * Runtime workers use continuation-based field sharing. Standalone callers and
+     * deterministic tests retain the ordinary synchronous trace contract.
+     */
+    private static final ThreadLocal<Boolean> DEFER_SHARED_FIELD_WAIT =
+            ThreadLocal.withInitial(() -> Boolean.FALSE);
     private static final ThreadLocal<DenseAirSearchScratch> DENSE_AIR_SEARCH =
             ThreadLocal.withInitial(DenseAirSearchScratch::new);
     private static final ThreadLocal<SurfaceHit[]> ROOM_SURFACE_HOLDER =
@@ -469,6 +476,30 @@ public final class AcousticTracer {
             );
         }
         return published;
+    }
+
+    /**
+     * Runtime-only trace variant which never occupies a propagation worker while
+     * another source is constructing the same listener-rooted air field.
+     */
+    static AcousticResult traceNonBlocking(
+            BlockGetter level,
+            Vec3 source,
+            Vec3 listener,
+            RoomProbe sourceRoomProbe,
+            RoomProbe listenerRoomProbe,
+            TraceQuality quality
+    ) {
+        boolean previous = DEFER_SHARED_FIELD_WAIT.get();
+        DEFER_SHARED_FIELD_WAIT.set(Boolean.TRUE);
+        try {
+            return trace(
+                    level, source, listener,
+                    sourceRoomProbe, listenerRoomProbe, quality
+            );
+        } finally {
+            DEFER_SHARED_FIELD_WAIT.set(previous);
+        }
     }
 
     /** Timing for the most recent trace on the calling worker thread. */
@@ -1805,6 +1836,11 @@ public final class AcousticTracer {
         if (!listenerField.hasBackbone()) {
             initialFieldBuilder = listenerField.claimBackboneBuild();
             if (!initialFieldBuilder) {
+                if (DEFER_SHARED_FIELD_WAIT.get()) {
+                    throw new AirFieldPendingException(
+                            listenerField.backboneReadiness()
+                    );
+                }
                 listenerField.awaitBackboneBuild();
                 if (listenerField.hasBackbone()) {
                     List<Long> sharedCells = listenerField.connect(
@@ -1826,7 +1862,8 @@ public final class AcousticTracer {
                 initialFieldBuilder = listenerField.claimBackboneBuild();
             }
         }
-        if (level instanceof AcousticScene scene) {
+        try {
+            if (level instanceof AcousticScene scene) {
             DenseAirSearchResult dense = searchDenseAirGraph(
                     scene, source, listener, startKeys, goalKeys,
                     candidateBudget
@@ -1849,7 +1886,7 @@ public final class AcousticTracer {
                 }
             }
         }
-        AirGraphHeap forwardFrontier = new AirGraphHeap(1024);
+            AirGraphHeap forwardFrontier = new AirGraphHeap(1024);
         AirGraphHeap backwardFrontier = new AirGraphHeap(1024);
         Long2DoubleOpenHashMap forwardDistance = new Long2DoubleOpenHashMap(
                 Math.max(1024, candidateBudget * 128)
@@ -2058,9 +2095,15 @@ public final class AcousticTracer {
             return null;
         }
         AIR_PATH_MISS_CACHE.remove(missCacheKey);
-        return putBounded(
-                AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER, cacheKey, result, 2048
-        );
+            return putBounded(
+                    AIR_PATH_CACHE, AIR_PATH_CACHE_ORDER, cacheKey, result, 2048
+            );
+        } catch (RuntimeException | Error failure) {
+            if (initialFieldBuilder) {
+                listenerField.finishBackboneBuild();
+            }
+            throw failure;
+        }
     }
 
     private static List<PropagationGraphPath> searchScenePortalGraph(
@@ -6637,6 +6680,8 @@ public final class AcousticTracer {
                 new ConcurrentLinkedQueue<>();
         private volatile boolean hasBackbone;
         private boolean buildingBackbone;
+        private CompletableFuture<Void> backboneReadiness =
+                CompletableFuture.completedFuture(null);
 
         private ListenerAirRouteField(
                 Vec3 anchorListener,
@@ -6676,7 +6721,12 @@ public final class AcousticTracer {
                 return false;
             }
             buildingBackbone = true;
+            backboneReadiness = new CompletableFuture<>();
             return true;
+        }
+
+        private synchronized CompletableFuture<Void> backboneReadiness() {
+            return backboneReadiness;
         }
 
         private synchronized void awaitBackboneBuild() {
@@ -6690,9 +6740,14 @@ public final class AcousticTracer {
             }
         }
 
-        private synchronized void finishBackboneBuild() {
-            buildingBackbone = false;
-            notifyAll();
+        private void finishBackboneBuild() {
+            CompletableFuture<Void> completed;
+            synchronized (this) {
+                buildingBackbone = false;
+                completed = backboneReadiness;
+                notifyAll();
+            }
+            completed.complete(null);
         }
 
         private void register(List<Long> cells) {
@@ -6940,6 +6995,19 @@ public final class AcousticTracer {
         }
 
         private record RouteStep(double distance, long next) {
+        }
+    }
+
+    static final class AirFieldPendingException extends RuntimeException {
+        private final CompletableFuture<Void> readiness;
+
+        private AirFieldPendingException(CompletableFuture<Void> readiness) {
+            super(null, null, false, false);
+            this.readiness = readiness;
+        }
+
+        CompletableFuture<Void> readiness() {
+            return readiness;
         }
     }
 

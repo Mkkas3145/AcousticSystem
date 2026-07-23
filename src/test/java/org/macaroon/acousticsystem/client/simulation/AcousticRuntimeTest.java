@@ -38,8 +38,10 @@ class AcousticRuntimeTest {
         );
         assertEquals(Math.max(1, totalBudget - 1), AcousticRuntime.onsetWorkerCount());
         assertEquals(totalBudget, AcousticRuntime.workerCount());
-        assertTrue(AcousticRuntime.realtimeBatchLaneCount() >= 1);
-        assertTrue(AcousticRuntime.realtimeBatchLaneCount() <= 4);
+        assertEquals(
+                Math.max(1, AcousticRuntime.onsetWorkerCount() - 1),
+                AcousticRuntime.realtimeBatchLaneCount()
+        );
         if (AcousticRuntime.onsetWorkerCount() > 1) {
             assertTrue(
                     AcousticRuntime.realtimeBatchLaneCount()
@@ -127,6 +129,40 @@ class AcousticRuntimeTest {
         slow.publish("slow-result");
         assertEquals("slow-result", slow.takePublished());
         assertFalse(slow.continueOrRelease());
+    }
+
+    @Test
+    void sharedFieldWaitParksWithoutOccupyingARealtimeLane() {
+        AcousticRuntime.LatestComputationQueue<String, String> queue =
+                new AcousticRuntime.LatestComputationQueue<>();
+
+        assertTrue(queue.offer("field-a"));
+        assertEquals("field-a", queue.take());
+        assertTrue(queue.park("field-a"));
+
+        // A parked request is resumed only by its shared-field completion and must not
+        // immediately re-enter a worker drain.
+        assertFalse(queue.continueOrRelease());
+        assertTrue(queue.resume());
+        assertEquals("field-a", queue.take());
+        assertFalse(queue.continueOrRelease());
+        assertTrue(queue.idle());
+    }
+
+    @Test
+    void movementUnparksAVoiceBeforeItsObsoleteFieldCompletes() {
+        AcousticRuntime.LatestComputationQueue<String, String> queue =
+                new AcousticRuntime.LatestComputationQueue<>();
+
+        assertTrue(queue.offer("field-a"));
+        assertEquals("field-a", queue.take());
+        assertTrue(queue.park("field-a"));
+
+        // Entering a new listener field must make the newest request runnable now.
+        assertTrue(queue.offer("field-b"));
+        assertFalse(queue.resume());
+        assertEquals("field-b", queue.take());
+        assertFalse(queue.continueOrRelease());
     }
 
     @Test
