@@ -50,12 +50,18 @@ abstract class SoundEngineMixin {
     @Unique
     private volatile ListenerTransform acousticsystem$latestListenerTransform;
 
+    @Unique
+    private volatile ClientLevel acousticsystem$latestLevel;
+
     @Inject(method = "play", at = @At("HEAD"))
     private void acousticsystem$prepareFirstFrame(
             SoundInstance sound,
             CallbackInfoReturnable<SoundEngine.PlayResult> cir
     ) {
-        AcousticRuntime.prepareSound(sound);
+        // SoundEngine.play is called by the client/render thread. First-frame
+        // preparation may inspect an emitter and request an acoustic scene, so it
+        // belongs to the OpenAL-owning sound executor with the rest of the transport.
+        executor.execute(() -> AcousticRuntime.prepareSound(sound));
     }
 
     @Inject(method = "play", at = @At("RETURN"))
@@ -99,15 +105,7 @@ abstract class SoundEngineMixin {
         acousticsystem$scheduleLatestListenerTransform();
 
         Minecraft minecraft = Minecraft.getInstance();
-        ClientLevel level = minecraft.level;
-        if (level != null) {
-            AcousticRuntime.tick(
-                    level,
-                    transform.position(),
-                    instanceToChannel,
-                    channelAccess
-            );
-        }
+        acousticsystem$latestLevel = minecraft.level;
         ci.cancel();
     }
 
@@ -122,6 +120,12 @@ abstract class SoundEngineMixin {
                 if (applied != null) {
                     listener.setTransform(applied);
                     AcousticRuntime.applyListenerPosition(applied.position());
+                    ClientLevel level = acousticsystem$latestLevel;
+                    if (level != null) {
+                        AcousticRuntime.tickFromSoundThread(
+                                level, applied.position(), channelAccess
+                        );
+                    }
                 }
                 AcousticRuntime.drainCompletedApplicationsOnSoundThread();
             } finally {

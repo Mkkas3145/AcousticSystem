@@ -144,6 +144,7 @@ public final class AcousticRuntime {
     private static final Map<SoundInstance, PreparedResult> PREPARED_SOUNDS = new ConcurrentHashMap<>();
     private static final Set<Integer> DEFERRED_ONSET_SOURCES = ConcurrentHashMap.newKeySet();
     private static final Map<SoundInstance, RealtimeState> REALTIME_STATES = new ConcurrentHashMap<>();
+    private static final Map<Integer, ActiveChannel> ACTIVE_CHANNELS = new ConcurrentHashMap<>();
     /*
      * Every voice owns one running calculation and one replaceable newest request.
      * Ready voices share the available latency lanes, but there is no all-voices
@@ -380,6 +381,37 @@ public final class AcousticRuntime {
         executor.execute(AcousticRuntime::drainCompletedApplicationsOnSoundThread);
     }
 
+    /** Called only from Minecraft's sound executor; never reads SoundEngine's map. */
+    public static void tickFromSoundThread(
+            ClientLevel level,
+            Vec3 listener,
+            ChannelAccess channelAccess
+    ) {
+        Map<SoundInstance, ChannelAccess.ChannelHandle> active = new IdentityHashMap<>();
+        for (ActiveChannel channel : ACTIVE_CHANNELS.values()) {
+            if (channel.sound != null && channel.handle != null
+                    && !channel.relative && !channel.handle.isStopped()) {
+                active.put(channel.sound, channel.handle);
+            }
+        }
+        tick(level, listener, active, channelAccess);
+    }
+
+    public static void registerChannel(
+            int source, Channel channel, Vec3 position, boolean relative
+    ) {
+        ACTIVE_CHANNELS.compute(source, (ignored, existing) -> {
+            ActiveChannel next = existing == null ? new ActiveChannel(channel) : existing;
+            next.channel = channel;
+            next.relative = relative;
+            return next;
+        });
+    }
+
+    public static void unregisterChannel(int source, Channel channel) {
+        ACTIVE_CHANNELS.remove(source, new ActiveChannel(channel));
+    }
+
     private static void maintainCaches(
             long now,
             Map<SoundInstance, ChannelAccess.ChannelHandle> activeSounds
@@ -590,6 +622,19 @@ public final class AcousticRuntime {
             SoundInstance sound,
             ChannelAccess.ChannelHandle handle
     ) {
+        if (handle != null) {
+            handle.execute(channel -> {
+                int source = ((ChannelAccessor) channel).acousticsystem$getSource();
+                ACTIVE_CHANNELS.compute(source, (ignored, existing) -> {
+                    ActiveChannel next = existing == null
+                            ? new ActiveChannel(channel) : existing;
+                    next.channel = channel;
+                    next.sound = sound;
+                    next.handle = handle;
+                    return next;
+                });
+            });
+        }
         if (sound.isRelative() || handle == null || handle.isStopped()) {
             PREPARED_SOUNDS.remove(sound);
             return;
@@ -646,6 +691,7 @@ public final class AcousticRuntime {
         SOURCE_ROOM_PROBE_CACHE.clear();
         cancelPreparedComputations();
         REALTIME_STATES.clear();
+        ACTIVE_CHANNELS.clear();
         REALTIME_READY.clear();
         PENDING_LISTENER_APPLICATION.clear();
         SOUND_REQUEST_CACHE.clear();
@@ -1463,6 +1509,27 @@ public final class AcousticRuntime {
     }
 
     private record PrePlayContext(ClientLevel level, AcousticScene scene, Vec3 listener, long generation) {
+    }
+
+    private static final class ActiveChannel {
+        private volatile Channel channel;
+        private volatile SoundInstance sound;
+        private volatile ChannelAccess.ChannelHandle handle;
+        private volatile boolean relative;
+
+        private ActiveChannel(Channel channel) {
+            this.channel = channel;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ActiveChannel active && active.channel == channel;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(channel);
+        }
     }
 
     private record ProbeSnapshot(long generation, long sceneRevision, Vec3 listener, RoomProbe roomProbe) {

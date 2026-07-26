@@ -102,6 +102,10 @@ abstract class ChannelMixin {
 
     @Inject(method = "play", at = @At("HEAD"), cancellable = true)
     private void acousticsystem$applyBeforePlayback(CallbackInfo ci) {
+        AcousticRuntime.registerChannel(
+                source, (Channel) (Object) this,
+                acousticsystem$position, acousticsystem$relative
+        );
         if (!AcousticRuntime.applyBeforePlay(
                 source, acousticsystem$position, acousticsystem$relative
         )) {
@@ -128,6 +132,7 @@ abstract class ChannelMixin {
 
     @Inject(method = "destroy", at = @At("HEAD"))
     private void acousticsystem$releaseEffects(CallbackInfo ci) {
+        AcousticRuntime.unregisterChannel(source, (Channel) (Object) this);
         AcousticRuntime.forgetDeferredSource(source);
         OpenALAcousticEffects.releaseSource(source);
         SoftwareAcousticMixer.releaseSource(source);
