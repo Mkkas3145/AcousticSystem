@@ -36,6 +36,12 @@ public final class AcousticScene implements BlockGetter {
     private final ConcurrentHashMap<LocalPortalFieldKey, LocalPortalField>
             localPortalFields = new ConcurrentHashMap<>();
     private final int sectionMask;
+    private final double minimumCapturedX;
+    private final double minimumCapturedY;
+    private final double minimumCapturedZ;
+    private final double maximumCapturedX;
+    private final double maximumCapturedY;
+    private final double maximumCapturedZ;
     private final int minY;
     private final int height;
     private final long revision;
@@ -84,6 +90,29 @@ public final class AcousticScene implements BlockGetter {
         componentOpenBoundaries = connectivity.openBoundaries();
         portalLinks = buildPortalLinks();
         collisionBvh = buildCollisionBvh();
+        int minimumSectionX = Integer.MAX_VALUE;
+        int minimumSectionY = Integer.MAX_VALUE;
+        int minimumSectionZ = Integer.MAX_VALUE;
+        int maximumSectionX = Integer.MIN_VALUE;
+        int maximumSectionY = Integer.MIN_VALUE;
+        int maximumSectionZ = Integer.MIN_VALUE;
+        for (int slot = 0; slot < this.sections.length; slot++) {
+            if (this.sections[slot] == null) {
+                continue;
+            }
+            minimumSectionX = Math.min(minimumSectionX, sectionXs[slot]);
+            minimumSectionY = Math.min(minimumSectionY, sectionYs[slot]);
+            minimumSectionZ = Math.min(minimumSectionZ, sectionZs[slot]);
+            maximumSectionX = Math.max(maximumSectionX, sectionXs[slot] + 1);
+            maximumSectionY = Math.max(maximumSectionY, sectionYs[slot] + 1);
+            maximumSectionZ = Math.max(maximumSectionZ, sectionZs[slot] + 1);
+        }
+        minimumCapturedX = minimumSectionX == Integer.MAX_VALUE ? 0.0 : minimumSectionX * 16.0;
+        minimumCapturedY = minimumSectionY == Integer.MAX_VALUE ? 0.0 : minimumSectionY * 16.0;
+        minimumCapturedZ = minimumSectionZ == Integer.MAX_VALUE ? 0.0 : minimumSectionZ * 16.0;
+        maximumCapturedX = maximumSectionX == Integer.MIN_VALUE ? 0.0 : maximumSectionX * 16.0;
+        maximumCapturedY = maximumSectionY == Integer.MIN_VALUE ? 0.0 : maximumSectionY * 16.0;
+        maximumCapturedZ = maximumSectionZ == Integer.MIN_VALUE ? 0.0 : maximumSectionZ * 16.0;
         this.minY = minY;
         this.height = height;
         this.revision = revision;
@@ -331,6 +360,41 @@ public final class AcousticScene implements BlockGetter {
      */
     public boolean mayIntersectPotentialCollision(Vec3 from, Vec3 to) {
         return collisionBvh != null && collisionBvh.intersects(from, to);
+    }
+
+    /**
+     * Distance to the immutable snapshot boundary along a ray. This is deliberately
+     * geometry-driven: callers do not need a gameplay-distance cap, and the collision
+     * BVH rejects empty ray segments before the exact voxel walk is attempted.
+     */
+    public double rayDistanceToBoundary(Vec3 origin, Vec3 direction) {
+        double distance = Double.POSITIVE_INFINITY;
+        distance = boundaryDistance(origin.x, direction.x, minimumCapturedX, maximumCapturedX, distance);
+        distance = boundaryDistance(origin.y, direction.y, minimumCapturedY, maximumCapturedY, distance);
+        distance = boundaryDistance(origin.z, direction.z, minimumCapturedZ, maximumCapturedZ, distance);
+        return Double.isFinite(distance) && distance > 1.0E-4 ? distance : 0.0;
+    }
+
+    public double maximumCapturedRayDistance() {
+        double x = maximumCapturedX - minimumCapturedX;
+        double y = maximumCapturedY - minimumCapturedY;
+        double z = maximumCapturedZ - minimumCapturedZ;
+        return Math.sqrt(x * x + y * y + z * z);
+    }
+
+    private static double boundaryDistance(
+            double coordinate,
+            double direction,
+            double minimum,
+            double maximum,
+            double current
+    ) {
+        if (Math.abs(direction) <= 1.0E-10) {
+            return current;
+        }
+        double boundary = direction > 0.0 ? maximum : minimum;
+        double candidate = (boundary - coordinate) / direction;
+        return candidate > 1.0E-4 ? Math.min(current, candidate) : current;
     }
 
     @Override

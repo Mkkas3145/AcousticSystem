@@ -48,6 +48,13 @@ public final class AcousticTracer {
     private static final Vec3 POSITIVE_Y_NORMAL = new Vec3(0.0, 1.0, 0.0);
     private static final Vec3 NEGATIVE_Z_NORMAL = new Vec3(0.0, 0.0, -1.0);
     private static final Vec3 POSITIVE_Z_NORMAL = new Vec3(0.0, 0.0, 1.0);
+    /* Finite radiator quadrature: centre plus the six principal surface samples. */
+    private static final Vec3[] EMITTER_VOLUME_SAMPLES = {
+            Vec3.ZERO,
+            new Vec3(0.32, 0.0, 0.0), new Vec3(-0.32, 0.0, 0.0),
+            new Vec3(0.0, 0.32, 0.0), new Vec3(0.0, -0.32, 0.0),
+            new Vec3(0.0, 0.0, 0.32), new Vec3(0.0, 0.0, -0.32)
+    };
 
     private static AABB fluidBounds(FluidState state, BlockGetter level, BlockPos position) {
         if (state.isEmpty()) {
@@ -134,6 +141,7 @@ public final class AcousticTracer {
      */
     private static final ThreadLocal<Boolean> DEFER_SHARED_FIELD_WAIT =
             ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private static final ThreadLocal<AABB> ACTIVE_EMITTER_BOUNDS = new ThreadLocal<>();
     private static final ThreadLocal<DenseAirSearchScratch> DENSE_AIR_SEARCH =
             ThreadLocal.withInitial(DenseAirSearchScratch::new);
     private static final ThreadLocal<SurfaceHit[]> ROOM_SURFACE_HOLDER =
@@ -224,6 +232,7 @@ public final class AcousticTracer {
         long sceneRevision = level instanceof AcousticScene scene
                 ? scene.revision()
                 : 0L;
+        AABB emitterBounds = ACTIVE_EMITTER_BOUNDS.get();
         TraceCacheKey traceCacheKey = new TraceCacheKey(
                 cacheIdentity(level),
                 sceneRevision,
@@ -232,7 +241,8 @@ public final class AcousticTracer {
                 graphPointKey(listener),
                 sourceRoomProbe,
                 listenerRoomProbe,
-                quality
+                quality,
+                emitterBounds
         );
         AcousticResult cachedTrace = TRACE_CACHE.get(traceCacheKey);
         if (cachedTrace != null) {
@@ -490,8 +500,18 @@ public final class AcousticTracer {
             RoomProbe listenerRoomProbe,
             TraceQuality quality
     ) {
+        return traceNonBlocking(level, source, listener, sourceRoomProbe, listenerRoomProbe, quality, null);
+    }
+
+    static AcousticResult traceNonBlocking(
+            BlockGetter level, Vec3 source, Vec3 listener,
+            RoomProbe sourceRoomProbe, RoomProbe listenerRoomProbe,
+            TraceQuality quality, AABB emitterBounds
+    ) {
         boolean previous = DEFER_SHARED_FIELD_WAIT.get();
+        AABB previousBounds = ACTIVE_EMITTER_BOUNDS.get();
         DEFER_SHARED_FIELD_WAIT.set(Boolean.TRUE);
+        ACTIVE_EMITTER_BOUNDS.set(emitterBounds);
         try {
             return trace(
                     level, source, listener,
@@ -499,6 +519,11 @@ public final class AcousticTracer {
             );
         } finally {
             DEFER_SHARED_FIELD_WAIT.set(previous);
+            if (previousBounds == null) {
+                ACTIVE_EMITTER_BOUNDS.remove();
+            } else {
+                ACTIVE_EMITTER_BOUNDS.set(previousBounds);
+            }
         }
     }
 
@@ -580,31 +605,36 @@ public final class AcousticTracer {
         MediumSample listenerMedium = sampleMedium(level, listener);
         AcousticTuning tuning = AcousticMaterialRegistry.tuning();
         RoomRayGrid grid = roomRayGrid(requestedRayCount);
-        double probeDistance = tuning.adaptiveRoomProbeDistance();
+        double fallbackProbeDistance = tuning.adaptiveRoomProbeDistance();
         SurfaceHit[] hits = new SurfaceHit[grid.directions().length];
         double[] distances = new double[hits.length];
+        double[] rayLimits = new double[hits.length];
         double[] openingBoundaries = new double[hits.length];
         float[] openingWeights = new float[hits.length];
         OpeningBoundary[] openingModels = new OpeningBoundary[hits.length];
         Arrays.fill(openingBoundaries, Double.POSITIVE_INFINITY);
         IntConsumer castRay = ray -> {
             Vec3 direction = grid.directions()[ray];
+            double rayLimit = rayDistanceToSceneBoundary(
+                    level, listener, direction, fallbackProbeDistance
+            );
             SurfaceHit[] firstHitHolder = ROOM_SURFACE_HOLDER.get();
             firstHitHolder[0] = null;
             SurfaceHit hit = firstAcousticSurface(
                     level,
                     listener,
-                    listener.add(direction.scale(probeDistance)),
+                    listener.add(direction.scale(rayLimit)),
                     firstHitHolder
             );
             hits[ray] = hit;
-            distances[ray] = hit == null ? probeDistance : hit.distance();
+            rayLimits[ray] = rayLimit;
+            distances[ray] = hit == null ? rayLimit : hit.distance();
             if (hit == null) {
                 // A ray leaving the simulation control volume is an absorbing open
                 // boundary, not missing data. Previously it contributed no surface and
                 // no escape area, so a listener outside a large open facade inherited
                 // the walls inside the opening as if they enclosed the listener.
-                openingBoundaries[ray] = probeDistance;
+                openingBoundaries[ray] = rayLimit;
                 openingWeights[ray] = 1.0F;
             }
         };
@@ -621,7 +651,7 @@ public final class AcousticTracer {
         double openingContrast = tuning.roomOpeningContrast();
         for (int ray = 0; ray < hits.length; ray++) {
             double localMedian = neighborMedian(distances, grid, ray, neighborBuffer);
-            if (hits[ray] == null && localMedian >= probeDistance * 0.75) {
+            if (hits[ray] == null && localMedian >= rayLimits[ray] * 0.75) {
                 // A null ray surrounded by other null rays is genuine escape to the
                 // control-volume boundary. A null ray surrounded by nearby coherent
                 // surfaces instead passed through an aperture in that surface; recover
@@ -4518,6 +4548,21 @@ public final class AcousticTracer {
         return query.result;
     }
 
+    static double rayDistanceToSceneBoundary(
+            BlockGetter level,
+            Vec3 origin,
+            Vec3 direction,
+            double fallbackDistance
+    ) {
+        if (level instanceof AcousticScene scene) {
+            double distance = scene.rayDistanceToBoundary(origin, direction);
+            if (distance > 1.0E-4) {
+                return distance;
+            }
+        }
+        return fallbackDistance;
+    }
+
     private static final class CollisionQuery implements BlockVisitor {
         private BlockGetter level;
         private Vec3 from;
@@ -5074,17 +5119,11 @@ public final class AcousticTracer {
             BlockGetter level,
             Vec3 source
     ) {
-        MediumSample local = sampleMedium(level, source);
-        if (local.weight() > 1.0E-6F) {
-            float[] amplitude = new float[AcousticBands.COUNT];
-            for (int band = 0; band < amplitude.length; band++) {
-                amplitude[band] = mix(
-                        1.0F,
-                        local.profile().gain(band),
-                        local.weight()
-                );
-            }
-            return new EmitterMediumTransfer(amplitude);
+        EmitterMediumTransfer volumeTransfer = sampleEmitterVolume(
+                level, source, ACTIVE_EMITTER_BOUNDS.get()
+        );
+        if (volumeTransfer != null) {
+            return volumeTransfer;
         }
 
         BlockPos cell = BlockPos.containing(source);
@@ -5179,6 +5218,123 @@ public final class AcousticTracer {
         return new EmitterMediumTransfer(amplitude);
     }
 
+    /**
+     * A source is a finite radiator, not a mathematical point.  Only engage this
+     * volume model when it intersects fluid; all-air/block emitters continue through
+     * the existing boundary-flux solver below.  This makes a genuine submerged source
+     * fully water-coupled while a source crossing the real free surface radiates into
+     * both media without event-name or coordinate heuristics.
+     */
+    private static EmitterMediumTransfer sampleEmitterVolume(
+            BlockGetter level,
+            Vec3 source,
+            AABB emitterBounds
+    ) {
+        if (emitterBounds != null) {
+            return integrateEmitterBounds(level, emitterBounds);
+        }
+        float[] pressureEnergy = new float[AcousticBands.COUNT];
+        double totalAdmittance = 0.0;
+        boolean intersectsFluid = false;
+        int sampleCount = EMITTER_VOLUME_SAMPLES.length;
+        for (int sample = 0; sample < sampleCount; sample++) {
+            Vec3 point = source.add(EMITTER_VOLUME_SAMPLES[sample]);
+            MediumSample medium = sampleMedium(level, point);
+            if (medium.weight() > 1.0E-6F) {
+                intersectsFluid = true;
+            }
+            double admittance = 1.0 / medium.profile().acousticImpedanceRayl();
+            totalAdmittance += admittance;
+            for (int band = 0; band < pressureEnergy.length; band++) {
+                float pressure = mix(
+                        1.0F, medium.profile().gain(band), medium.weight()
+                );
+                pressureEnergy[band] += (float) (admittance * pressure * pressure);
+            }
+        }
+        if (!intersectsFluid || totalAdmittance <= 1.0E-12) {
+            return null;
+        }
+        float[] amplitude = new float[AcousticBands.COUNT];
+        for (int band = 0; band < amplitude.length; band++) {
+            amplitude[band] = Mth.clamp(
+                    (float) Math.sqrt(pressureEnergy[band] / totalAdmittance),
+                    0.0F, 1.0F
+            );
+        }
+        return new EmitterMediumTransfer(amplitude);
+    }
+
+    /** Exact AABB/fluid-volume integration; catches arbitrarily thin surface overlap. */
+    private static EmitterMediumTransfer integrateEmitterBounds(
+            BlockGetter level,
+            AABB emitter
+    ) {
+        double totalVolume = Math.max(0.0,
+                (emitter.maxX - emitter.minX)
+                        * (emitter.maxY - emitter.minY)
+                        * (emitter.maxZ - emitter.minZ));
+        if (totalVolume <= 1.0E-12) {
+            return null;
+        }
+        float[] pressureEnergy = new float[AcousticBands.COUNT];
+        double fluidVolume = 0.0;
+        double totalAdmittance = 0.0;
+        int minX = Mth.floor(emitter.minX);
+        int minY = Mth.floor(emitter.minY);
+        int minZ = Mth.floor(emitter.minZ);
+        int maxX = Mth.floor(Math.nextDown(emitter.maxX));
+        int maxY = Mth.floor(Math.nextDown(emitter.maxY));
+        int maxZ = Mth.floor(Math.nextDown(emitter.maxZ));
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int y = minY; y <= maxY; y++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int x = minX; x <= maxX; x++) {
+                    pos.set(x, y, z);
+                    FluidState fluid = level.getFluidState(pos);
+                    AABB fluidBox = fluidBounds(fluid, level, pos);
+                    if (fluidBox == null) {
+                        continue;
+                    }
+                    double overlap = Math.max(0.0, Math.min(emitter.maxX, fluidBox.maxX)
+                            - Math.max(emitter.minX, fluidBox.minX))
+                            * Math.max(0.0, Math.min(emitter.maxY, fluidBox.maxY)
+                            - Math.max(emitter.minY, fluidBox.minY))
+                            * Math.max(0.0, Math.min(emitter.maxZ, fluidBox.maxZ)
+                            - Math.max(emitter.minZ, fluidBox.minZ));
+                    if (overlap <= 1.0E-12) {
+                        continue;
+                    }
+                    fluidVolume += overlap;
+                    AcousticMaterial material = AcousticMaterialRegistry.findFluid(fluid);
+                    double admittance = overlap / material.medium().acousticImpedanceRayl();
+                    totalAdmittance += admittance;
+                    for (int band = 0; band < pressureEnergy.length; band++) {
+                        float pressure = material.medium().gain(band);
+                        pressureEnergy[band] += (float) (admittance * pressure * pressure);
+                    }
+                }
+            }
+        }
+        if (fluidVolume <= 1.0E-12) {
+            return null;
+        }
+        double airVolume = Math.max(0.0, totalVolume - Math.min(totalVolume, fluidVolume));
+        double airAdmittance = airVolume / MediumProfile.AIR.acousticImpedanceRayl();
+        totalAdmittance += airAdmittance;
+        for (int band = 0; band < pressureEnergy.length; band++) {
+            pressureEnergy[band] += (float) airAdmittance;
+        }
+        float[] amplitude = new float[AcousticBands.COUNT];
+        for (int band = 0; band < amplitude.length; band++) {
+            amplitude[band] = Mth.clamp(
+                    (float) Math.sqrt(pressureEnergy[band] / Math.max(totalAdmittance, 1.0E-12)),
+                    0.0F, 1.0F
+            );
+        }
+        return new EmitterMediumTransfer(amplitude);
+    }
+
     private static double rectangleSolidAngle(
             double distance,
             double firstMin,
@@ -5231,12 +5387,45 @@ public final class AcousticTracer {
         }
         AcousticMaterial material = AcousticMaterialRegistry.findFluid(fluidState);
         MediumProfile profile = material.medium();
-        float depth = (float) Math.max(0.0, bounds.maxY - point.y);
+        // A full water voxel is not automatically a water surface. In a column, the
+        // free surface may be many blocks higher; treating every cell top as one made
+        // a swimming listener alternate between air and water while crossing internal
+        // voxel boundaries. Only the exposed top of the connected fluid column drives
+        // the air/water transition.
+        double surfaceY = connectedFluidSurfaceY(level, pos, fluidState, point.y);
+        float depth = (float) Math.max(0.0, surfaceY - point.y);
         return new MediumSample(
                 profile,
                 material,
                 Mth.clamp(depth / profile.transitionDepth(), 0.0F, 1.0F)
         );
+    }
+
+    private static double connectedFluidSurfaceY(
+            BlockGetter level,
+            BlockPos start,
+            FluidState initial,
+            double pointY
+    ) {
+        BlockPos cursor = start;
+        FluidState state = initial;
+        // This is an endpoint test, not a ray march. The bound avoids turning a deep
+        // ocean into vertical world traversal; beyond it the listener is certainly
+        // fully immersed for the configured transition depth.
+        for (int steps = 0; steps < 16; steps++) {
+            double fill = Mth.clamp(state.getAmount() / 8.0, 0.0, 1.0);
+            if (fill < 1.0 - 1.0E-6) {
+                return cursor.getY() + fill;
+            }
+            BlockPos above = cursor.above();
+            FluidState upper = level.getFluidState(above);
+            if (upper.isEmpty() || upper.getType() != initial.getType()) {
+                return cursor.getY() + fill;
+            }
+            cursor = above;
+            state = upper;
+        }
+        return pointY + 1.0;
     }
 
     private static RoomAcoustics applyTuning(RoomAcoustics room, AcousticTuning tuning) {
@@ -6008,6 +6197,7 @@ public final class AcousticTracer {
         private final RoomProbe sourceProbe;
         private final RoomProbe listenerProbe;
         private final TraceQuality quality;
+        private final AABB emitterBounds;
         private final int hash;
 
         private TraceCacheKey(
@@ -6018,7 +6208,8 @@ public final class AcousticTracer {
                 GraphPointKey listener,
                 RoomProbe sourceProbe,
                 RoomProbe listenerProbe,
-                TraceQuality quality
+                TraceQuality quality,
+                AABB emitterBounds
         ) {
             this.level = level;
             this.sceneRevision = sceneRevision;
@@ -6028,6 +6219,7 @@ public final class AcousticTracer {
             this.sourceProbe = sourceProbe;
             this.listenerProbe = listenerProbe;
             this.quality = quality;
+            this.emitterBounds = emitterBounds;
             int value = System.identityHashCode(level);
             value = 31 * value + Long.hashCode(sceneRevision);
             value = 31 * value + Long.hashCode(materialRevision);
@@ -6036,6 +6228,7 @@ public final class AcousticTracer {
             value = 31 * value + System.identityHashCode(sourceProbe);
             value = 31 * value + System.identityHashCode(listenerProbe);
             value = 31 * value + quality.hashCode();
+            value = 31 * value + (emitterBounds == null ? 0 : emitterBounds.hashCode());
             this.hash = value;
         }
 
@@ -6054,7 +6247,8 @@ public final class AcousticTracer {
                     && listener.equals(key.listener)
                     && sourceProbe == key.sourceProbe
                     && listenerProbe == key.listenerProbe
-                    && quality == key.quality;
+                    && quality == key.quality
+                    && java.util.Objects.equals(emitterBounds, key.emitterBounds);
         }
 
         @Override

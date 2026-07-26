@@ -102,7 +102,6 @@ public final class AcousticSceneManager {
     private static List<BlockPos> lastCaptureSourceCells = List.of();
     private static BlockPos sparseProbeCell;
     private static float sparseProbeDenseDistance;
-    private static float sparseProbeMaximumDistance;
     private static int sparseProbeRayCount;
     private static Set<SectionKey> sparseProbeSections = Set.of();
 
@@ -581,10 +580,10 @@ public final class AcousticSceneManager {
     }
 
     /**
-     * Extends only the directions which leave the dense listener sphere. Copying a
-     * second complete sphere would make a 64-block probe roughly eight times larger;
-     * section corridors retain the far walls needed by the worker while empty space
-     * remains represented by a few cheap palette copies.
+     * Extends only the directions which leave the dense listener sphere. Each corridor
+     * continues until it leaves the client-loaded world; this has no arbitrary acoustic
+     * distance cap. The immutable scene's BVH then makes the long empty segments cheap
+     * to reject on the worker.
      */
     private static Set<SectionKey> sparseProbeSections(
             ClientLevel level,
@@ -592,12 +591,10 @@ public final class AcousticSceneManager {
             AcousticTuning tuning
     ) {
         float denseDistance = tuning.roomProbeDistance();
-        float maximumDistance = tuning.adaptiveRoomProbeDistance();
-        int rayCount = Math.min(256, tuning.roomRayCount());
+        int rayCount = tuning.roomRayCount();
         BlockPos listenerCell = BlockPos.containing(listener);
         if (listenerCell.equals(sparseProbeCell)
                 && denseDistance == sparseProbeDenseDistance
-                && maximumDistance == sparseProbeMaximumDistance
                 && rayCount == sparseProbeRayCount) {
             return sparseProbeSections;
         }
@@ -622,7 +619,7 @@ public final class AcousticSceneManager {
                 );
                 SectionKey previous = null;
                 for (double distance = denseDistance + 4.0;
-                     distance <= maximumDistance + 1.0E-6;
+                     ;
                      distance += 4.0) {
                     Vec3 point = listener.add(direction.scale(distance));
                     SectionKey key = SectionKey.fromBlock(
@@ -649,7 +646,6 @@ public final class AcousticSceneManager {
         }
         sparseProbeCell = listenerCell.immutable();
         sparseProbeDenseDistance = denseDistance;
-        sparseProbeMaximumDistance = maximumDistance;
         sparseProbeRayCount = rayCount;
         sparseProbeSections = Set.copyOf(sections);
         return sparseProbeSections;
@@ -658,7 +654,6 @@ public final class AcousticSceneManager {
     private static void clearSparseProbe() {
         sparseProbeCell = null;
         sparseProbeDenseDistance = 0.0F;
-        sparseProbeMaximumDistance = 0.0F;
         sparseProbeRayCount = 0;
         sparseProbeSections = Set.of();
     }

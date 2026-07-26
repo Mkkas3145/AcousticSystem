@@ -7,6 +7,7 @@ import org.macaroon.acousticsystem.client.material.AcousticBands;
 import org.macaroon.acousticsystem.client.material.AcousticMaterial;
 import org.macaroon.acousticsystem.client.material.AcousticTuning;
 import org.macaroon.acousticsystem.client.material.MediumProfile;
+import org.macaroon.acousticsystem.client.scene.AcousticScene;
 import org.macaroon.acousticsystem.physics.ReverbDecayEstimator;
 import org.macaroon.acousticsystem.physics.ReverbFieldEstimator;
 
@@ -74,7 +75,10 @@ final class LateReverbTracer {
         );
         int rayCount = Math.min(tuning.lateReverbRayCount(), directionGrid.length);
         int maxBounces = tuning.lateReverbMaxBounces();
-        double maximumSegmentDistance = tuning.adaptiveRoomProbeDistance();
+        double fallbackSegmentDistance = tuning.adaptiveRoomProbeDistance();
+        double maximumSegmentDistance = level instanceof AcousticScene scene
+                ? Math.max(1.0, scene.maximumCapturedRayDistance())
+                : fallbackSegmentDistance;
         double histogramDuration = Math.max(
                 0.64,
                 maxBounces * tuning.meters(maximumSegmentDistance) / soundSpeed
@@ -101,7 +105,7 @@ final class LateReverbTracer {
                     rayTraces[ray] = traceRay(
                             level, listener, directionGrid, initialHits, tuning,
                             mediumMaterial, mediumWeight, soundSpeed,
-                            maximumSegmentDistance, maxBounces,
+                            fallbackSegmentDistance, maxBounces,
                             directionOffset, seed, ray, rayCount
                     )
             );
@@ -110,7 +114,7 @@ final class LateReverbTracer {
                 rayTraces[ray] = traceRay(
                         level, listener, directionGrid, initialHits, tuning,
                         mediumMaterial, mediumWeight, soundSpeed,
-                        maximumSegmentDistance, maxBounces,
+                            fallbackSegmentDistance, maxBounces,
                         directionOffset, seed, ray, rayCount
                 );
             }
@@ -250,7 +254,7 @@ final class LateReverbTracer {
             AcousticMaterial mediumMaterial,
             float mediumWeight,
             double soundSpeed,
-            double maximumSegmentDistance,
+            double fallbackSegmentDistance,
             int maxBounces,
             int directionOffset,
             long seed,
@@ -279,7 +283,11 @@ final class LateReverbTracer {
                     : AcousticTracer.firstAcousticSurface(
                             level,
                             position,
-                            position.add(direction.scale(maximumSegmentDistance)),
+                            position.add(direction.scale(
+                                    AcousticTracer.rayDistanceToSceneBoundary(
+                                            level, position, direction, fallbackSegmentDistance
+                                    )
+                            )),
                             hitHolder
                     );
             if (hit == null) {
